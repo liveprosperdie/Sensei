@@ -1,6 +1,7 @@
 import os
 import json
 import anthropic
+import subprocess
 from dotenv import load_dotenv
 import speech_recognition as sr
 
@@ -15,7 +16,6 @@ with sr.Microphone() as source:
     recognizer.adjust_for_ambient_noise(source, duration=1)
     print("Listening... Speak now!")
     audio_data=recognizer.listen(source)
-    print("Audio captured, size:", len(audio_data.get_raw_data()))
     print("Processing you voice...")
 
 try:
@@ -27,7 +27,10 @@ try:
         system="You are Sensei, a PC assistant. You must ALWAYS respond with valid JSON only. No other text, explanation, or formatting — ever. Your response must contain exactly two keys:- \"action\": one of \"open\", \"play\", \"search\", or \"answer\"- \"parameter\": the relevant value for that action    Action definitions:    - \"open\"   → open an application or file (parameter: app or file name)    - \"play\"   → play media such as music or video (parameter: title or query)    - \"search\" → search the web or system (parameter: search query)    - \"answer\" → respond to a question or statement (parameter: the answer text)    Example responses:    {\"action\": \"open\", \"parameter\": \"calculator\"}    {\"action\": \"play\", \"parameter\": \"Bohemian Rhapsody\"}    {\"action\": \"search\", \"parameter\": \"weather in London\"}    {\"action\": \"answer\", \"parameter\": \"The capital of France is Paris.\"}    Never output anything outside of this JSON structure. No preamble, no explanation, no markdown.")
     r=(message.content[0].text).replace("```json","").replace("```","").strip()
     response=json.loads(r)
-    print(f"{response["action"]} {response["parameter"]}")
+    if response["action"]=="open":
+        subprocess.Popen(f"start {response['parameter']}", shell=True)
+    elif response["action"]=="answer":
+        print(response["parameter"])
 except sr.UnknownValueError:
     print ("Couldn't understand what u said")
 except sr.RequestError as e:
