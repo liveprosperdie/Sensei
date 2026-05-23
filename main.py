@@ -2,6 +2,7 @@ import os
 import json
 import anthropic
 import subprocess
+import webbrowser
 from dotenv import load_dotenv
 import speech_recognition as sr
 
@@ -31,6 +32,12 @@ try:
         subprocess.Popen(f"start {response['parameter']}", shell=True)
     elif response["action"]=="answer":
         print(response["parameter"])
+    elif response["action"]=="play":
+        url=f"https://www.youtube.com/results?search_query={response['parameter'].strip().replace(' ','+')}"
+        webbrowser.open(url)
+    elif response["action"]=="search":
+        url=f"https://www.google.com/search?q={response['parameter'].strip().replace(' ','+')}"
+        webbrowser.open(url)
 except sr.UnknownValueError:
     print ("Couldn't understand what u said")
 except sr.RequestError as e:
