@@ -1,1 +1,4 @@
 .env
+samples/
+*.onnx
+*.onnx.data
