@@ -6,7 +6,7 @@ import numpy as np
 import openwakeword
 from openwakeword import Model as WakeModel
 
-whisper_model=whisper.load_model("small")
+whisper_model=whisper.load_model("small", device="cuda")
 openwakeword.utils.download_models()
 oww_model = WakeModel(wakeword_models=["sensei.onnx"], inference_framework="onnx")
 
@@ -60,6 +60,8 @@ while True:
     if session_active and (current_time-session_start_time)<SESSION_TIMEOUT:
         r=record_command()
         if r is None:
+            session_active=False
+            oww_model.reset()
             continue
         final_command=r
         text=transcribe_command(final_command)
@@ -87,3 +89,4 @@ while True:
             session_active=True
             session_start_time = time.time()
             last_activation_time=time.time()
+            oww_model.reset()
