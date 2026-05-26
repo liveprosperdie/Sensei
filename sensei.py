@@ -15,43 +15,55 @@ stream = mic.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, fr
 last_activation_time=0.0
 COOLDOWN_TIME=3.0
 session_active = False
-
 SESSION_TIMEOUT = 20
-
 print("Listening for 'Sensei'...")
 session_start_time = 0
+
+
+def record_command():
+    command_audio=[]
+    chunk_count=0
+    silent_chunks=15
+    MAX_CHUNKS=200
+    MIN_CHUNKS=60
+    MAX_SILENT=15
+    while chunk_count < MAX_CHUNKS:
+        audio_chunk = stream.read(1280, exception_on_overflow=False)
+        audio_np = np.frombuffer(audio_chunk, dtype=np.int16)
+        rms = np.sqrt(np.mean(audio_np.astype(np.float32)**2))
+        command_audio.append(audio_np.astype(np.float32))
+        chunk_count+=1
+        if chunk_count>MIN_CHUNKS: 
+            if rms<150:
+                silent_chunks+=1
+            else:
+                silent_chunks=0
+            if silent_chunks >= MAX_SILENT:
+                break
+    if len(command_audio) == 0:
+        return None
+    command=np.concatenate(command_audio)
+    final_command=command/32768.0 
+    if np.sqrt(np.mean(command**2)) < 100:
+        return None
+    return final_command
+
+
+def transcribe_command(final_command):
+    result=whisper_model.transcribe(final_command,fp16=False, language="en")
+    text=result["text"].strip()
+    return text
+
+
 while True:
     current_time=time.time()
     if session_active and (current_time-session_start_time)<SESSION_TIMEOUT:
-        command_audio=[]
-        chunk_count=0
-        silent_chunks=15
-        MAX_CHUNKS=200
-        MIN_CHUNKS=60
-        MAX_SILENT=15
-        while chunk_count < MAX_CHUNKS:
-            audio_chunk = stream.read(1280, exception_on_overflow=False)
-            audio_np = np.frombuffer(audio_chunk, dtype=np.int16)
-            rms = np.sqrt(np.mean(audio_np.astype(np.float32)**2))
-            command_audio.append(audio_np.astype(np.float32))
-            chunk_count+=1
-            if chunk_count>MIN_CHUNKS: 
-                if rms<150:
-                    silent_chunks+=1
-                else:
-                    silent_chunks=0
-                if silent_chunks >= MAX_SILENT:
-                    break
-        if len(command_audio) == 0:
+        r=record_command()
+        if r is None:
             continue
-        command=np.concatenate(command_audio)
-        final_command=command/32768.0
-        if np.sqrt(np.mean(command**2)) < 100:
-            print("No speech detected, ignoring.")
-            continue
-        result=whisper_model.transcribe(final_command,fp16=False, language="en")
-        text=result["text"].strip()
-        print(f"you said {text}")
+        final_command=r
+        text=transcribe_command(final_command)
+        print(text)
         session_active=True
         session_start_time = time.time()
         continue
@@ -66,35 +78,12 @@ while True:
             print("Wake word detected!")
             winsound.Beep(1000, 200)
             last_activation_time=time.time()
-            command_audio=[]
-            chunk_count=0
-            silent_chunks=15
-            MAX_CHUNKS=200
-            MIN_CHUNKS=60
-            MAX_SILENT=15
-            while chunk_count < MAX_CHUNKS:
-                audio_chunk = stream.read(1280, exception_on_overflow=False)
-                audio_np = np.frombuffer(audio_chunk, dtype=np.int16)
-                rms = np.sqrt(np.mean(audio_np.astype(np.float32)**2))
-                command_audio.append(audio_np.astype(np.float32))
-                chunk_count+=1
-                if chunk_count>MIN_CHUNKS: 
-                    if rms<150:
-                        silent_chunks+=1
-                    else:
-                        silent_chunks=0
-                    if silent_chunks >= MAX_SILENT:
-                        break
-            if len(command_audio) == 0:
+            r=record_command()
+            if r is None:
                 continue
-            command=np.concatenate(command_audio)
-            final_command=command/32768.0
-            if np.sqrt(np.mean(command**2)) < 100:
-                print("No speech detected, ignoring.")
-                continue
-            result=whisper_model.transcribe(final_command,fp16=False, language="en")
-            text=result["text"].strip()
-            print(f"you said {text}")
+            final_command=r
+            text=transcribe_command(final_command)
+            print(text)
             session_active=True
             session_start_time = time.time()
             last_activation_time=time.time()
