@@ -76,6 +76,8 @@ while True:
             continue
         final_command=r
         text=transcribe_command(final_command)
+        if not text:
+            continue
         result=claude_handler.ask_akira(text).replace("```json","").replace("```","").strip()
         response=json.loads(result)
         print (response)
@@ -88,10 +90,12 @@ while True:
             if response["confirmation_required"]:
                 claude_handler.speak(response["confirmation_message"])
                 flush_stream()
+                time.sleep(0.5)
                 session_start_time = time.time()
             else:
                 claude_handler.speak(response["response"])
                 flush_stream()
+                time.sleep(0.5)
                 session_start_time = time.time()
         elif response["mode"]=="conversation":
             if response["end_session"]:
@@ -101,8 +105,9 @@ while True:
                 continue
             claude_handler.speak(response["response"])
             flush_stream()
+            time.sleep(0.5)
             session_start_time = time.time()
-        
+        print("session continuing")
         session_active=True
         continue
     else:
@@ -121,6 +126,8 @@ while True:
                 continue
             final_command=r
             text=transcribe_command(final_command)
+            if not text:
+                continue
             result=claude_handler.ask_akira(text).replace("```json","").replace("```","").strip()
             response=json.loads(result)
             print (response)
@@ -133,10 +140,12 @@ while True:
                 if response["confirmation_required"]:
                     claude_handler.speak(response["confirmation_message"])
                     flush_stream()
+                    time.sleep(0.5)
                     session_start_time = time.time()
                 else:
                     claude_handler.speak(response["response"])
                     flush_stream()
+                    time.sleep(0.5)
                     session_start_time = time.time()
                 print(response)
             elif response["mode"]=="conversation":
@@ -147,6 +156,7 @@ while True:
                     continue
                 claude_handler.speak(response["response"])
                 flush_stream()
+                time.sleep(0.5)
                 session_start_time = time.time()
             session_active=True
             last_activation_time=time.time()
