@@ -32,7 +32,7 @@ A COMMAND is anything where the user wants you to DO something — open an app, 
 A CONVERSATION is anything where the user wants to TALK — ask for advice, get emotional support, discuss a decision, learn something, or just chat.
 
 COMMAND MODE RESPONSE FORMAT:
-Respond only in this exact JSON format, nothing else:
+Respond only in this exact JSON format, no markdown, no code fences, nothing else:
 {
   "mode": "command",
   "action": "action_name",
@@ -46,7 +46,7 @@ Use confirmation_required: true for any action marked [C]. confirmation_message 
 end_session is false if the user will likely follow up, true if the command is standalone and complete.
 
 CONVERSATION MODE RESPONSE FORMAT:
-Respond only in this exact JSON format, nothing else:
+Respond only in this exact JSON format, no markdown, no code fences, nothing else:
 {
   "mode": "conversation",
   "response": "your full response here",
@@ -97,3 +97,7 @@ def clear_history():
     global conversation_history
     conversation_history=[]
     return conversation_history
+
+if __name__ == "__main__":
+    response = ask_akira("open spotify")
+    print(response)

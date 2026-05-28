@@ -1,9 +1,12 @@
+import os
 import time
+import json
 import whisper
 import pyaudio
 import winsound
 import numpy as np
 import openwakeword
+import claude_handler
 from openwakeword import Model as WakeModel
 
 whisper_model=whisper.load_model("small", device="cuda")
@@ -65,7 +68,23 @@ while True:
             continue
         final_command=r
         text=transcribe_command(final_command)
-        print(text)
+        result=claude_handler.ask_akira(text).replace("```json","").replace("```","").strip()
+        response=json.loads(result)
+        if response["mode"]=="command":
+            if response["end_session"]:
+                claude_handler.clear_history()
+                session_active=False
+                oww_model.reset()
+                continue
+            print(response)
+        elif response["mode"]=="conversation":
+            if response["end_session"]:
+                claude_handler.clear_history()
+                session_active=False
+                oww_model.reset()
+                continue
+            print(response)
+        
         session_active=True
         session_start_time = time.time()
         continue
@@ -85,7 +104,22 @@ while True:
                 continue
             final_command=r
             text=transcribe_command(final_command)
-            print(text)
+            result=claude_handler.ask_akira(text).replace("```json","").replace("```","").strip()
+            response=json.loads(result)
+            if response["mode"]=="command":
+                if response["end_session"]:
+                    claude_handler.clear_history()
+                    session_active=False
+                    oww_model.reset()
+                    continue
+                print(response)
+            elif response["mode"]=="conversation":
+                if response["end_session"]:
+                    claude_handler.clear_history()
+                    session_active=False
+                    oww_model.reset()
+                    continue
+                print(response)
             session_active=True
             session_start_time = time.time()
             last_activation_time=time.time()
