@@ -44,10 +44,12 @@ def record_command():
             if silent_chunks >= MAX_SILENT:
                 break
     if len(command_audio) == 0:
+        print("record_command: no audio or too quiet")
         return None
     command=np.concatenate(command_audio)
     final_command=command/32768.0 
     if np.sqrt(np.mean(command**2)) < 100:
+        print("record_command: no audio or too quiet")
         return None
     return final_command
 
@@ -56,6 +58,12 @@ def transcribe_command(final_command):
     result=whisper_model.transcribe(final_command,fp16=False, language="en")
     text=result["text"].strip()
     return text
+
+
+def flush_stream():
+    available = stream.get_read_available()
+    if available > 0:
+        stream.read(available, exception_on_overflow=False)
 
 
 while True:
@@ -70,23 +78,32 @@ while True:
         text=transcribe_command(final_command)
         result=claude_handler.ask_akira(text).replace("```json","").replace("```","").strip()
         response=json.loads(result)
+        print (response)
         if response["mode"]=="command":
             if response["end_session"]:
                 claude_handler.clear_history()
                 session_active=False
                 oww_model.reset()
                 continue
-            print(response)
+            if response["confirmation_required"]:
+                claude_handler.speak(response["confirmation_message"])
+                flush_stream()
+                session_start_time = time.time()
+            else:
+                claude_handler.speak(response["response"])
+                flush_stream()
+                session_start_time = time.time()
         elif response["mode"]=="conversation":
             if response["end_session"]:
                 claude_handler.clear_history()
                 session_active=False
                 oww_model.reset()
                 continue
-            print(response)
+            claude_handler.speak(response["response"])
+            flush_stream()
+            session_start_time = time.time()
         
         session_active=True
-        session_start_time = time.time()
         continue
     else:
         session_active=False
@@ -106,12 +123,21 @@ while True:
             text=transcribe_command(final_command)
             result=claude_handler.ask_akira(text).replace("```json","").replace("```","").strip()
             response=json.loads(result)
+            print (response)
             if response["mode"]=="command":
                 if response["end_session"]:
                     claude_handler.clear_history()
                     session_active=False
                     oww_model.reset()
                     continue
+                if response["confirmation_required"]:
+                    claude_handler.speak(response["confirmation_message"])
+                    flush_stream()
+                    session_start_time = time.time()
+                else:
+                    claude_handler.speak(response["response"])
+                    flush_stream()
+                    session_start_time = time.time()
                 print(response)
             elif response["mode"]=="conversation":
                 if response["end_session"]:
@@ -119,8 +145,9 @@ while True:
                     session_active=False
                     oww_model.reset()
                     continue
-                print(response)
+                claude_handler.speak(response["response"])
+                flush_stream()
+                session_start_time = time.time()
             session_active=True
-            session_start_time = time.time()
             last_activation_time=time.time()
             oww_model.reset()

@@ -1,4 +1,5 @@
 import os
+import pyttsx3
 import anthropic
 from dotenv import load_dotenv
 
@@ -39,6 +40,7 @@ Respond only in this exact JSON format, no markdown, no code fences, nothing els
   "parameter": "relevant parameter or detail",
   "confirmation_required": true or false,
   "confirmation_message": "message to ask user before executing, or null if not required",
+  "response": "short natural acknowledgment of what you're about to do",
   "end_session": true or false
 }
 
@@ -80,6 +82,20 @@ PERSONALITY RULES:
 """
 
 conversation_history=[]
+engine = pyttsx3.init()
+voices = engine.getProperty('voices')
+female_voice_id = None
+for voice in voices:
+    if "zira" in voice.name.lower() or (voice.gender and "female" in voice.gender.lower()):
+        female_voice_id = voice.id
+        break
+if female_voice_id:
+    engine.setProperty('voice', female_voice_id)
+else:
+    if len(voices) > 1:
+        engine.setProperty('voice', voices[1].id)
+engine.setProperty('rate', 215)
+engine.setProperty('volume', 0.9)
 
 
 def ask_akira(text):
@@ -93,11 +109,13 @@ def ask_akira(text):
     conversation_history.append({"role":"assistant","content":message.content[0].text})
     return message.content[0].text
 
+
 def clear_history():
     global conversation_history
     conversation_history=[]
     return conversation_history
 
-if __name__ == "__main__":
-    response = ask_akira("open spotify")
-    print(response)
+
+def speak(text):
+  engine.say(text)
+  engine.runAndWait()
