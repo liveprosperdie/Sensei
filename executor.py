@@ -2,6 +2,8 @@ import os
 import shutil
 import subprocess
 import webbrowser
+from comtypes import CLSCTX_ALL
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 
 URI_MAP = {
     "settings": "ms-settings:",
@@ -60,6 +62,16 @@ WEB_MAP = {
     "x": "https://x.com"
 }
 
+MUTE_MAP={
+        "mute":1,
+        "quiet":1,
+        "silence":1,
+        "shut it":1,
+        "unmute":0,
+        "speak up":0,
+    }
+
+
 def open_application(parameter):
     param = parameter.lower().strip()
     ALIASES = {
@@ -110,6 +122,36 @@ def open_application(parameter):
     return f"Trying to open {parameter}."
 
 
+def adjust_volume(parameter):
+    devices = AudioUtilities.GetSpeakers()
+    volume = devices.EndpointVolume
+    
+    parameter=parameter.lower().strip()
+
+    if parameter.startswith("+") or parameter.startswith("-"):
+        current = round(volume.GetMasterVolumeLevelScalar() * 100)
+        new = max(0, min(100, current + int(parameter)))
+        volume.SetMasterVolumeLevelScalar(new / 100.0, None)
+        return f"Volume set to {new}%."
+
+
+    if parameter in MUTE_MAP:
+        volume.SetMute(MUTE_MAP[parameter],None)
+        return f"Volume {'muted' if MUTE_MAP[parameter] else 'unmuted'}."
+    
+
+    try:
+        p=int(parameter)
+        if p<0:
+            p=0
+        elif p>100:
+            p=100
+        vol=p/100.0
+        volume.SetMasterVolumeLevelScalar(vol,None)
+        return f"Volume set to {p}%."
+    except ValueError:
+        pass   
+
 def execute(action, parameter):
     if action == "open_application":
         return open_application(parameter)
@@ -117,7 +159,9 @@ def execute(action, parameter):
         webbrowser.open(parameter)
         return f"Opening {parameter}."
     if action == "web_search":
-        webbrowser.open(f"https://www.google.com/search?q={parameter}")
+        webbrowser.open(f"https://www.google.com/search?q={parameter}")        
         return f"Searching for {parameter}."
+    if action == "adjust_volume":
+        return adjust_volume(parameter)
     return f"I don't know how to handle action: {action}"
 
