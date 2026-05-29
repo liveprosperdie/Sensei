@@ -6,14 +6,14 @@ import webbrowser
 URI_MAP = {
     "settings": "ms-settings:",
     "calculator": "calculator:",
-    "store": "ms-windows-store:",
+    "store": "ms-windows-store:",#
     "copilot": "ms-copilot:",
     "msedge":"microsoft-edge:",
-    "edge":"microsoft-edge:",
+    "edge":"microsoft-edge:",#
     "whatsapp": "whatsapp:",
     "paint":"ms-paint:",
     "chatgpt": "chatgpt:",
-    "teams": "msteams:",
+    "teams": "msteams:",#
     "xbox":  "xbox:",
     "notepad":"notepad"
 }
@@ -62,7 +62,22 @@ WEB_MAP = {
 
 def open_application(parameter):
     param = parameter.lower().strip()
-
+    ALIASES = {
+        "microsoft word": "word",
+        "microsoft excel": "excel",
+        "microsoft powerpoint": "powerpoint",
+        "microsoft store": "store",
+        "microsoft teams": "teams",
+        "google chrome": "chrome",
+        "mozilla firefox": "firefox",
+        "github desktop": "githubapp",
+        "github": "github",
+        "proton vpn": "protonvpn",
+        "adobe acrobat": "acrobat",
+        "adobe reader": "acrobat",
+        "git bash": "gitbash",
+    }
+    param = ALIASES.get(param, param)
     if param in URI_MAP:
         try:
             os.startfile(URI_MAP[param])
@@ -98,8 +113,11 @@ def open_application(parameter):
 def execute(action, parameter):
     if action == "open_application":
         return open_application(parameter)
+    if action == "open_url":
+        webbrowser.open(parameter)
+        return f"Opening {parameter}."
+    if action == "web_search":
+        webbrowser.open(f"https://www.google.com/search?q={parameter}")
+        return f"Searching for {parameter}."
     return f"I don't know how to handle action: {action}"
 
-
-if __name__ == "__main__":
-    print(execute("open_application", "gitbash"))

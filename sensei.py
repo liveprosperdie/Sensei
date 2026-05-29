@@ -7,9 +7,10 @@ import winsound
 import numpy as np
 import openwakeword
 import claude_handler
+from executor import execute
 from openwakeword import Model as WakeModel
 
-whisper_model=whisper.load_model("small", device="cuda")
+whisper_model=whisper.load_model("base", device="cuda")
 openwakeword.utils.download_models()
 oww_model = WakeModel(wakeword_models=["sensei.onnx"], inference_framework="onnx")
 
@@ -93,6 +94,7 @@ while True:
                 time.sleep(0.5)
                 session_start_time = time.time()
             else:
+                execute(response["action"], response["parameter"])
                 claude_handler.speak(response["response"])
                 flush_stream()
                 time.sleep(0.5)
@@ -143,6 +145,7 @@ while True:
                     time.sleep(0.5)
                     session_start_time = time.time()
                 else:
+                    execute(response["action"], response["parameter"])
                     claude_handler.speak(response["response"])
                     flush_stream()
                     time.sleep(0.5)
