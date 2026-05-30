@@ -364,6 +364,16 @@ def minimize_window(parameter):
     return f"Couldn't find {parameter} window."
 
 
+def shutdown():
+    subprocess.Popen(["shutdown", "/s", "/t", "0", "/f"])
+    return "Shutting down. Goodbye."
+
+
+def restart():
+    subprocess.Popen(["shutdown", "/r", "/t", "0", "/f"])
+    return "Restarting. Be right back."
+
+
 def execute(action, parameter):
     if action == "open_application":
         return open_application(parameter)
@@ -391,4 +401,8 @@ def execute(action, parameter):
         return maximize_window(parameter)
     if action == "minimize_window":
         return minimize_window(parameter)
+    if action == "shutdown":
+        return shutdown()
+    if action == "restart":
+        return restart()
     return f"I don't know how to handle action: {action}"
