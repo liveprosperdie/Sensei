@@ -27,6 +27,8 @@ URI_MAP = {
 _home = os.path.expanduser("~")
 
 MANUAL_MAP = {
+    "explorer": r"C:\Windows\explorer.exe",
+    "files": r"C:\Windows\explorer.exe",
     "brave":      r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
     "discord":    os.path.join(_home, "AppData", "Local", "Discord", "app-1.0.9238", "discord.exe"),
     "vlc":        r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
@@ -69,6 +71,7 @@ WEB_MAP = {
 WINDOW_TITLE_MAP = {
     "clock": "Clock",
     "calculator": "Calculator",
+    "file explorer": "explorer",
     "photos": "Photos",
     "maps": "Maps",
     "calendar": "Calendar",
@@ -102,6 +105,7 @@ BRIGHTNESS_MAP = {
     "low": 25,
     "high": 75,
 }
+
 
 def _open_single_app(parameter):
     param = parameter.lower().strip()
@@ -269,7 +273,18 @@ def adjust_brightness(parameter):
     except Exception as e:
         return f"Failed to set brightness: {e}"
 
-  
+
+def switch_window(parameter):
+    import pygetwindow as gw
+    param = parameter.lower().strip()
+    windows = gw.getAllWindows()
+    for win in windows:
+        if param in win.title.lower() and win.title:
+            win.activate()
+            return f"Switched to {parameter}."
+    return f"Couldn't find {parameter} window."
+
+
 def execute(action, parameter):
     if action == "open_application":
         return open_application(parameter)
@@ -291,4 +306,6 @@ def execute(action, parameter):
         return adjust_brightness(parameter)
     if action == "screenshot":
         return screenshot()
+    if action == "switch_window":
+        return switch_window(parameter)
     return f"I don't know how to handle action: {action}"
