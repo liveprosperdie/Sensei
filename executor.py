@@ -249,4 +249,3 @@ def execute(action, parameter):
     if action == "screenshot":
         return screenshot()
     return f"I don't know how to handle action: {action}"
-
