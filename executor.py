@@ -90,6 +90,18 @@ MUTE_MAP={
         "speak up":0,
     }
 
+BRIGHTNESS_MAP = {
+    "max": 100,
+    "full": 100,
+    "minimum": 0,
+    "min": 0,
+    "off": 0,
+    "half": 50,
+    "medium": 50,
+    "mid": 50,
+    "low": 25,
+    "high": 75,
+}
 
 def _open_single_app(parameter):
     param = parameter.lower().strip()
@@ -228,6 +240,35 @@ def screenshot():
     img.save(path)
     return f"Screenshot saved as {filename}."
 
+
+def adjust_brightness(parameter):
+    param = parameter.lower().strip()
+
+    if param in BRIGHTNESS_MAP:
+        new = BRIGHTNESS_MAP[param]
+    elif param.startswith("+") or param.startswith("-"):
+        try:
+            get_cmd = "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness).CurrentBrightness"
+            result = subprocess.run(["powershell", "-Command", get_cmd], capture_output=True, text=True)
+            current = int(result.stdout.strip())
+            new = max(0, min(100, current + int(param)))
+        except:
+            return "Couldn't read current brightness."
+    else:
+        try:
+            new = max(0, min(100, int(param)))
+        except ValueError:
+            return f"I don't understand '{parameter}' as a brightness level."
+
+    try:
+        set_cmd = f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1, {new})"
+        result = subprocess.run(["powershell", "-Command", set_cmd], capture_output=True)
+        if result.returncode != 0:
+            return "Couldn't change brightness — WMI may not be supported on this display."
+        return f"Brightness set to {new}%."
+    except Exception as e:
+        return f"Failed to set brightness: {e}"
+
   
 def execute(action, parameter):
     if action == "open_application":
@@ -246,6 +287,8 @@ def execute(action, parameter):
         return hibernate()
     if action == "lock_screen":
         return lock_screen()
+    if action == "adjust_brightness":
+        return adjust_brightness(parameter)
     if action == "screenshot":
         return screenshot()
     return f"I don't know how to handle action: {action}"

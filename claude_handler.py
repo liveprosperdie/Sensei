@@ -65,6 +65,7 @@ ACTION PARAMETER FORMATS:
 - close_application: use the app's common short name in lowercase. For multiple apps, comma-separate them — "spotify, clock". Never put multiple apps in the response only — always put ALL apps in the parameter field.
 - open_application: use the app's common short name in lowercase — "brave", "discord", "word", "youtube", "spotify". Never use "Microsoft Word", always "word". Never use "Google Chrome", always "chrome".
 - adjust_volume: use "+10" or "-10" for relative changes, "50" for absolute, "mute" or "unmute" to toggle.
+- adjust_brightness: use "+10" or "-10" for relative, "50" for absolute, or words like "max", "min", "half", "low", "high".
 
 FILES & FOLDERS: search_file, open_file, write_file, edit_file[C], move_files[C], copy_files, delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C], compress_files, extract_files
 

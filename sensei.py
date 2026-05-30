@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import torch
 import whisper
 import pyaudio
 import winsound
@@ -10,7 +11,8 @@ import claude_handler
 from executor import execute
 from openwakeword import Model as WakeModel
 
-whisper_model=whisper.load_model("base", device="cuda")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+whisper_model = whisper.load_model("base", device=device)
 openwakeword.utils.download_models()
 oww_model = WakeModel(wakeword_models=["sensei.onnx"], inference_framework="onnx")
 
@@ -84,6 +86,8 @@ while True:
         print (response)
         if response["mode"]=="command":
             if response["end_session"]:
+                execute(response["action"], response["parameter"]) 
+                claude_handler.speak(response["response"])
                 claude_handler.clear_history()
                 session_active=False
                 oww_model.reset()
@@ -101,6 +105,7 @@ while True:
                 session_start_time = time.time()
         elif response["mode"]=="conversation":
             if response["end_session"]:
+                claude_handler.speak(response["response"])
                 claude_handler.clear_history()
                 session_active=False
                 oww_model.reset()
@@ -135,6 +140,8 @@ while True:
             print (response)
             if response["mode"]=="command":
                 if response["end_session"]:
+                    execute(response["action"], response["parameter"]) 
+                    claude_handler.speak(response["response"])
                     claude_handler.clear_history()
                     session_active=False
                     oww_model.reset()
@@ -153,6 +160,7 @@ while True:
                 print(response)
             elif response["mode"]=="conversation":
                 if response["end_session"]:
+                    claude_handler.speak(response["response"])
                     claude_handler.clear_history()
                     session_active=False
                     oww_model.reset()
