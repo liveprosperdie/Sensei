@@ -67,6 +67,8 @@ ACTION PARAMETER FORMATS:
 - adjust_volume: use "+10" or "-10" for relative changes, "50" for absolute, "mute" or "unmute" to toggle.
 - adjust_brightness: use "+10" or "-10" for relative, "50" for absolute, or words like "max", "min", "half", "low", "high".
 - switch_window: triggered when user says "switch to", "show me", "bring up", "go to", or "focus on" an app that's already open.
+- maximize_window: always specify the app name — "spotify", "brave". Never send null.
+- minimize_window: always specify the app name.
 
 FILES & FOLDERS: search_file, open_file, write_file, edit_file[C], move_files[C], copy_files, delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C], compress_files, extract_files
 

@@ -82,6 +82,8 @@ while True:
         if not text:
             continue
         result=claude_handler.ask_akira(text).replace("```json","").replace("```","").strip()
+        if not result:
+            continue
         response=json.loads(result)
         print (response)
         if response["mode"]=="command":
@@ -136,6 +138,8 @@ while True:
             if not text:
                 continue
             result=claude_handler.ask_akira(text).replace("```json","").replace("```","").strip()
+            if not result:
+                continue
             response=json.loads(result)
             print (response)
             if response["mode"]=="command":

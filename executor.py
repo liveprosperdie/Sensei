@@ -1,8 +1,11 @@
 import os
 import shutil
+import psutil
 import datetime
 import webbrowser
 import subprocess
+import win32process
+import pygetwindow as gw
 from PIL import ImageGrab
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
@@ -275,13 +278,89 @@ def adjust_brightness(parameter):
 
 
 def switch_window(parameter):
-    import pygetwindow as gw
+
+    if not parameter:
+        return "Which window do you want to switch to?"
     param = parameter.lower().strip()
-    windows = gw.getAllWindows()
-    for win in windows:
+
+    for win in gw.getAllWindows():
         if param in win.title.lower() and win.title:
-            win.activate()
+            try:
+                win.activate()
+            except:
+                pass
             return f"Switched to {parameter}."
+        
+    for win in gw.getAllWindows():
+        if not win.title:
+            continue
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(win._hWnd)
+            proc = psutil.Process(pid)
+            if param in proc.name().lower():
+                try:
+                    win.activate()
+                except:
+                    pass
+                return f"Switched to {parameter}."
+        except:
+            continue
+    return f"Couldn't find {parameter} window."
+
+
+def maximize_window(parameter):
+    if not parameter:
+        return "Which window do you want to maximize?"
+    param = parameter.lower().strip()
+    
+    for win in gw.getAllWindows():
+        if param in win.title.lower() and win.title:
+            try:
+                win.activate()
+            except:
+                pass
+            win.maximize()
+            return f"Maximized {parameter}."
+    
+    for win in gw.getAllWindows():
+        if not win.title:
+            continue
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(win._hWnd)
+            proc = psutil.Process(pid)
+            if param in proc.name().lower():
+                try:
+                    win.activate()
+                except:
+                    pass
+                win.maximize()
+                return f"Maximized {parameter}."
+        except:
+            continue
+    return f"Couldn't find {parameter} window."
+
+
+def minimize_window(parameter):
+    if not parameter:
+        return "Which window do you want to minimize?"
+    param = parameter.lower().strip()
+    
+    for win in gw.getAllWindows():
+        if param in win.title.lower() and win.title:
+            win.minimize()
+            return f"Minimized {parameter}."
+    
+    for win in gw.getAllWindows():
+        if not win.title:
+            continue
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(win._hWnd)
+            proc = psutil.Process(pid)
+            if param in proc.name().lower():
+                win.minimize()
+                return f"Minimized {parameter}."
+        except:
+            continue
     return f"Couldn't find {parameter} window."
 
 
@@ -308,4 +387,8 @@ def execute(action, parameter):
         return screenshot()
     if action == "switch_window":
         return switch_window(parameter)
+    if action == "maximize_window":
+        return maximize_window(parameter)
+    if action == "minimize_window":
+        return minimize_window(parameter)
     return f"I don't know how to handle action: {action}"
