@@ -207,21 +207,16 @@ def lock_screen():
 
 def adjust_volume(parameter):
     devices = AudioUtilities.GetSpeakers()
-    volume = devices.EndpointVolume
-    
+    volume = devices.EndpointVolume  
     parameter=parameter.lower().strip()
-
     if parameter.startswith("+") or parameter.startswith("-"):
         current = round(volume.GetMasterVolumeLevelScalar() * 100)
         new = max(0, min(100, current + int(parameter)))
         volume.SetMasterVolumeLevelScalar(new / 100.0, None)
         return f"Volume set to {new}%."
-
-
     if parameter in MUTE_MAP:
         volume.SetMute(MUTE_MAP[parameter],None)
-        return f"Volume {'muted' if MUTE_MAP[parameter] else 'unmuted'}."
-    
+        return f"Volume {'muted' if MUTE_MAP[parameter] else 'unmuted'}."   
     try:
         p=int(parameter)
         if p<0:
@@ -266,7 +261,6 @@ def adjust_brightness(parameter):
             new = max(0, min(100, int(param)))
         except ValueError:
             return f"I don't understand '{parameter}' as a brightness level."
-
     try:
         set_cmd = f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1, {new})"
         result = subprocess.run(["powershell", "-Command", set_cmd], capture_output=True)
@@ -278,11 +272,9 @@ def adjust_brightness(parameter):
 
 
 def switch_window(parameter):
-
     if not parameter:
         return "Which window do you want to switch to?"
     param = parameter.lower().strip()
-
     for win in gw.getAllWindows():
         if param in win.title.lower() and win.title:
             try:
@@ -290,7 +282,6 @@ def switch_window(parameter):
             except:
                 pass
             return f"Switched to {parameter}."
-        
     for win in gw.getAllWindows():
         if not win.title:
             continue
@@ -311,8 +302,7 @@ def switch_window(parameter):
 def maximize_window(parameter):
     if not parameter:
         return "Which window do you want to maximize?"
-    param = parameter.lower().strip()
-    
+    param = parameter.lower().strip()   
     for win in gw.getAllWindows():
         if param in win.title.lower() and win.title:
             try:
@@ -320,8 +310,7 @@ def maximize_window(parameter):
             except:
                 pass
             win.maximize()
-            return f"Maximized {parameter}."
-    
+            return f"Maximized {parameter}."    
     for win in gw.getAllWindows():
         if not win.title:
             continue
@@ -343,13 +332,11 @@ def maximize_window(parameter):
 def minimize_window(parameter):
     if not parameter:
         return "Which window do you want to minimize?"
-    param = parameter.lower().strip()
-    
+    param = parameter.lower().strip()   
     for win in gw.getAllWindows():
         if param in win.title.lower() and win.title:
             win.minimize()
-            return f"Minimized {parameter}."
-    
+            return f"Minimized {parameter}."   
     for win in gw.getAllWindows():
         if not win.title:
             continue

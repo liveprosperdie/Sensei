@@ -257,32 +257,27 @@ if not female_voice_id and len(_voices) > 1:
 conversation_history=[]
 
 def predict_mode(text):
-    text = text.lower().strip()
-    
+    text = text.lower().strip() 
     command_keywords = [
         "open", "close", "play", "pause", "stop", "search",
         "volume", "brightness", "mute", "unmute", "lock",
         "shutdown", "restart", "screenshot", "minimize",
         "maximize", "switch", "send", "create", "delete",
         "download", "install", "find", "move", "copy"
-    ]
-    
+    ]   
     for keyword in command_keywords:
         if keyword in text:
-            return "command"
-    
+            return "command" 
     return "conversation"
 
 MAX_HISTORY = 6  
-
 
 def ask_akira(text):
     conversation_history.append({"role": "user", "content": text})
     if len(conversation_history) > MAX_HISTORY:
         conversation_history[:] = conversation_history[-MAX_HISTORY:]
     predicted_mode = predict_mode(text)
-    max_tokens = 200 if predicted_mode == "command" else 700
-    
+    max_tokens = 200 if predicted_mode == "command" else 700   
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=max_tokens,
@@ -298,8 +293,6 @@ def ask_akira(text):
     )
     response_text = message.content[0].text
     conversation_history.append({"role": "assistant", "content": response_text})
-    usage = message.usage
-    print(f"Tokens — in: {usage.input_tokens} | out: {usage.output_tokens} | cache_read: {getattr(usage, 'cache_read_input_tokens', 0)} | cache_created: {getattr(usage, 'cache_creation_input_tokens', 0)}")
     return response_text
 
 
