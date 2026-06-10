@@ -1,17 +1,20 @@
+import os
 import time
 import json
 import torch
-import whisper
 import pyaudio
+import tempfile
 import winsound
+import threading
 import numpy as np
 import openwakeword
 import claude_handler
+from groq import Groq
+import soundfile as sf
 from executor import execute
 from openwakeword import Model as WakeModel
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-whisper_model = whisper.load_model("base", device=device)
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 openwakeword.utils.download_models()
 oww_model = WakeModel(wakeword_models=["sensei.onnx"], inference_framework="onnx")
 
@@ -24,6 +27,11 @@ SESSION_TIMEOUT = 20
 session_start_time = 0.0
 pending_action = None
 pending_parameter = None
+akira_speaking = False
+user_speaking = threading.Event()
+vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
+vad_audio_buffer = []
+vad_buffer_lock = threading.Lock()
 print("Listening for 'Sensei'...")
 
 
@@ -32,7 +40,7 @@ def record_command():
     chunk_count = 0
     silent_chunks = 15
     MAX_CHUNKS = 200
-    MIN_CHUNKS = 60
+    MIN_CHUNKS = 48
     MAX_SILENT = 15
     while chunk_count < MAX_CHUNKS:
         audio_chunk = stream.read(1280, exception_on_overflow=False)
@@ -59,8 +67,17 @@ def record_command():
 
 
 def transcribe_command(final_command):
-    result = whisper_model.transcribe(final_command, fp16=False, language="en")
-    return result["text"].strip()
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        temp_path = f.name
+    sf.write(temp_path, final_command, 16000)
+    with open(temp_path, "rb") as f:
+        result = groq_client.audio.transcriptions.create(
+            model="whisper-large-v3-turbo",
+            file=f,
+            language="en"
+        )
+    os.remove(temp_path)
+    return result.text.strip()
 
 
 def flush_stream():
@@ -69,23 +86,45 @@ def flush_stream():
         stream.read(available, exception_on_overflow=False)
 
 
+def vad_listener():
+    while True:
+        if akira_speaking:
+            audio_chunk = stream.read(512, exception_on_overflow=False)
+            audio_np = np.frombuffer(audio_chunk, dtype=np.int16)
+            audio_float = torch.FloatTensor(audio_np.astype(np.float32) / 32768.0)
+            confidence = vad_model(audio_float, 16000).item()
+            if confidence > 0.5:
+                user_speaking.set()
+        else:
+            time.sleep(0.01)
+
+
 def handle_response(response):
     """Process a parsed Akira response. Returns True if session should continue, False if it should end."""
-    global session_start_time, pending_action, pending_parameter
+    global session_start_time, pending_action, pending_parameter,akira_speaking
 
     if response["mode"] == "command":
         if response["end_session"]:
             execute(response["action"], response["parameter"])
+            akira_speaking = True
             claude_handler.speak(response["response"])
+            akira_speaking = False
+            user_speaking.clear()
             claude_handler.clear_history()
             return False
         if response["confirmation_required"]:
             pending_action = response["action"]
             pending_parameter = response["parameter"]
-            claude_handler.speak(response["confirmation_message"] + " Say yes to confirm.")
+            akira_speaking = True
+            claude_handler.speak(response["response"])
+            akira_speaking = False
+            user_speaking.clear()
         else:
             execute(response["action"], response["parameter"])
+            akira_speaking = True
             claude_handler.speak(response["response"])
+            akira_speaking = False
+            user_speaking.clear()
         flush_stream()
         time.sleep(0.5)
         session_start_time = time.time()
@@ -93,10 +132,16 @@ def handle_response(response):
 
     elif response["mode"] == "conversation":
         if response["end_session"]:
+            akira_speaking = True
             claude_handler.speak(response["response"])
+            akira_speaking = False
+            user_speaking.clear()
             claude_handler.clear_history()
             return False
+        akira_speaking = True
         claude_handler.speak(response["response"])
+        akira_speaking = False
+        user_speaking.clear()
         flush_stream()
         time.sleep(0.5)
         session_start_time = time.time()
@@ -131,6 +176,8 @@ def get_akira_response(text):
         return None
     return json.loads(raw)
 
+vad_thread = threading.Thread(target=vad_listener, daemon=True)
+vad_thread.start()
 
 while True:
     current_time = time.time()
