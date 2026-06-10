@@ -35,9 +35,9 @@ vad_buffer_lock = threading.Lock()
 print("Listening for 'Sensei'...")
 
 
-def record_command():
-    command_audio = []
-    chunk_count = 0
+def record_command(pre_audio=None):
+    command_audio = [pre_audio] if pre_audio is not None else []
+    chunk_count = 1 if pre_audio is not None else 0
     silent_chunks = 15
     MAX_CHUNKS = 200
     MIN_CHUNKS = 48
@@ -60,7 +60,7 @@ def record_command():
         return None
     command = np.concatenate(command_audio)
     final_command = command / 32768.0
-    if np.sqrt(np.mean(command ** 2)) < 100:
+    if pre_audio is None and np.sqrt(np.mean(command ** 2)) < 100:
         print("record_command: no audio or too quiet")
         return None
     return final_command
@@ -81,12 +81,14 @@ def transcribe_command(final_command):
 
 
 def flush_stream():
-    available = stream.get_read_available()
-    if available > 0:
-        stream.read(available, exception_on_overflow=False)
+    if not user_speaking.is_set():
+        available = stream.get_read_available()
+        if available > 0:
+            stream.read(available, exception_on_overflow=False)
 
 
 def vad_listener():
+    global vad_audio_buffer
     while True:
         if akira_speaking:
             audio_chunk = stream.read(512, exception_on_overflow=False)
@@ -95,6 +97,8 @@ def vad_listener():
             confidence = vad_model(audio_float, 16000).item()
             if confidence > 0.5:
                 user_speaking.set()
+                with vad_buffer_lock:
+                    vad_audio_buffer.append(audio_np.astype(np.float32))
         else:
             time.sleep(0.01)
 
@@ -182,7 +186,16 @@ vad_thread.start()
 while True:
     current_time = time.time()
     if session_active and (current_time - session_start_time) < SESSION_TIMEOUT:
-        r = record_command()
+        with vad_buffer_lock:
+            if user_speaking.is_set() and len(vad_audio_buffer) > 0:
+                pre_audio = np.concatenate(vad_audio_buffer)
+                vad_audio_buffer.clear()
+                user_speaking.clear()
+            else:
+                pre_audio = None
+                vad_audio_buffer.clear()
+        print(f"DEBUG: user_speaking={user_speaking.is_set()}, buffer_len={len(vad_audio_buffer)}, pre_audio={'yes' if pre_audio is not None else 'no'}")
+        r = record_command(pre_audio=pre_audio)
         if r is None:
             session_active = False
             oww_model.reset()
