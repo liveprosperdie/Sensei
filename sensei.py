@@ -2,18 +2,23 @@ import os
 import time
 import json
 import torch
+import socket
 import pyaudio
 import tempfile
 import winsound
 import threading
+import subprocess
 import numpy as np
 import openwakeword
+import browser_setup
 import claude_handler
 from groq import Groq
 import soundfile as sf
 from executor import execute
 from openwakeword import Model as WakeModel
 
+
+browser_setup.setup_browsers()
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 openwakeword.utils.download_models()
 oww_model = WakeModel(wakeword_models=["sensei.onnx"], inference_framework="onnx")
@@ -103,32 +108,49 @@ def vad_listener():
             time.sleep(0.01)
 
 
+def speak_and_wait(text):
+    """Sets akira_speaking before speech starts (so VAD listens during it),
+    runs speak() in a thread, and blocks here until it's done before returning."""
+    global akira_speaking
+    akira_speaking = True
+    thread = claude_handler.speak_async(text)
+    thread.join()
+    akira_speaking = False
+    user_speaking.clear()
+
+
+def run_actions(response):
+    """Execute one action or a list of actions. Returns a list of result strings."""
+    results = []
+    if "actions" in response and response["actions"]:
+        for step in response["actions"]:
+            result = execute(step["action"], step.get("parameter"))
+            results.append(result)
+    elif response.get("action"):
+        result = execute(response["action"], response.get("parameter"))
+        results.append(result)
+    return results
+
+
 def handle_response(response):
-    """Process a parsed Akira response. Returns True if session should continue, False if it should end."""
-    global session_start_time, pending_action, pending_parameter,akira_speaking
+    global session_start_time, pending_action, pending_parameter, akira_speaking
 
     if response["mode"] == "command":
-        if response["end_session"]:
-            execute(response["action"], response["parameter"])
-            akira_speaking = True
-            claude_handler.speak(response["response"])
-            akira_speaking = False
-            user_speaking.clear()
+        # Run immediate actions first, regardless of confirmation status
+        if response.get("actions") or response.get("action"):
+            run_actions(response)
+
+        if response.get("confirmation_required") and response.get("pending_actions"):
+            pending_action = response["pending_actions"]
+            pending_parameter = None
+
+        speak_and_wait(response["response"])
+
+        if response.get("end_session"):
+            flush_stream()
             claude_handler.clear_history()
             return False
-        if response["confirmation_required"]:
-            pending_action = response["action"]
-            pending_parameter = response["parameter"]
-            akira_speaking = True
-            claude_handler.speak(response["response"])
-            akira_speaking = False
-            user_speaking.clear()
-        else:
-            execute(response["action"], response["parameter"])
-            akira_speaking = True
-            claude_handler.speak(response["response"])
-            akira_speaking = False
-            user_speaking.clear()
+
         flush_stream()
         time.sleep(0.5)
         session_start_time = time.time()
@@ -136,16 +158,10 @@ def handle_response(response):
 
     elif response["mode"] == "conversation":
         if response["end_session"]:
-            akira_speaking = True
-            claude_handler.speak(response["response"])
-            akira_speaking = False
-            user_speaking.clear()
+            speak_and_wait(response["response"])
             claude_handler.clear_history()
             return False
-        akira_speaking = True
-        claude_handler.speak(response["response"])
-        akira_speaking = False
-        user_speaking.clear()
+        speak_and_wait(response["response"])
         flush_stream()
         time.sleep(0.5)
         session_start_time = time.time()
@@ -159,15 +175,25 @@ def get_akira_response(text):
 
     if pending_action is not None:
         if any(word in text.lower() for word in ["yes", "yeah", "yep", "do it", "confirm", "sure"]):
-            response = {
-                "mode": "command",
-                "action": pending_action,
-                "parameter": pending_parameter,
-                "confirmation_required": False,
-                "confirmation_message": None,
-                "response": "Done.",
-                "end_session": False
-            }
+            if isinstance(pending_action, list):
+                response = {
+                    "mode": "command",
+                    "actions": pending_action,
+                    "confirmation_required": False,
+                    "confirmation_message": None,
+                    "response": "Done.",
+                    "end_session": False
+                }
+            else:
+                response = {
+                    "mode": "command",
+                    "action": pending_action,
+                    "parameter": pending_parameter,
+                    "confirmation_required": False,
+                    "confirmation_message": None,
+                    "response": "Done.",
+                    "end_session": False
+                }
             pending_action = None
             pending_parameter = None
             return response
@@ -175,7 +201,11 @@ def get_akira_response(text):
             pending_action = None
             pending_parameter = None
 
-    raw = claude_handler.ask_akira(text).replace("```json", "").replace("```", "").strip()
+    try:
+        raw = claude_handler.ask_akira(text).replace("```json", "").replace("```", "").strip()
+    except Exception as e:
+        print(f"API error: {e}")
+        return {"mode": "conversation", "response": "Sorry, having trouble connecting right now.", "end_session": False}
     if not raw:
         return None
     return json.loads(raw)
@@ -194,7 +224,6 @@ while True:
             else:
                 pre_audio = None
                 vad_audio_buffer.clear()
-        print(f"DEBUG: user_speaking={user_speaking.is_set()}, buffer_len={len(vad_audio_buffer)}, pre_audio={'yes' if pre_audio is not None else 'no'}")
         r = record_command(pre_audio=pre_audio)
         if r is None:
             session_active = False
