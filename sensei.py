@@ -135,14 +135,37 @@ def run_actions(response):
 def handle_response(response):
     global session_start_time, pending_action, pending_parameter, akira_speaking
 
+    DANGEROUS_ACTIONS = {
+        "close_application", "shutdown", "restart", "hibernate",
+        "delete_files", "move_files", "edit_file", "uninstall_application"
+    }
+
     if response["mode"] == "command":
-        # Run immediate actions first, regardless of confirmation status
+        # Safety net — never run dangerous actions without confirmation
         if response.get("actions") or response.get("action"):
-            run_actions(response)
+            actions_to_check = response.get("actions", [])
+            if response.get("action"):
+                actions_to_check = [{"action": response["action"], "parameter": response.get("parameter")}]
+            unsafe = [a for a in actions_to_check if a["action"] in DANGEROUS_ACTIONS]
+            safe = [a for a in actions_to_check if a["action"] not in DANGEROUS_ACTIONS]
+            if unsafe and not response.get("confirmation_required"):
+                response["confirmation_required"] = True
+                response["pending_actions"] = unsafe
+                response["actions"] = safe
+                response.pop("action", None)
+                response.pop("parameter", None)
+                response["confirmation_message"] = "Just confirming before I do that."
+            if safe and not response.get("confirmation_required"):
+                run_actions({"actions": safe})
+            elif not unsafe:
+                run_actions(response)
 
         if response.get("confirmation_required") and response.get("pending_actions"):
             pending_action = response["pending_actions"]
             pending_parameter = None
+        elif response.get("confirmation_required") and response.get("action"):
+            pending_action = response["action"]
+            pending_parameter = response.get("parameter")
 
         speak_and_wait(response["response"])
 
@@ -174,40 +197,21 @@ def get_akira_response(text):
     global pending_action, pending_parameter
 
     if pending_action is not None:
-        if any(word in text.lower() for word in ["yes", "yeah", "yep", "do it", "confirm", "sure"]):
-            if isinstance(pending_action, list):
-                response = {
-                    "mode": "command",
-                    "actions": pending_action,
-                    "confirmation_required": False,
-                    "confirmation_message": None,
-                    "response": "Done.",
-                    "end_session": False
-                }
-            else:
-                response = {
-                    "mode": "command",
-                    "action": pending_action,
-                    "parameter": pending_parameter,
-                    "confirmation_required": False,
-                    "confirmation_message": None,
-                    "response": "Done.",
-                    "end_session": False
-                }
+        confirmed = claude_handler.ask_confirmation(text)
+        if confirmed:
+            actions = pending_action if isinstance(pending_action, list) else [{"action": pending_action, "parameter": pending_parameter}]
             pending_action = None
             pending_parameter = None
-            return response
+            run_actions({"actions": actions})
+            speak_and_wait("Done.")
+            return None
         else:
             pending_action = None
             pending_parameter = None
 
-    try:
-        raw = claude_handler.ask_akira(text).replace("```json", "").replace("```", "").strip()
-    except Exception as e:
-        print(f"API error: {e}")
-        return {"mode": "conversation", "response": "Sorry, having trouble connecting right now.", "end_session": False}
+    raw = claude_handler.ask_akira(text).replace("```json", "").replace("```", "").strip()
     if not raw:
-        return None
+        return {"mode": "conversation", "response": "Sorry, having trouble connecting right now.", "end_session": False}
     return json.loads(raw)
 
 vad_thread = threading.Thread(target=vad_listener, daemon=True)
@@ -265,4 +269,5 @@ while True:
             session_active = handle_response(response)
             if session_active:
                 last_activation_time = time.time()
+                session_start_time = time.time()
                 oww_model.reset()

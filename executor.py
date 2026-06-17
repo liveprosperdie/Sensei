@@ -48,7 +48,7 @@ MANUAL_MAP = {
     "explorer": r"C:\Windows\explorer.exe",
     "files": r"C:\Windows\explorer.exe",
     "brave":      r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-    "discord":    os.path.join(_home, "AppData", "Local", "Discord", "app-1.0.9238", "discord.exe"),
+    "discord": os.path.join(_home, "AppData", "Local", "Discord", "app-1.0.9238", "discord.exe"),
     "vlc":        r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
     "obsidian":   os.path.join(_home, "AppData", "Local", "Programs", "Obsidian", "obsidian.exe"),
     "notion":     os.path.join(_home, "AppData", "Local", "Programs", "Notion", "notion.exe"),
@@ -128,6 +128,39 @@ BRIGHTNESS_MAP = {
 _browsers = {}
 
 BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+
+
+def _attach_cdp_browser(binary_path, port, driver_service):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    result = sock.connect_ex(('127.0.0.1', port))
+    sock.close()
+    if result != 0:
+        subprocess.Popen([
+            binary_path,
+            f"--remote-debugging-port={port}",
+            "--profile-directory=Default"
+        ])
+        time.sleep(3)
+    options = Options()
+    options.binary_location = binary_path
+    options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+    driver = webdriver.Chrome(service=driver_service, options=options)
+    existing = set(driver.window_handles)
+    if hasattr(driver, '_akira_tab') and driver._akira_tab in driver.window_handles:
+        pass
+    else:
+        driver.execute_cdp_cmd('Target.createTarget', {'url': 'about:blank'})
+        for _ in range(10):
+            new_handles = [h for h in driver.window_handles if h not in existing]
+            if new_handles:
+                break
+            time.sleep(0.3)
+        driver._akira_tab = new_handles[0]
+    driver.switch_to.window(driver._akira_tab)
+    return driver
+
 
 def _get_default_browser():
     try:
@@ -150,78 +183,69 @@ def get_browser(name=None, incognito=False):
     name = name.lower().strip()
     key = f"{name}_incognito" if incognito else name
     if key in _browsers:
+        driver = _browsers[key]
         try:
-            _ = _browsers[key].title
-            return _browsers[key]
+            _ = driver.title  # checks session is alive
+            # now validate the akira tab specifically
+            if hasattr(driver, '_akira_tab') and driver._akira_tab not in driver.window_handles:
+                # tab was closed — recreate it
+                existing = set(driver.window_handles)
+                driver.execute_cdp_cmd('Target.createTarget', {'url': 'about:blank'})
+                for _ in range(10):
+                    new_handles = [h for h in driver.window_handles if h not in existing]
+                    if new_handles:
+                        break
+                    time.sleep(0.3)
+                driver._akira_tab = new_handles[0]
+                driver.switch_to.window(driver._akira_tab)
+            return driver
         except:
             del _browsers[key]
     if name == "brave":
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        result = sock.connect_ex(('127.0.0.1', 9222))
-        sock.close()
-        if result != 0:
-            subprocess.Popen([
-                BRAVE_PATH,
-                "--remote-debugging-port=9222",
-                "--profile-directory=Default"
-            ])
-            time.sleep(3)
-        options = Options()
-        options.binary_location = BRAVE_PATH
-        options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
-        brave_driver = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
-        service = Service(brave_driver if os.path.exists(brave_driver) else ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-        existing = set(driver.window_handles)
-        # Check if we already have a live Akira tab
-        if hasattr(driver, '_akira_tab') and driver._akira_tab in driver.window_handles:
-            pass  # reuse it
+        if incognito:
+            options = Options()
+            options.binary_location = BRAVE_PATH
+            options.add_argument("--incognito")
+            service_path = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
+            service = Service(service_path if os.path.exists(service_path) else ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
         else:
-            driver.execute_cdp_cmd('Target.createTarget', {'url': 'about:blank'})
-            for _ in range(10):
-                new_handles = [h for h in driver.window_handles if h not in existing]
-                if new_handles:
-                    break
-                time.sleep(0.3)
-            driver._akira_tab = new_handles[0]
-        driver.switch_to.window(driver._akira_tab)
-        def _ensure_akira_tab(browser):
-            if hasattr(browser, '_akira_tab') and browser._akira_tab in browser.window_handles:
-                browser.switch_to.window(browser._akira_tab)
-                return
-            # Tab was closed, create a new one
-            existing = set(browser.window_handles)
-            browser.execute_cdp_cmd('Target.createTarget', {'url': 'about:blank'})
-            for _ in range(10):
-                new_handles = [h for h in browser.window_handles if h not in existing]
-                if new_handles:
-                    break
-                time.sleep(0.3)
-            browser._akira_tab = new_handles[0]
-            browser.switch_to.window(browser._akira_tab)
+            service_path = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
+            service = Service(service_path if os.path.exists(service_path) else ChromeDriverManager().install())
+            driver = _attach_cdp_browser(BRAVE_PATH, 9222, service)
+
     elif name == "chrome":
-        options = Options()
-        options.add_argument("--start-maximized")
-        options.add_argument("--new-window")
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
+        if incognito:
+            options = Options()
+            options.binary_location = CHROME_PATH
+            options.add_argument("--incognito")
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=options)
+        else:
+            service = Service(ChromeDriverManager().install())
+            driver = _attach_cdp_browser(CHROME_PATH, 9223, service)
+
     elif name == "firefox":
         options = FirefoxOptions()
         if incognito:
             options.add_argument("-private")
         service = FirefoxService(GeckoDriverManager().install())
         driver = webdriver.Firefox(service=service, options=options)
+
     elif name == "edge":
-        options = EdgeOptions()
         if incognito:
+            options = EdgeOptions()
+            options.binary_location = EDGE_PATH
             options.add_argument("--inprivate")
-        service = EdgeService(EdgeChromiumDriverManager().install())
-        driver = webdriver.Edge(service=service, options=options)
+            service = EdgeService(EdgeChromiumDriverManager().install())
+            driver = webdriver.Edge(service=service, options=options)
+        else:
+            service = EdgeService(EdgeChromiumDriverManager().install())
+            driver = _attach_cdp_browser(EDGE_PATH, 9224, service)
+
     else:
-        options = Options()
-        options.add_argument("--start-maximized")
         service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
+        driver = _attach_cdp_browser(CHROME_PATH, 9223, service)
     _browsers[key] = driver
     return driver
 
@@ -234,13 +258,15 @@ def new_tab(parameter=None):
         if new_handles:
             break
         time.sleep(0.3)
-    browser._akira_tab = new_handles[0]
-    browser.switch_to.window(browser._akira_tab)
+    new_handle = new_handles[0]
+    browser.switch_to.window(new_handle)
+    # DO NOT update _akira_tab
     if parameter:
         query = urllib.parse.quote(parameter)
         browser.get(f"https://www.google.com/search?q={query}")
         return f"Searching {parameter} in a new tab."
     return "Opened a new tab."
+
 
 def _open_single_app(parameter):
     param = parameter.lower().strip()
@@ -288,7 +314,7 @@ def _open_single_app(parameter):
         return f"Opening {parameter}."
     except:
         pass
-    subprocess.Popen(f"start {parameter}", shell=True)
+    subprocess.Popen(["cmd", "/c", "start", "", parameter])
     return f"Trying to open {parameter}."
 
 
@@ -326,6 +352,17 @@ def _close_single_app(parameter):
 
 
 def close_application(parameter):
+    if parameter.strip().lower() == "all":
+        for proc in psutil.process_iter(['name']):
+            try:
+                if proc.info['name'].lower() not in [
+                    "explorer.exe", "sensei.py", "python.exe", "pythonw.exe",
+                    "svchost.exe", "system", "registry", "smss.exe"
+                ]:
+                    proc.kill()
+            except:
+                pass
+        return "Closed everything."
     apps = [p.strip() for p in parameter.split(",")]
     for app in apps:
         _close_single_app(app)
@@ -359,7 +396,7 @@ def adjust_volume(parameter):
         volume.SetMasterVolumeLevelScalar(vol,None)
         return f"Volume set to {p}%."
     except ValueError:
-        pass   
+        return f"I don't understand '{parameter}' as a volume level."
 
 
 def hibernate():
@@ -497,6 +534,8 @@ def execute(action, parameter):
     if action == "open_application":
         return open_application(parameter)
     if action == "open_url":
+        if not parameter or not parameter.startswith(("https://", "http://")):
+            return "That doesn't look like a valid URL."
         browser = get_browser()
         existing = set(browser.window_handles)
         browser.execute_cdp_cmd('Target.createTarget', {'url': parameter})

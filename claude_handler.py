@@ -91,6 +91,7 @@ If the user's request requires more than one action — e.g. "search one piece a
 }
 
 Rules:
+- close_application, shutdown, restart, hibernate, delete_files, move_files, edit_file, uninstall_application — these ALWAYS go in pending_actions, never in actions. No exceptions.
 - "actions" = things that run immediately, no confirmation needed.
 - "pending_actions" = things that require confirmation (any action marked [C]). These do NOT run until the user confirms.
 - If nothing needs confirmation, omit "pending_actions" entirely (or leave it empty) and set confirmation_required: false.
@@ -299,28 +300,16 @@ if not female_voice_id and len(_voices) > 1:
 
 conversation_history=[]
 
-def predict_mode(text):
-    text = text.lower().strip() 
-    command_keywords = [
-        "open", "close", "play", "pause", "stop", "search",
-        "volume", "brightness", "mute", "unmute", "lock",
-        "shutdown", "restart", "screenshot", "minimize",
-        "maximize", "switch", "send", "create", "delete",
-        "download", "install", "find", "move", "copy"
-    ]   
-    for keyword in command_keywords:
-        if keyword in text:
-            return "command" 
-    return "conversation"
-
 MAX_HISTORY = 6
 
 def ask_akira(text):
     conversation_history.append({"role": "user", "content": text})
     if len(conversation_history) > MAX_HISTORY:
-        conversation_history[:] = conversation_history[-MAX_HISTORY:]
-    predicted_mode = predict_mode(text)
-    max_tokens = 300 if predicted_mode == "command" else 700   
+        trim = len(conversation_history) - MAX_HISTORY
+        if trim % 2 != 0:
+            trim += 1
+        conversation_history[:] = conversation_history[trim:]
+    max_tokens = 500
     message = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=max_tokens,
@@ -364,3 +353,13 @@ def speak_async(text, on_done=None):
     thread = threading.Thread(target=_run, daemon=True)
     thread.start()
     return thread
+    
+
+def ask_confirmation(text):
+    message = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=10,
+        system="The user was just asked to confirm an action. Reply only with YES or NO based on whether their response is a confirmation or a rejection. Nothing else.",
+        messages=[{"role": "user", "content": text}]
+    )
+    return message.content[0].text.strip().upper().startswith("YES")
