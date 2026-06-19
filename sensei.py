@@ -2,15 +2,12 @@ import os
 import time
 import json
 import torch
-import socket
 import pyaudio
 import tempfile
 import winsound
 import threading
-import subprocess
 import numpy as np
 import openwakeword
-import browser_setup
 import claude_handler
 from groq import Groq
 import soundfile as sf
@@ -18,7 +15,6 @@ from executor import execute
 from openwakeword import Model as WakeModel
 
 
-browser_setup.setup_browsers()
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 openwakeword.utils.download_models()
 oww_model = WakeModel(wakeword_models=["sensei.onnx"], inference_framework="onnx")
