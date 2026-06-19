@@ -1,9 +1,9 @@
 import os
 import time
-import socket
 import shutil
 import psutil
 import winreg
+import requests
 import datetime
 import webbrowser
 import subprocess
@@ -131,22 +131,61 @@ BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.ex
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 
+import psutil  # add this to your imports at top of executor.py
 
 def _attach_cdp_browser(binary_path, port, driver_service):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    result = sock.connect_ex(('127.0.0.1', port))
-    sock.close()
-    if result != 0:
+    def _port_ready():
+        try:
+            resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    if not _port_ready():
+        # Check if browser is already running without debug port
+        binary_name = os.path.basename(binary_path).lower()
+        already_running = False
+        for p in psutil.process_iter(['name']):
+            try:
+                if p.info['name'] and p.info['name'].lower() == binary_name:
+                    already_running = True
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        if already_running:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/IM", binary_name],
+                capture_output=True
+            )
+            time.sleep(1.0)
+
+        akira_profile_dir = os.path.join(os.environ['LOCALAPPDATA'], 'Sensei', 'AkiraChromeProfile')
+        os.makedirs(akira_profile_dir, exist_ok=True)
+
         subprocess.Popen([
             binary_path,
             f"--remote-debugging-port={port}",
-            "--profile-directory=Default"
+            f"--user-data-dir={akira_profile_dir}",
+            "--no-first-run",
+            "--disable-session-crashed-bubble",
+            "--restore-last-session=false"
         ])
-        time.sleep(3)
+
+        for _ in range(40):
+            if _port_ready():
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError(
+                f"Browser at {binary_path} did not bind debug port {port} within 20 seconds"
+            )
+
     options = Options()
     options.binary_location = binary_path
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
     driver = webdriver.Chrome(service=driver_service, options=options)
+
     existing = set(driver.window_handles)
     if hasattr(driver, '_akira_tab') and driver._akira_tab in driver.window_handles:
         pass
@@ -158,21 +197,85 @@ def _attach_cdp_browser(binary_path, port, driver_service):
                 break
             time.sleep(0.3)
         driver._akira_tab = new_handles[0]
+
     driver.switch_to.window(driver._akira_tab)
     return driver
 
+
+def _attach_cdp_edge(port):
+    def _port_ready():
+        try:
+            resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    if not _port_ready():
+        already_running = False
+        for p in psutil.process_iter(['name']):
+            try:
+                if p.info['name'] and p.info['name'].lower() == "msedge.exe":
+                    already_running = True
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+        if already_running:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/IM", "msedge.exe"],
+                capture_output=True
+            )
+            time.sleep(1.0)
+
+        subprocess.Popen([
+            EDGE_PATH,
+            f"--remote-debugging-port={port}",
+            "--profile-directory=Default",
+            "--no-first-run",
+            "--disable-session-crashed-bubble",
+            "--restore-last-session=false"
+        ])
+
+        for _ in range(20):
+            if _port_ready():
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError(f"Edge did not bind debug port {port} within 10 seconds")
+
+    options = EdgeOptions()
+    options.binary_location = EDGE_PATH
+    options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+    service = EdgeService(EdgeChromiumDriverManager().install())
+    driver = webdriver.Edge(service=service, options=options)
+
+    existing = set(driver.window_handles)
+    if hasattr(driver, '_akira_tab') and driver._akira_tab in driver.window_handles:
+        pass
+    else:
+        driver.execute_cdp_cmd('Target.createTarget', {'url': 'about:blank'})
+        for _ in range(10):
+            new_handles = [h for h in driver.window_handles if h not in existing]
+            if new_handles:
+                break
+            time.sleep(0.3)
+        driver._akira_tab = new_handles[0]
+
+    driver.switch_to.window(driver._akira_tab)
+    return driver
 
 def _get_default_browser():
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 
             r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice") as key:
             prog_id = winreg.QueryValueEx(key, "ProgId")[0].lower()
+            print(f"[DEBUG] _get_default_browser raw ProgId: {prog_id}")
             if "brave" in prog_id: return "brave"
             if "chrome" in prog_id: return "chrome"
             if "firefox" in prog_id: return "firefox"
             if "edge" in prog_id: return "edge"
-    except:
-        pass
+    except Exception as e:
+        print(f"[DEBUG] _get_default_browser registry read failed: {e}")
     return "edge"
 
 
@@ -240,9 +343,7 @@ def get_browser(name=None, incognito=False):
             service = EdgeService(EdgeChromiumDriverManager().install())
             driver = webdriver.Edge(service=service, options=options)
         else:
-            service = EdgeService(EdgeChromiumDriverManager().install())
-            driver = _attach_cdp_browser(EDGE_PATH, 9224, service)
-
+            driver = _attach_cdp_edge(9224)
     else:
         service = Service(ChromeDriverManager().install())
         driver = _attach_cdp_browser(CHROME_PATH, 9223, service)
@@ -250,7 +351,12 @@ def get_browser(name=None, incognito=False):
     return driver
 
 def new_tab(parameter=None):
-    browser = get_browser()
+    browser_name = None
+    if parameter and "|browser:" in parameter:
+        parameter, browser_name = parameter.split("|browser:", 1)
+        parameter = parameter.strip()
+        browser_name = browser_name.strip()
+    browser = get_browser(browser_name)
     existing = set(browser.window_handles)
     browser.execute_cdp_cmd('Target.createTarget', {'url': 'chrome://newtab'})
     for _ in range(10):
@@ -547,10 +653,26 @@ def execute(action, parameter):
         browser.switch_to.window(new_handles[0])
         return f"Opening {parameter}."
     if action == "web_search":
+        print(f"[DEBUG] web_search called with action={action} parameter={parameter}")
+        browser_name = None
+        if parameter and "|browser:" in parameter:
+            parts = parameter.split("|browser:")
+            parameter = parts[0].strip()
+            browser_name = parts[1].strip()
+        print(f"[DEBUG] browser_name={browser_name} query={parameter}")
         query = urllib.parse.quote(parameter)
-        browser = get_browser()
+        try:
+            browser = get_browser(name=browser_name)
+        except RuntimeError as e:
+            print(f"[DEBUG] get_browser raised: {e}")
+            return str(e)
+        print(f"[DEBUG] got browser, all handles: {browser.window_handles}")
+        print(f"[DEBUG] akira_tab: {browser._akira_tab}")
+        print(f"[DEBUG] current handle before switch: {browser.current_window_handle}")
         browser.switch_to.window(browser._akira_tab)
+        print(f"[DEBUG] navigating to: https://www.google.com/search?q={query}")
         browser.get(f"https://www.google.com/search?q={query}")
+        print(f"[DEBUG] done, current url: {browser.current_url}")
         return f"Searching for {parameter}."
     if action == "bookmark_page":
         get_browser().execute_script("window.bookmarks = window.bookmarks || []; window.bookmarks.push(document.URL);")
