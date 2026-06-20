@@ -131,7 +131,41 @@ BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.ex
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 
-import psutil  # add this to your imports at top of executor.py
+
+def extract_interactive_elements(driver, max_elements=40):
+    """
+    Returns a list of visible, interactive elements on the current page,
+    each tagged with an index Akira can reference ("click element 3").
+    """
+    script = """
+    const items = [];
+    const selector = 'a, button, input, textarea, select, [role="button"], [onclick]';
+    const elements = document.querySelectorAll(selector);
+    let idx = 0;
+    for (const el of elements) {
+        const rect = el.getBoundingClientRect();
+        const visible = rect.width > 0 && rect.height > 0 &&
+            window.getComputedStyle(el).visibility !== 'hidden' &&
+            window.getComputedStyle(el).display !== 'none';
+        if (!visible) continue;
+
+        const text = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '').trim().slice(0, 100);
+        if (!text && el.tagName !== 'INPUT') continue;
+
+        items.push({
+            index: idx,
+            tag: el.tagName.toLowerCase(),
+            type: el.type || null,
+            text: text
+        });
+        el.setAttribute('data-akira-index', idx);
+        idx++;
+        if (idx >= arguments[0]) break;
+    }
+    return items;
+    """
+    return driver.execute_script(script, max_elements)
+
 
 def _attach_cdp_browser(binary_path, port, driver_service):
     def _port_ready():
