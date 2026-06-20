@@ -133,6 +133,48 @@ EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 
 import psutil  # add this to your imports at top of executor.py
 
+def extract_interactive_elements(driver, max_elements=40):
+    """
+    Returns a list of visible, interactive elements on the current page,
+    each tagged with an index Akira can reference ("click element 3").
+    """
+    script = """
+    const items = [];
+    const selector = 'a, button, input, textarea, select, [role="button"], [onclick]';
+    const elements = document.querySelectorAll(selector);
+    let idx = 0;
+    for (const el of elements) {
+        const rect = el.getBoundingClientRect();
+        const visible = rect.width > 0 && rect.height > 0 &&
+            window.getComputedStyle(el).visibility !== 'hidden' &&
+            window.getComputedStyle(el).display !== 'none';
+        if (!visible) continue;
+
+        let text = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '');
+        text = text.replace(/\\s+/g, ' ').trim().slice(0, 100);
+        if (!text && el.tagName !== 'INPUT') continue;
+
+        const isActionable = ['INPUT', 'TEXTAREA', 'BUTTON', 'SELECT'].includes(el.tagName);
+        if (!el.href && !isActionable) continue;
+
+        items.push({
+            index: idx,
+            tag: el.tagName.toLowerCase(),
+            type: el.type || null,
+            text: text,
+            href: el.href || null
+        });
+        el.setAttribute('data-akira-index', idx);
+        idx++;
+        if (idx >= arguments[0]) break;
+    }
+    return items;
+    """
+    elements = driver.execute_script(script, max_elements)
+    print(f"[DEBUG] extract_interactive_elements found {len(elements)} elements")
+    return elements
+
+
 def _attach_cdp_browser(binary_path, port, driver_service):
     def _port_ready():
         try:
