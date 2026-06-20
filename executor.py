@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import shutil
 import psutil
@@ -131,7 +132,13 @@ BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.ex
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 
-import psutil  # add this to your imports at top of executor.py
+RISKY_KEYWORDS = [
+    "buy", "purchase", "checkout", "pay", "payment", "subscribe",
+    "submit", "send", "confirm order", "place order", "delete",
+    "remove", "cancel subscription", "sign up", "register", "donate",
+    "transfer", "withdraw", "discard", "archive", "block", "report",
+    "unsubscribe", "forward"
+]
 
 def extract_interactive_elements(driver, max_elements=40):
     """
