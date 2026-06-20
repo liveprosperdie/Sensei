@@ -182,6 +182,47 @@ def extract_interactive_elements(driver, max_elements=40):
     return elements
 
 
+def click_element(driver, index, expected_text=None, expected_href=None, instruction=None):
+    """
+    Clicks the element at `index`. Re-extracts the DOM fresh to guard against
+    staleness. If the element at that index no longer matches what was
+    originally matched, re-runs the matching layer once (costs one Haiku call)
+    instead of clicking the wrong thing.
+    """
+    fresh_elements = extract_interactive_elements(driver)
+
+    if index >= len(fresh_elements):
+        return {"success": False, "reason": "index out of range after re-extraction"}
+
+    current = fresh_elements[index]
+    stale = (
+        (expected_text is not None and current["text"] != expected_text) or
+        (expected_href is not None and current["href"] != expected_href)
+    )
+
+    if stale and instruction:
+        from claude_handler import find_element_index
+        new_index = find_element_index(fresh_elements, instruction)
+        if new_index is None or new_index >= len(fresh_elements):
+            return {"success": False, "reason": "element not found after page changed"}
+        index = new_index
+        current = fresh_elements[index]
+    elif stale:
+        return {"success": False, "reason": "element changed, no instruction to re-match against"}
+
+    text_lower = current["text"].lower()
+    needs_confirmation = any(kw in text_lower for kw in RISKY_KEYWORDS)
+
+    return {
+        "success": True,
+        "needs_confirmation": needs_confirmation,
+        "element": current,
+        "_execute": lambda: driver.execute_script(
+            f"document.querySelector('[data-akira-index=\"{index}\"]').click();"
+        )
+    }
+
+
 def _attach_cdp_browser(binary_path, port, driver_service):
     def _port_ready():
         try:
