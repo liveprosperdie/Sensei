@@ -1,4 +1,5 @@
 import os
+import json
 import pyttsx3
 import anthropic
 import threading
@@ -367,3 +368,34 @@ def ask_confirmation(text):
         messages=[{"role": "user", "content": text}]
     )
     return message.content[0].text.strip().upper().startswith("YES")
+
+
+def find_element_index(elements, instruction):
+    """
+    Given a list of extracted page elements and a natural-language instruction,
+    returns the matching element's index, or None if no confident match exists.
+    """
+    elements_text = "\n".join(
+        f"{el['index']}: tag={el['tag']} type={el['type']} text=\"{el['text']}\"" + (f" href={el['href']}" if el['href'] else "")
+        for el in elements
+    )
+    message = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=10,
+        system=(
+            "You match a user's instruction to one element from a numbered list of page elements. "
+            "Reply with ONLY the index number of the best match. "
+            "If nothing is a confident match, reply with exactly: NONE"
+        ),
+        messages=[{
+            "role": "user",
+            "content": f"Elements:\n{elements_text}\n\nInstruction: {instruction}"
+        }]
+    )
+    result = message.content[0].text.strip()
+    if result.upper() == "NONE":
+        return None
+    try:
+        return int(result)
+    except ValueError:
+        return None
