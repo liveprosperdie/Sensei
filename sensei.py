@@ -116,15 +116,22 @@ def speak_and_wait(text):
 
 
 def run_actions(response):
-    """Execute one action or a list of actions. Returns a list of result strings."""
+    """Execute one action or a list of actions. Returns a list of result strings.
+    If any result needs click-confirmation, that's signaled via global pending state
+    set here directly (mirrors how handle_response sets pending_action elsewhere)."""
+    global pending_action, pending_parameter
     results = []
-    if "actions" in response and response["actions"]:
-        for step in response["actions"]:
-            result = execute(step["action"], step.get("parameter"))
+    steps = response.get("actions", [])
+    if not steps and response.get("action"):
+        steps = [{"action": response["action"], "parameter": response.get("parameter")}]
+    for step in steps:
+        result = execute(step["action"], step.get("parameter"))
+        if isinstance(result, dict) and result.get("needs_click_confirmation"):
+            pending_action = "click"
+            pending_parameter = result["retry_parameter"]
+            results.append(f"Are you sure you want to click '{result['element_text']}'?")
+        else:
             results.append(result)
-    elif response.get("action"):
-        result = execute(response["action"], response.get("parameter"))
-        results.append(result)
     return results
 
 
@@ -152,9 +159,16 @@ def handle_response(response):
                 response.pop("parameter", None)
                 response["confirmation_message"] = "Just confirming before I do that."
             if safe and not response.get("confirmation_required"):
-                run_actions({"actions": safe})
+                run_results = run_actions({"actions": safe})
             elif not unsafe:
-                run_actions(response)
+                run_results = run_actions(response)
+            else:
+                run_results = []
+
+            # click_element can discover risk only after matching — if it did,
+            # override whatever Akira originally planned to say with the real question.
+            if pending_action == "click" and pending_parameter and run_results:
+                response["response"] = run_results[-1]
 
         if response.get("confirmation_required") and response.get("pending_actions"):
             pending_action = response["pending_actions"]
