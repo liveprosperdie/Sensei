@@ -169,6 +169,10 @@ def handle_response(response):
             # override whatever Akira originally planned to say with the real question.
             if pending_action == "click" and pending_parameter and run_results:
                 response["response"] = run_results[-1]
+            elif run_results and any(isinstance(r, str) and r.startswith("I couldn't find") for r in run_results):
+                response["response"] = run_results[-1]
+            elif run_results and any(isinstance(r, str) and r.startswith("Couldn't click") for r in run_results):
+                response["response"] = run_results[-1]
 
         if response.get("confirmation_required") and response.get("pending_actions"):
             pending_action = response["pending_actions"]

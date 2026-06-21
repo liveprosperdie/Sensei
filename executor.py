@@ -127,6 +127,7 @@ BRIGHTNESS_MAP = {
 
 
 _browsers = {}
+_last_browser_name = None
 
 BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
@@ -438,6 +439,8 @@ def get_browser(name=None, incognito=False):
         service = Service(ChromeDriverManager().install())
         driver = _attach_cdp_browser(CHROME_PATH, 9223, service)
     _browsers[key] = driver
+    global _last_browser_name
+    _last_browser_name = name
     return driver
 
 def new_tab(parameter=None):
@@ -794,11 +797,11 @@ def execute(action, parameter):
     if action == "restart":
         return restart()
     if action == "click":
-        # parameter is the natural-language instruction, e.g. "the search button"
-        browser = get_browser()
+        browser = get_browser(_last_browser_name)
         elements = extract_interactive_elements(browser)
         from claude_handler import find_element_index
         index = find_element_index(elements, parameter)
+        print(f"[DEBUG] click: matched index={index} for instruction='{parameter}'")
         if index is None or index >= len(elements):
             return "I couldn't find that on the page."
         target = elements[index]
