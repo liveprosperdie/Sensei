@@ -793,4 +793,20 @@ def execute(action, parameter):
         return shutdown()
     if action == "restart":
         return restart()
+    if action == "click":
+        # parameter is the natural-language instruction, e.g. "the search button"
+        browser = get_browser()
+        elements = extract_interactive_elements(browser)
+        from claude_handler import find_element_index
+        index = find_element_index(elements, parameter)
+        if index is None or index >= len(elements):
+            return "I couldn't find that on the page."
+        target = elements[index]
+        result = click_element(browser, index, expected_text=target["text"], expected_href=target["href"], instruction=parameter)
+        if not result["success"]:
+            return f"Couldn't click that: {result['reason']}"
+        if result["needs_confirmation"]:
+            return {"needs_confirmation": True, "element_text": result["element"]["text"], "_execute": result["_execute"]}
+        result["_execute"]()
+        return f"Clicked {result['element']['text']}."
     return f"I don't know how to handle action: {action}"
