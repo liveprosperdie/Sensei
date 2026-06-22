@@ -99,8 +99,8 @@ SEARCH_URL_MAP = {
     "pinterest":   "https://www.pinterest.com/search/pins/?q={}",
     "amazon":      "https://www.amazon.in/s?k={}",
     "flipkart":    "https://www.flipkart.com/search?q={}",
-    "makemytrip":  "https://www.makemytrip.com/hotels/hotel-listing/?searchText={}",
-    "ixigo":       "https://www.ixigo.com/search?query={}",
+    "makemytrip":  "https://www.makemytrip.com/hotels/",
+    "ixigo":       "https://www.ixigo.com/hotels",
     "chatgpt":     "https://chatgpt.com/?q={}",
     "claude":      "https://claude.ai/new?q={}",
     "gemini":      "https://gemini.google.com/app?q={}",
@@ -781,24 +781,22 @@ def execute(action, parameter):
         browser.switch_to.window(new_handles[0])
         return f"Opening {parameter}."
     if action == "site_search":
-        # parameter format: "site|query" e.g. "youtube|One Piece"
         if not parameter or "|" not in parameter:
             return "I need a site and a query to search."
         site, query = parameter.split("|", 1)
         site = site.strip().lower()
         query = query.strip()
         url_template = SEARCH_URL_MAP.get(site)
-        if not url_template:
-            # fallback: open site homepage and do a google search
-            fallback = f"https://www.google.com/search?q={urllib.parse.quote(query)}+site:{site}.com"
-            browser = get_browser(_last_browser_name)
-            browser.switch_to.window(browser._akira_tab)
-            browser.get(fallback)
-            return f"Searching {query} on {site}."
-        url = url_template.format(urllib.parse.quote(query))
+        url = url_template.format(urllib.parse.quote(query)) if url_template else f"https://www.google.com/search?q={urllib.parse.quote(query)}+site:{site}.com"
         browser = get_browser(_last_browser_name)
-        browser.switch_to.window(browser._akira_tab)
-        browser.get(url)
+        existing = set(browser.window_handles)
+        browser.execute_cdp_cmd('Target.createTarget', {'url': url})
+        for _ in range(10):
+            new_handles = [h for h in browser.window_handles if h not in existing]
+            if new_handles:
+                break
+            time.sleep(0.3)
+        browser.switch_to.window(new_handles[0])
         return f"Searching {query} on {site}."
     if action == "web_search":
         print(f"[DEBUG] web_search called with action={action} parameter={parameter}")

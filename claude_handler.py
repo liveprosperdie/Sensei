@@ -133,9 +133,10 @@ FILES & FOLDERS: search_file, open_file, write_file, edit_file[C], move_files[C]
 
 DOWNLOADS & INSTALL: download_file, download_application, install_application[C], uninstall_application[C]
 
-BROWSER & SEARCH: web_search, open_url, summarize_document, new_tab, click
+BROWSER & SEARCH: web_search, open_url, site_search, summarize_document, new_tab, click
 ACTION PARAMETER FORMATS:
-- web_search parameter format: if the user specifies a browser, append "|browser:name" to the query. Example: "one piece|browser:chrome", "naruto|browser:edge". If no browser specified, just use the query as-is. Never invent a browser name like "current" — if no browser is specified, omit the |browser: suffix entirely.
+- web_search: use for general web searches only. Parameter is the query, optionally with "|browser:name" suffix for a specific browser (chrome, brave, edge, firefox only). Never use a website name as a browser.
+- site_search: use when the user wants to search ON a specific website or platform. Parameter format is "site|query". Examples: "youtube|One Piece", "amazon|wireless headphones", "reddit|python tips", "makemytrip|hotels in goa", "netflix|dark". Use this for youtube, netflix, spotify, amazon, flipkart, reddit, twitter, instagram, pinterest, github, stackoverflow, wikipedia, makemytrip, ixigo, chatgpt, claude, gemini, perplexity, and any other platform where the user is searching within that site.
 - click: parameter is a natural-language description of what to click, exactly as the user said it — e.g. "the official python website", "register", "the search button". Do not try to guess element indices or hrefs yourself, just pass through the description.
 
 CODE: write_code, fix_code, read_clipboard, write_clipboard, dictate_text
