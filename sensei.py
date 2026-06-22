@@ -28,6 +28,7 @@ SESSION_TIMEOUT = 20
 session_start_time = 0.0
 pending_action = None
 pending_parameter = None
+pending_execute = None
 akira_speaking = False
 user_speaking = threading.Event()
 vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
@@ -119,7 +120,7 @@ def run_actions(response):
     """Execute one action or a list of actions. Returns a list of result strings.
     If any result needs click-confirmation, that's signaled via global pending state
     set here directly (mirrors how handle_response sets pending_action elsewhere)."""
-    global pending_action, pending_parameter
+    global pending_action, pending_parameter, pending_execute
     results = []
     steps = response.get("actions", [])
     if not steps and response.get("action"):
@@ -127,8 +128,9 @@ def run_actions(response):
     for step in steps:
         result = execute(step["action"], step.get("parameter"))
         if isinstance(result, dict) and result.get("needs_click_confirmation"):
-            pending_action = "click"
+            pending_action = "click_confirmed"
             pending_parameter = result["retry_parameter"]
+            pending_execute = result["_execute"]
             results.append(f"Are you sure you want to click '{result['element_text']}'?")
         else:
             results.append(result)

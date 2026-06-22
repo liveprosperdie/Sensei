@@ -805,11 +805,24 @@ def execute(action, parameter):
         if index is None or index >= len(elements):
             return "I couldn't find that on the page."
         target = elements[index]
-        result = click_element(browser, index, expected_text=target["text"], expected_href=target["href"], instruction=parameter)
+        try:
+            result = click_element(browser, index, expected_text=target["text"], expected_href=target["href"], instruction=parameter)
+        except Exception as e:
+            print(f"[DEBUG] click: EXCEPTION in click_element: {e!r}")
+            return f"Couldn't click that: {e}"
+        print(f"[DEBUG] click: click_element returned keys={list(result.keys()) if isinstance(result, dict) else result!r}")
         if not result["success"]:
+            print(f"[DEBUG] click: returning failure")
             return f"Couldn't click that: {result['reason']}"
         if result["needs_confirmation"]:
-            return {"needs_confirmation": True, "element_text": result["element"]["text"], "_execute": result["_execute"]}
-        result["_execute"]()
+            print(f"[DEBUG] click: needs confirmation, returning dict")
+            return {"needs_click_confirmation": True, "element_text": result["element"]["text"], "_execute": result["_execute"], "retry_parameter": parameter}
+        print(f"[DEBUG] click: calling _execute()")
+        try:
+            result["_execute"]()
+        except Exception as e:
+            print(f"[DEBUG] click: EXCEPTION in _execute(): {e!r}")
+            return f"Couldn't click that: {e}"
+        print(f"[DEBUG] click: _execute() done, returning success")
         return f"Clicked {result['element']['text']}."
     return f"I don't know how to handle action: {action}"
