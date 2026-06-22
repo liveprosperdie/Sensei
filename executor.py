@@ -190,7 +190,7 @@ def click_element(driver, index, expected_text=None, expected_href=None, instruc
     originally matched, re-runs the matching layer once (costs one Haiku call)
     instead of clicking the wrong thing.
     """
-    fresh_elements = extract_interactive_elements(driver)
+    fresh_elements = extract_interactive_elements(driver, max_elements=100)
 
     if index >= len(fresh_elements):
         return {"success": False, "reason": "index out of range after re-extraction"}
@@ -830,7 +830,7 @@ def execute(action, parameter):
         return restart()
     if action == "click":
         browser = get_browser(_last_browser_name)
-        elements = extract_interactive_elements(browser)
+        elements = extract_interactive_elements(browser, max_elements=100)
         from claude_handler import find_element_index
         index = find_element_index(elements, parameter)
         print(f"[DEBUG] click: matched index={index} for instruction='{parameter}'")
