@@ -87,6 +87,30 @@ WEB_MAP = {
     "x": "https://x.com"
 }
 
+SEARCH_URL_MAP = {
+    "youtube":     "https://www.youtube.com/results?search_query={}",
+    "google":      "https://www.google.com/search?q={}",
+    "gmail":       "https://mail.google.com/mail/u/0/#search/{}",
+    "github":      "https://github.com/search?q={}",
+    "reddit":      "https://www.reddit.com/search/?q={}",
+    "twitter":     "https://x.com/search?q={}",
+    "x":           "https://x.com/search?q={}",
+    "instagram":   "https://www.instagram.com/explore/search/keyword/?q={}",
+    "pinterest":   "https://www.pinterest.com/search/pins/?q={}",
+    "amazon":      "https://www.amazon.in/s?k={}",
+    "flipkart":    "https://www.flipkart.com/search?q={}",
+    "makemytrip":  "https://www.makemytrip.com/hotels/hotel-listing/?searchText={}",
+    "ixigo":       "https://www.ixigo.com/search?query={}",
+    "chatgpt":     "https://chatgpt.com/?q={}",
+    "claude":      "https://claude.ai/new?q={}",
+    "gemini":      "https://gemini.google.com/app?q={}",
+    "perplexity":  "https://www.perplexity.ai/search?q={}",
+    "stackoverflow": "https://stackoverflow.com/search?q={}",
+    "wikipedia":   "https://en.wikipedia.org/w/index.php?search={}",
+    "spotify":     "https://open.spotify.com/search/{}",
+    "netflix":     "https://www.netflix.com/search?q={}",
+}
+
 WINDOW_TITLE_MAP = {
     "clock": "Clock",
     "calculator": "Calculator",
