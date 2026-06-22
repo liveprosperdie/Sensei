@@ -777,6 +777,27 @@ def execute(action, parameter):
         print(f"[DEBUG] navigating to: https://www.google.com/search?q={query}")
         browser.get(f"https://www.google.com/search?q={query}")
         print(f"[DEBUG] done, current url: {browser.current_url}")
+        try:
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+            reject_selectors = [
+                "button[id*='reject']",
+                "button[aria-label*='Reject']",
+                "button[aria-label*='Accept all']",
+                "form[action*='consent'] button",
+            ]
+            for selector in reject_selectors:
+                try:
+                    btn = WebDriverWait(browser, 2).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                    btn.click()
+                    print(f"[DEBUG] web_search: dismissed popup via selector: {selector}")
+                    break
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"[DEBUG] web_search: popup dismiss failed silently: {e!r}")
         return f"Searching for {parameter}."
     if action == "bookmark_page":
         get_browser().execute_script("window.bookmarks = window.bookmarks || []; window.bookmarks.push(document.URL);")

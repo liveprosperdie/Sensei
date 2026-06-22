@@ -240,10 +240,14 @@ def get_akira_response(text):
             pending_parameter = None
             pending_execute = None
 
-    raw = claude_handler.ask_akira(text).replace("```json", "").replace("```", "").strip()
-    if not raw:
-        return {"mode": "conversation", "response": "Sorry, having trouble connecting right now.", "end_session": False}
-    return json.loads(raw)
+    try:
+        raw = claude_handler.ask_akira(text).replace("```json", "").replace("```", "").strip()
+        if not raw:
+            return {"mode": "conversation", "response": "Sorry, having trouble connecting right now.", "end_session": False}
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"[DEBUG] get_akira_response: JSONDecodeError: {e!r} | raw was: {raw!r}")
+        return {"mode": "conversation", "response": "Something went wrong on my end. Say that again.", "end_session": False}
 
 vad_thread = threading.Thread(target=vad_listener, daemon=True)
 vad_thread.start()
