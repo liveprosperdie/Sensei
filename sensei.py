@@ -210,20 +210,35 @@ def handle_response(response):
 
 
 def get_akira_response(text):
-    global pending_action, pending_parameter
+    global pending_action, pending_parameter, pending_execute
 
     if pending_action is not None:
         confirmed = claude_handler.ask_confirmation(text)
         if confirmed:
-            actions = pending_action if isinstance(pending_action, list) else [{"action": pending_action, "parameter": pending_parameter}]
-            pending_action = None
-            pending_parameter = None
-            run_actions({"actions": actions})
-            speak_and_wait("Done.")
-            return None
+            if pending_action == "click_confirmed" and pending_execute is not None:
+                try:
+                    pending_execute()
+                    speak_text = "Done."
+                except Exception as e:
+                    print(f"[DEBUG] get_akira_response: EXCEPTION in pending_execute: {e!r}")
+                    speak_text = f"Couldn't click that: {e}"
+                pending_action = None
+                pending_parameter = None
+                pending_execute = None
+                speak_and_wait(speak_text)
+                return None
+            else:
+                actions = pending_action if isinstance(pending_action, list) else [{"action": pending_action, "parameter": pending_parameter}]
+                pending_action = None
+                pending_parameter = None
+                pending_execute = None
+                run_actions({"actions": actions})
+                speak_and_wait("Done.")
+                return None
         else:
             pending_action = None
             pending_parameter = None
+            pending_execute = None
 
     raw = claude_handler.ask_akira(text).replace("```json", "").replace("```", "").strip()
     if not raw:
