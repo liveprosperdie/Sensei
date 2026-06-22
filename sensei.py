@@ -201,8 +201,9 @@ def run_actions(response, step_results=None):
 
     return results
 
+
 def handle_response(response):
-    global session_start_time, pending_action, pending_parameter, akira_speaking
+    global session_start_time, pending_action, pending_parameter, pending_execute, akira_speaking
 
     DANGEROUS_ACTIONS = {
         "close_application", "shutdown", "restart", "hibernate",
@@ -210,20 +211,28 @@ def handle_response(response):
     }
 
     if response["mode"] == "command":
-        # Safety net — never run dangerous actions without confirmation
+
         if response.get("actions") or response.get("action"):
+
+            # normalize to actions list
             actions_to_check = response.get("actions", [])
             if response.get("action"):
                 actions_to_check = [{"action": response["action"], "parameter": response.get("parameter")}]
+
+            # safety net — catch dangerous actions Claude forgot to gate
             unsafe = [a for a in actions_to_check if a["action"] in DANGEROUS_ACTIONS]
             safe = [a for a in actions_to_check if a["action"] not in DANGEROUS_ACTIONS]
+
             if unsafe and not response.get("confirmation_required"):
+                print(f"[DEBUG] handle_response: safety net caught ungated dangerous actions: {[a['action'] for a in unsafe]}")
                 response["confirmation_required"] = True
                 response["pending_actions"] = unsafe
                 response["actions"] = safe
                 response.pop("action", None)
                 response.pop("parameter", None)
                 response["confirmation_message"] = "Just confirming before I do that."
+
+            # run safe actions now
             if safe and not response.get("confirmation_required"):
                 run_results = run_actions({"actions": safe})
             elif not unsafe:
@@ -231,15 +240,24 @@ def handle_response(response):
             else:
                 run_results = []
 
-            # click_element can discover risk only after matching — if it did,
-            # override whatever Akira originally planned to say with the real question.
-            if pending_action == "click" and pending_parameter and run_results:
-                response["response"] = run_results[-1]
-            elif run_results and any(isinstance(r, str) and r.startswith("I couldn't find") for r in run_results):
-                response["response"] = run_results[-1]
-            elif run_results and any(isinstance(r, str) and r.startswith("Couldn't click") for r in run_results):
+            # override spoken response if execution produced a more useful message
+            if run_results:
+                override_prefixes = (
+                    "I couldn't find",
+                    "Couldn't click",
+                    "Skipped",
+                    "Something went wrong",
+                )
+                for r in reversed(run_results):
+                    if isinstance(r, str) and r.startswith(override_prefixes):
+                        response["response"] = r
+                        break
+
+            # click confirmation discovered at runtime
+            if pending_action == "click_confirmed" and run_results:
                 response["response"] = run_results[-1]
 
+        # store pending dangerous actions for confirmation
         if response.get("confirmation_required") and response.get("pending_actions"):
             pending_action = response["pending_actions"]
             pending_parameter = None
