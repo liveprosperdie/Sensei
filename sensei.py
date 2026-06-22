@@ -116,26 +116,90 @@ def speak_and_wait(text):
     user_speaking.clear()
 
 
-def run_actions(response):
-    """Execute one action or a list of actions. Returns a list of result strings.
-    If any result needs click-confirmation, that's signaled via global pending state
-    set here directly (mirrors how handle_response sets pending_action elsewhere)."""
+def run_actions(response, step_results=None):
+    """Execute one action or a list of actions with full chain/dependency support.
+
+    Supports:
+    - id/depends_on dependency graph
+    - {{stepX.result}} substitution before each step runs
+    - per-step result storage
+    - dependent steps halt on failed dependency
+    - independent steps never blocked by each other
+    - click confirmation pause via existing pending state
+    """
     global pending_action, pending_parameter, pending_execute
+
+    if step_results is None:
+        step_results = {}
+
     results = []
     steps = response.get("actions", [])
     if not steps and response.get("action"):
         steps = [{"action": response["action"], "parameter": response.get("parameter")}]
+
+    failed_ids = set()
+
     for step in steps:
-        result = execute(step["action"], step.get("parameter"))
+        step_id = step.get("id")
+        depends_on = step.get("depends_on")
+
+        # dependency check — skip if dependency failed
+        if depends_on and depends_on in failed_ids:
+            msg = f"Skipped {step.get('action')} because {depends_on} failed."
+            print(f"[DEBUG] run_actions: {msg}")
+            results.append(msg)
+            if step_id:
+                failed_ids.add(step_id)
+            continue
+
+        # {{stepX.result}} substitution
+        parameter = step.get("parameter")
+        if parameter and isinstance(parameter, str) and "{{" in parameter:
+            import re
+            def substitute(match):
+                ref_id = match.group(1)
+                return str(step_results.get(ref_id, match.group(0)))
+            parameter = re.sub(r"\{\{(\w+)\.result\}\}", substitute, parameter)
+            print(f"[DEBUG] run_actions: substituted parameter={parameter!r}")
+
+        print(f"[DEBUG] run_actions: executing action={step['action']} parameter={parameter!r} id={step_id}")
+
+        try:
+            result = execute(step["action"], parameter)
+        except Exception as e:
+            print(f"[DEBUG] run_actions: EXCEPTION in execute: {e!r}")
+            result = f"Something went wrong running {step['action']}: {e}"
+
+        # click confirmation — pause chain, store state
         if isinstance(result, dict) and result.get("needs_click_confirmation"):
             pending_action = "click_confirmed"
             pending_parameter = result["retry_parameter"]
             pending_execute = result["_execute"]
-            results.append(f"Are you sure you want to click '{result['element_text']}'?")
-        else:
-            results.append(result)
-    return results
+            msg = f"Are you sure you want to click '{result['element_text']}'?"
+            results.append(msg)
+            # store partial results so chain can resume later if needed
+            if step_id:
+                step_results[step_id] = None
+                failed_ids.add(step_id)
+            break
 
+        # store result by id for downstream substitution
+        if step_id:
+            step_results[step_id] = result
+
+        # track failures for dependent steps
+        if isinstance(result, str) and (
+            result.startswith("Couldn't") or
+            result.startswith("I couldn't") or
+            result.startswith("Something went wrong") or
+            result.startswith("Skipped")
+        ):
+            if step_id:
+                failed_ids.add(step_id)
+
+        results.append(result)
+
+    return results
 
 def handle_response(response):
     global session_start_time, pending_action, pending_parameter, akira_speaking
