@@ -214,13 +214,24 @@ def click_element(driver, index, expected_text=None, expected_href=None, instruc
     text_lower = current["text"].lower()
     needs_confirmation = any(kw in text_lower for kw in RISKY_KEYWORDS)
 
+    selector = f'[data-akira-index="{index}"]'
+    matched_elements = driver.find_elements(By.CSS_SELECTOR, selector)
+    if not matched_elements:
+        return {"success": False, "reason": "element not found in DOM after extraction"}
+    selenium_element = matched_elements[0]
+
+    def _do_click(el=selenium_element):
+        try:
+            el.click()
+        except Exception:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+            driver.execute_script("arguments[0].click();", el)
+
     return {
         "success": True,
         "needs_confirmation": needs_confirmation,
         "element": current,
-        "_execute": lambda: driver.execute_script(
-            f"document.querySelector('[data-akira-index=\"{index}\"]').click();"
-        )
+        "_execute": _do_click
     }
 
 
