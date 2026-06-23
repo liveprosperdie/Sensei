@@ -780,6 +780,36 @@ def execute(action, parameter):
             time.sleep(0.3)
         browser.switch_to.window(new_handles[0])
         return f"Opening {parameter}."
+    if action == "fill":
+        # parameter format: "description|text to type|submit" or "description|text to type"
+        # submit is optional, if present hits Enter after typing
+        if not parameter or "|" not in parameter:
+            return "I need a field description and text to type."
+        parts = parameter.split("|")
+        instruction = parts[0].strip()
+        text = parts[1].strip()
+        should_submit = len(parts) > 2 and parts[2].strip().lower() == "submit"
+        browser = get_browser(_last_browser_name)
+        elements = extract_interactive_elements(browser, max_elements=100)
+        from claude_handler import find_element_index
+        index = find_element_index(elements, instruction)
+        if index is None or index >= len(elements):
+            return "I couldn't find that field on the page."
+        selector = f'[data-akira-index="{index}"]'
+        matched = browser.find_elements(By.CSS_SELECTOR, selector)
+        if not matched:
+            return "Couldn't locate that field in the DOM."
+        el = matched[0]
+        try:
+            el.click()
+            el.clear()
+            el.send_keys(text)
+            if should_submit:
+                from selenium.webdriver.common.keys import Keys
+                el.send_keys(Keys.RETURN)
+        except Exception as e:
+            return f"Couldn't type into that field: {e}"
+        return f"Typed '{text}' into {instruction}." + (" Submitted." if should_submit else "")
     if action == "site_search":
         if not parameter or "|" not in parameter:
             return "I need a site and a query to search."
