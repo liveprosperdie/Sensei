@@ -770,7 +770,23 @@ def youtube_control(parameter):
                 elements = extract_interactive_elements(browser, max_elements=100)
                 idx = find_element_index(elements, click_targets[param])
             if idx is None:
-                return f"Couldn't find {param} on the page."
+                print(f"[DEBUG] youtube_control: trying vision fallback for {param}")
+                import datetime
+                screenshot_path = os.path.join(_home, "Pictures", "Screenshots", f"akira_vision_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+                from PIL import ImageGrab
+                img = ImageGrab.grab()
+                img.save(screenshot_path)
+                from claude_handler import vision_match
+                coords = vision_match(screenshot_path, click_targets[param])
+                os.remove(screenshot_path)
+                if coords is None:
+                    return f"Couldn't find {param} on the page."
+                x, y = coords
+                browser.execute_script(f"""
+                    var el = document.elementFromPoint({x}, {y});
+                    if (el) el.click();
+                """)
+                return "Done."
         sel = f'[data-akira-index="{idx}"]'
         els = browser.find_elements(By.CSS_SELECTOR, sel)
         if els:
