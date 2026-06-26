@@ -379,6 +379,52 @@ def ask_confirmation(text):
     return message.content[0].text.strip().upper().startswith("YES")
 
 
+def vision_match(screenshot_path, instruction):
+    """
+    Takes a screenshot path and instruction, returns (x, y) coordinates to click
+    or None if no match found.
+    """
+    import base64
+    with open(screenshot_path, "rb") as f:
+        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
+    
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=50,
+        system=(
+            "You are given a screenshot and an instruction. "
+            "Find the element the user wants to interact with. "
+            "Reply with ONLY 'x,y' pixel coordinates of the center of that element. "
+            "If nothing matches, reply NONE."
+        ),
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_data
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": f"Instruction: {instruction}"
+                }
+            ]
+        }]
+    )
+    result = message.content[0].text.strip()
+    if result.upper() == "NONE":
+        return None
+    try:
+        x, y = result.split(",")
+        return (int(x.strip()), int(y.strip()))
+    except:
+        return None
+
+
 def find_element_index(elements, instruction):
     """
     Given a list of extracted page elements and a natural-language instruction,
