@@ -359,7 +359,32 @@ def get_pc_context():
 
 
 def ask_akira(text):
-    conversation_history.append({"role": "user", "content": text})
+    from executor import get_pc_context
+    try:
+        ctx = get_pc_context()
+        context_str = (
+            f"[CURRENT PC STATE — use this to inform your response]\n"
+            f"Current page: {ctx['current_page_title']} | {ctx['current_url']}\n"
+            f"Open tabs: {', '.join(ctx['browser_tabs'][:5])}\n"
+            f"Open windows: {', '.join(ctx['open_windows'][:5])}\n"
+        )
+        full_text = context_str + "\n" + text
+    except:
+        full_text = text
+    conversation_history.append({"role": "user", "content": full_text})def ask_akira(text):
+    from executor import get_pc_context
+    try:
+        ctx = get_pc_context()
+        context_str = (
+            f"[CURRENT PC STATE — use this to inform your response]\n"
+            f"Current page: {ctx['current_page_title']} | {ctx['current_url']}\n"
+            f"Open tabs: {', '.join(ctx['browser_tabs'][:5])}\n"
+            f"Open windows: {', '.join(ctx['open_windows'][:5])}\n"
+        )
+        full_text = context_str + "\n" + text
+    except:
+        full_text = text
+    conversation_history.append({"role": "user", "content": full_text})
     if len(conversation_history) > MAX_HISTORY:
         trim = len(conversation_history) - MAX_HISTORY
         if trim % 2 != 0:
