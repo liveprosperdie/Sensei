@@ -502,6 +502,27 @@ def new_tab(parameter=None):
     return "Opened a new tab."
 
 
+def scroll(parameter):
+    browser = get_browser(_last_browser_name)
+    param = parameter.lower().strip()
+    
+    if param == "down":
+        browser.execute_script("window.scrollBy(0, 500);")
+    elif param == "up":
+        browser.execute_script("window.scrollBy(0, -500);")
+    elif param == "top":
+        browser.execute_script("window.scrollTo(0, 0);")
+    elif param == "bottom":
+        browser.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    else:
+        try:
+            px = int(param)
+            browser.execute_script(f"window.scrollBy(0, {px});")
+        except ValueError:
+            return "I don't understand that scroll direction."
+    return f"Scrolled {parameter}."
+
+
 def _open_single_app(parameter):
     param = parameter.lower().strip()
     ALIASES = {
@@ -902,6 +923,15 @@ def execute(action, parameter):
         return restart()
     if action == "click":
         browser = get_browser(_last_browser_name)
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        from selenium.webdriver.common.by import By as SeleniumBy
+        try:
+            WebDriverWait(browser, 5).until(
+                EC.presence_of_element_located((SeleniumBy.TAG_NAME, "body"))
+            )
+        except Exception:
+            pass
         elements = extract_interactive_elements(browser, max_elements=100)
         from claude_handler import find_element_index
         index = find_element_index(elements, parameter)
@@ -929,4 +959,6 @@ def execute(action, parameter):
             return f"Couldn't click that: {e}"
         print(f"[DEBUG] click: _execute() done, returning success")
         return f"Clicked {result['element']['text']}."
+    if action == "scroll":
+        return scroll(parameter)
     return f"I don't know how to handle action: {action}"
