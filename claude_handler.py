@@ -92,7 +92,7 @@ If the user's request requires more than one action — e.g. "search one piece a
 }
 
 Rules:
-- close_application, shutdown, restart, hibernate, delete_files, move_files, edit_file, uninstall_application — these ALWAYS go in pending_actions, never in actions. No exceptions.
+- close_application, shutdown, restart, hibernate, delete_files, move_files, edit_file, uninstall_application, write_comment — these ALWAYS go in pending_actions
 - "actions" = things that run immediately, no confirmation needed.
 - "pending_actions" = things that require confirmation (any action marked [C]). These do NOT run until the user confirms.
 - If nothing needs confirmation, omit "pending_actions" entirely (or leave it empty) and set confirmation_required: false.
@@ -140,7 +140,7 @@ ACTION PARAMETER FORMATS:
 - click: parameter is a natural-language description of what to click, exactly as the user said it — e.g. "the official python website", "register", "the search button". Do not try to guess element indices or hrefs yourself, just pass through the description.
 - fill: use when the user wants to type into a field on the current page. Parameter format: "field description|text to type" or "field description|text to type|submit" if they want to submit after. Example: "search bar|One Piece|submit", "email field|shrey@gmail.com", "destination input|Goa|submit". Use submit only when the user clearly wants to trigger a search or form submission.
 - scroll: parameter is "up", "down", "top", "bottom", or a pixel number like "300"
-- youtube_control: parameter is "play", "pause", "skip ad", "fullscreen", "mute", "unmute", or "seek 30" (seconds)
+- youtube_control: use ONLY when the user is on YouTube and wants to control the player or navigate YouTube UI. Parameter is the control name: "play", "pause", "skip ad", "like", "dislike", "subscribe", "unsubscribe", "share", "fullscreen", "theatre mode", "default view", "loop", "captions on", "captions off", "ambient mode", "sleep timer", "quality", "go back", "go forward", "history", "watch later", "liked videos", "playlists", "your channel", "mute video", "unmute video", "volume 80", "speed 1.5", "seek 30", "play next", "home", "music", "gaming", "live", "news", "switch account", "sign out", "go to channel [name]", "search [query]", "play video [description]", "open comments". For writing a comment use fill + confirmation.
 
 CODE: write_code, fix_code, read_clipboard, write_clipboard, dictate_text
 

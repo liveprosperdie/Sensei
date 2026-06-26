@@ -211,7 +211,7 @@ def extract_interactive_elements(driver, max_elements=40):
             window.getComputedStyle(el).display !== 'none';
         if (!visible) continue;
 
-        let text = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || '');
+        let text = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('alt') || '');
         text = text.replace(/\\s+/g, ' ').trim().slice(0, 100);
         if (!text && el.tagName !== 'INPUT') continue;
 
@@ -533,6 +533,56 @@ def new_tab(parameter=None):
 def youtube_control(parameter):
     browser = get_browser(_last_browser_name)
     param = parameter.lower().strip()
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    try:
+        WebDriverWait(browser, 8).until(
+            EC.presence_of_element_located((By.TAG_NAME, "ytd-app"))
+        )
+    except Exception:
+        pass
+    
+    # for visual/thumbnail descriptions, grab richer context
+    if any(w in param for w in ["thumbnail", "face", "image", "picture", "guy", "man", "woman", "person"]):
+        script = """
+            const videos = document.querySelectorAll('ytd-rich-item-renderer, ytd-video-renderer');
+            const data = [];
+            let i = 0;
+            for (const v of videos) {
+                const title = v.querySelector('#video-title, #title')?.textContent?.trim() || '';
+                const thumb = v.querySelector('img')?.getAttribute('alt') || '';
+                const ch = v.querySelector('#channel-name, #text')?.textContent?.trim() || '';
+                if (title) data.push({index: i, title, thumb, channel: ch});
+                v.setAttribute('data-akira-index', i);
+                i++;
+            }
+            return data;
+        """
+        try:
+            videos = browser.execute_script(script)
+            if videos:
+                videos_text = "\n".join(f"{v['index']}: title=\"{v['title']}\" alt=\"{v['thumb']}\" channel=\"{v['channel']}\"" for v in videos)
+                from claude_handler import find_element_index_from_text
+                # fallback to regular find with richer text
+                message = __import__('anthropic').Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY")).messages.create(
+                    model="claude-haiku-4-5",
+                    max_tokens=10,
+                    system="Match the instruction to a video by index. Reply with ONLY the index number or NONE.",
+                    messages=[{"role": "user", "content": f"Videos:\n{videos_text}\n\nInstruction: {param}"}]
+                )
+                result = message.content[0].text.strip()
+                if result != "NONE":
+                    try:
+                        idx = int(result)
+                        browser.execute_script(f"""
+                            var els = document.querySelectorAll('[data-akira-index="{idx}"] a#thumbnail, [data-akira-index="{idx}"] a');
+                            if (els.length) els[0].click();
+                        """)
+                        return "Playing that video."
+                    except:
+                        pass
+        except Exception as e:
+            print(f"[DEBUG] youtube visual match failed: {e}")
 
     # ── Group A: Pure JS ──────────────────────────────────────────────
 
