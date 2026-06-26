@@ -533,30 +533,253 @@ def new_tab(parameter=None):
 def youtube_control(parameter):
     browser = get_browser(_last_browser_name)
     param = parameter.lower().strip()
-    
-    if param == "pause" or param == "play":
-        browser.execute_script("document.querySelector('video').click();")
-    elif param == "skip ad":
+
+    # ── Group A: Pure JS ──────────────────────────────────────────────
+
+    if param in ("play", "pause"):
+        browser.execute_script("document.querySelector('video') && document.querySelector('video').click();")
+        return "Done."
+
+    if param == "skip ad":
         browser.execute_script("""
-            var btn = document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button');
+            var btn = document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern');
             if (btn) btn.click();
         """)
-    elif param == "fullscreen":
-        browser.execute_script("""
-            var btn = document.querySelector('.ytp-fullscreen-button');
-            if (btn) btn.click();
-        """)
-    elif param == "mute" or param == "unmute":
-        browser.execute_script("document.querySelector('video').muted = !document.querySelector('video').muted;")
-    elif param.startswith("seek "):
+        return "Ad skipped."
+
+    if param.startswith("volume "):
         try:
-            seconds = int(param.replace("seek ", ""))
-            browser.execute_script(f"document.querySelector('video').currentTime += {seconds};")
+            val = int(param.replace("volume ", "").replace("%", "").strip())
+            val = max(0, min(100, val))
+            browser.execute_script(f"document.querySelector('video').volume = {val/100};")
+            return f"Video volume set to {val}%."
         except ValueError:
-            return "I need a number of seconds to seek."
-    else:
-        return f"I don't know that YouTube control."
-    return f"Done."
+            return "Give me a number for volume."
+
+    if param == "mute video":
+        browser.execute_script("document.querySelector('video').muted = true;")
+        return "Video muted."
+
+    if param == "unmute video":
+        browser.execute_script("document.querySelector('video').muted = false;")
+        return "Video unmuted."
+
+    if param in ("fullscreen", "full screen"):
+        browser.execute_script("document.querySelector('.ytp-fullscreen-button')?.click();")
+        return "Fullscreen."
+
+    if param in ("theatre mode", "theater mode", "theatre", "theater"):
+        browser.execute_script("document.querySelector('.ytp-size-button')?.click();")
+        return "Theatre mode."
+
+    if param in ("default view", "exit fullscreen", "exit theatre", "exit theater"):
+        browser.execute_script("""
+            var vid = document.querySelector('video');
+            if (document.fullscreenElement) document.exitFullscreen();
+            else document.querySelector('.ytp-size-button')?.click();
+        """)
+        return "Default view."
+
+    if param.startswith("speed "):
+        speeds = {"0.25":0.25,"0.5":0.5,"0.75":0.75,"normal":1,"1":1,"1.25":1.25,"1.5":1.5,"1.75":1.75,"2":2,"2x":2}
+        val = param.replace("speed ", "").strip()
+        rate = speeds.get(val)
+        if rate:
+            browser.execute_script(f"document.querySelector('video').playbackRate = {rate};")
+            return f"Speed set to {val}."
+        return "Valid speeds: 0.25, 0.5, 0.75, normal, 1.25, 1.5, 1.75, 2."
+
+    if param in ("captions on", "subtitles on", "cc on"):
+        browser.execute_script("document.querySelector('.ytp-subtitles-button')?.click();")
+        return "Captions on."
+
+    if param in ("captions off", "subtitles off", "cc off"):
+        browser.execute_script("""
+            var btn = document.querySelector('.ytp-subtitles-button');
+            if (btn && btn.getAttribute('aria-pressed') === 'true') btn.click();
+        """)
+        return "Captions off."
+
+    if param == "loop":
+        browser.execute_script("document.querySelector('video').loop = !document.querySelector('video').loop;")
+        return "Loop toggled."
+
+    if param.startswith("seek "):
+        try:
+            seconds = int(param.replace("seek ", "").replace("s","").strip())
+            browser.execute_script(f"document.querySelector('video').currentTime += {seconds};")
+            return f"Seeked {seconds} seconds."
+        except ValueError:
+            return "Give me seconds to seek."
+
+    if param == "like":
+        browser.execute_script("""
+            var btn = document.querySelector('button[aria-label*="like this video"], button[aria-label*="Like"]');
+            if (btn) btn.click();
+        """)
+        return "Liked."
+
+    if param == "dislike":
+        browser.execute_script("""
+            var btn = document.querySelector('button[aria-label*="dislike"], button[aria-label*="Dislike"]');
+            if (btn) btn.click();
+        """)
+        return "Disliked."
+
+    if param == "ambient mode":
+        # open settings then click ambient mode toggle
+        browser.execute_script("document.querySelector('.ytp-settings-button')?.click();")
+        time.sleep(0.5)
+        elements = extract_interactive_elements(browser, max_elements=60)
+        from claude_handler import find_element_index
+        idx = find_element_index(elements, "ambient mode")
+        if idx is not None:
+            sel = f'[data-akira-index="{idx}"]'
+            els = browser.find_elements(By.CSS_SELECTOR, sel)
+            if els: els[0].click()
+        return "Ambient mode toggled."
+
+    # ── Group B: Settings menu items ─────────────────────────────────
+
+    if param in ("sleep timer", "set sleep timer"):
+        browser.execute_script("document.querySelector('.ytp-settings-button')?.click();")
+        time.sleep(0.5)
+        elements = extract_interactive_elements(browser, max_elements=60)
+        from claude_handler import find_element_index
+        idx = find_element_index(elements, "sleep timer")
+        if idx is not None:
+            sel = f'[data-akira-index="{idx}"]'
+            els = browser.find_elements(By.CSS_SELECTOR, sel)
+            if els: els[0].click()
+        return "Sleep timer menu opened."
+
+    if param in ("quality", "change quality", "video quality"):
+        browser.execute_script("document.querySelector('.ytp-settings-button')?.click();")
+        time.sleep(0.5)
+        elements = extract_interactive_elements(browser, max_elements=60)
+        from claude_handler import find_element_index
+        idx = find_element_index(elements, "quality")
+        if idx is not None:
+            sel = f'[data-akira-index="{idx}"]'
+            els = browser.find_elements(By.CSS_SELECTOR, sel)
+            if els: els[0].click()
+        return "Quality menu opened."
+
+    if param in ("playback speed menu", "speed menu"):
+        browser.execute_script("document.querySelector('.ytp-settings-button')?.click();")
+        time.sleep(0.5)
+        elements = extract_interactive_elements(browser, max_elements=60)
+        from claude_handler import find_element_index
+        idx = find_element_index(elements, "playback speed")
+        if idx is not None:
+            sel = f'[data-akira-index="{idx}"]'
+            els = browser.find_elements(By.CSS_SELECTOR, sel)
+            if els: els[0].click()
+        return "Playback speed menu opened."
+
+    # ── Group C: Click-based ──────────────────────────────────────────
+
+    click_targets = {
+        "subscribe":        "subscribe button",
+        "unsubscribe":      "unsubscribe button",
+        "share":            "share button",
+        "save":             "save to playlist button",
+        "play next":        "next video button",
+        "next video":       "next video button",
+        "history":          "history in sidebar",
+        "watch later":      "watch later in sidebar",
+        "liked videos":     "liked videos in sidebar",
+        "playlists":        "playlists in sidebar",
+        "your channel":     "your channel in sidebar",
+        "downloads":        "downloads in sidebar",
+        "youtube studio":   "youtube studio menu item",
+        "settings":         "settings menu item",
+        "open comments":    "comments section",
+        "show comments":    "comments section",
+        "home":             "home in sidebar",
+        "explore":          "explore in sidebar",
+        "music":            "music filter chip",
+        "movies":           "movies filter chip or sidebar",
+        "news":             "news filter chip",
+        "gaming":           "gaming filter chip",
+        "live":             "live filter chip",
+        "ask":              "ask button below video",
+        "clips":            "clips button",
+    }
+
+    if param in click_targets:
+        elements = extract_interactive_elements(browser, max_elements=100)
+        from claude_handler import find_element_index
+        idx = find_element_index(elements, click_targets[param])
+        if idx is None:
+            # open sidebar first for sidebar items then retry
+            sidebar_items = {"history","watch later","liked videos","playlists","your channel","downloads","youtube studio","settings","home"}
+            if param in sidebar_items:
+                browser.execute_script("document.querySelector('#guide-button, button[aria-label=\'Guide\']')?.click();")
+                time.sleep(0.8)
+                elements = extract_interactive_elements(browser, max_elements=100)
+                idx = find_element_index(elements, click_targets[param])
+            if idx is None:
+                return f"Couldn't find {param} on the page."
+        sel = f'[data-akira-index="{idx}"]'
+        els = browser.find_elements(By.CSS_SELECTOR, sel)
+        if els:
+            els[0].click()
+            return f"Done."
+        return f"Couldn't click {param}."
+
+    # ── Group D: Navigation ───────────────────────────────────────────
+
+    if param == "go back":
+        browser.back()
+        return "Going back."
+
+    if param == "go forward":
+        browser.forward()
+        return "Going forward."
+
+    if param.startswith("go to channel "):
+        channel = param.replace("go to channel ", "").strip()
+        query = urllib.parse.quote(channel + " youtube channel")
+        browser.execute_script(f"window.location.href='https://www.youtube.com/results?search_query={query}';")
+        return f"Searching for {channel}'s channel."
+
+    if param.startswith("search "):
+        query = param.replace("search ", "").strip()
+        encoded = urllib.parse.quote(query)
+        browser.execute_script(f"window.location.href='https://www.youtube.com/results?search_query={encoded}';")
+        return f"Searching {query} on YouTube."
+
+    if param.startswith("play video ") or param.startswith("click video "):
+        description = param.replace("play video ", "").replace("click video ", "").strip()
+        elements = extract_interactive_elements(browser, max_elements=100)
+        from claude_handler import find_element_index
+        idx = find_element_index(elements, description)
+        if idx is None:
+            return "Couldn't find that video."
+        sel = f'[data-akira-index="{idx}"]'
+        els = browser.find_elements(By.CSS_SELECTOR, sel)
+        if els:
+            els[0].click()
+            return f"Playing {description}."
+        return "Couldn't click that video."
+
+    # ── Group E: Account (confirmation handled by sensei.py) ─────────
+
+    if param in ("switch account", "sign out", "manage premium", "premium benefits"):
+        # open account menu first
+        browser.execute_script("document.querySelector('button#avatar-btn, button[aria-label*=\"Account\"]')?.click();")
+        time.sleep(0.5)
+        elements = extract_interactive_elements(browser, max_elements=60)
+        from claude_handler import find_element_index
+        idx = find_element_index(elements, param)
+        if idx is not None:
+            sel = f'[data-akira-index="{idx}"]'
+            els = browser.find_elements(By.CSS_SELECTOR, sel)
+            if els: els[0].click()
+        return f"Opened {param}."
+
+    return f"I don't know that YouTube control: {param}"
 
 def scroll(parameter):
     browser = get_browser(_last_browser_name)
