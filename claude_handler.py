@@ -427,21 +427,26 @@ def vision_match(screenshot_path, instruction):
 
 def find_element_index(elements, instruction):
     """
-    Given a list of extracted page elements and a natural-language instruction,
-    returns the matching element's index, or None if no confident match exists.
+    Uses Sonnet to match instruction to element. Returns index or None.
     """
+    if not elements:
+        return None
+        
     elements_text = "\n".join(
-        f"{el['index']}: tag={el['tag']} type={el['type']} text=\"{el['text']}\"" + (f" href={el['href']}" if el['href'] else "")
+        f"{el['index']}: role={el.get('role','?')} text=\"{el['text']}\"" + 
+        (f" href={el['href']}" if el.get('href') else "")
         for el in elements
     )
+    
     message = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=10,
         system=(
-            "You match a user's instruction to one element from a numbered list of page elements. "
+            "You match a user's instruction to one element from a list. "
             "Reply with ONLY the index number of the best match. "
-            "Always return the closest matching index. Only return NONE if the list is completely empty or no element has any relation whatsoever to the instruction."
-            "Short instructions like 'continue', 'show more', 'next', 'submit' should match the closest button with that label or function."
+            "Always pick the closest match — only reply NONE if the list is empty "
+            "or nothing is even remotely related. "
+            "For video titles, match on partial words and meaning, not exact text."
         ),
         messages=[{
             "role": "user",
