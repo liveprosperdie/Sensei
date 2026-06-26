@@ -316,6 +316,48 @@ conversation_history=[]
 
 MAX_HISTORY = 6
 
+def get_pc_context():
+    """Returns current PC state for Akira's awareness."""
+    import pygetwindow as gw
+    
+    # open windows
+    try:
+        windows = [w.title for w in gw.getAllWindows() if w.title.strip()]
+    except:
+        windows = []
+    
+    # browser tabs
+    tabs = []
+    current_url = None
+    current_title = None
+    try:
+        browser = get_browser()
+        current_handle = browser.current_window_handle
+        for handle in browser.window_handles:
+            try:
+                browser.switch_to.window(handle)
+                if browser.title:
+                    tabs.append(browser.title)
+            except:
+                pass
+        # restore
+        try:
+            browser.switch_to.window(browser._akira_tab)
+        except:
+            browser.switch_to.window(current_handle)
+        current_url = browser.current_url
+        current_title = browser.title
+    except:
+        pass
+    
+    return {
+        "open_windows": windows[:10],
+        "browser_tabs": tabs,
+        "current_url": current_url,
+        "current_page_title": current_title
+    }
+
+
 def ask_akira(text):
     conversation_history.append({"role": "user", "content": text})
     if len(conversation_history) > MAX_HISTORY:
