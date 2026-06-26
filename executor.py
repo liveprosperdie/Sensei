@@ -501,6 +501,33 @@ def new_tab(parameter=None):
         return f"Searching {parameter} in a new tab."
     return "Opened a new tab."
 
+def youtube_control(parameter):
+    browser = get_browser(_last_browser_name)
+    param = parameter.lower().strip()
+    
+    if param == "pause" or param == "play":
+        browser.execute_script("document.querySelector('video').click();")
+    elif param == "skip ad":
+        browser.execute_script("""
+            var btn = document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button');
+            if (btn) btn.click();
+        """)
+    elif param == "fullscreen":
+        browser.execute_script("""
+            var btn = document.querySelector('.ytp-fullscreen-button');
+            if (btn) btn.click();
+        """)
+    elif param == "mute" or param == "unmute":
+        browser.execute_script("document.querySelector('video').muted = !document.querySelector('video').muted;")
+    elif param.startswith("seek "):
+        try:
+            seconds = int(param.replace("seek ", ""))
+            browser.execute_script(f"document.querySelector('video').currentTime += {seconds};")
+        except ValueError:
+            return "I need a number of seconds to seek."
+    else:
+        return f"I don't know that YouTube control."
+    return f"Done."
 
 def scroll(parameter):
     browser = get_browser(_last_browser_name)

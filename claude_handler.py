@@ -393,7 +393,7 @@ def find_element_index(elements, instruction):
         system=(
             "You match a user's instruction to one element from a numbered list of page elements. "
             "Reply with ONLY the index number of the best match. "
-            "Prefer a reasonable guess over returning NONE — only return NONE if truly no element is even remotely relevant. "
+            "Always return the closest matching index. Only return NONE if the list is completely empty or no element has any relation whatsoever to the instruction."
             "Short instructions like 'continue', 'show more', 'next', 'submit' should match the closest button with that label or function."
         ),
         messages=[{
