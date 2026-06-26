@@ -435,7 +435,7 @@ def find_element_index(elements, instruction):
         for el in elements
     )
     message = client.messages.create(
-        model="claude-haiku-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=10,
         system=(
             "You match a user's instruction to one element from a numbered list of page elements. "

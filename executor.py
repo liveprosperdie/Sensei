@@ -194,11 +194,97 @@ def get_current_site(driver):
     return None
 
 
-def extract_interactive_elements(driver, max_elements=40):
+def extract_interactive_elements(driver, max_elements=80):
     """
-    Returns a list of visible, interactive elements on the current page,
-    each tagged with an index Akira can reference ("click element 3").
+    Uses CDP accessibility tree for richer, more reliable element extraction.
+    Falls back to DOM extraction if CDP fails.
     """
+    try:
+        # get full accessibility tree via CDP
+        result = driver.execute_cdp_cmd("Accessibility.getFullAXTree", {})
+        nodes = result.get("nodes", [])
+        
+        items = []
+        idx = 0
+        
+        # roles we care about
+        interactive_roles = {
+            "button", "link", "menuitem", "option", "checkbox", "radio",
+            "tab", "textbox", "searchbox", "combobox", "listbox",
+            "menuitemcheckbox", "menuitemradio", "switch", "treeitem"
+        }
+        
+        for node in nodes:
+            if idx >= max_elements:
+                break
+                
+            role = node.get("role", {}).get("value", "")
+            if role not in interactive_roles:
+                continue
+            
+            # get name from accessibility tree
+            name = node.get("name", {}).get("value", "").strip()
+            if not name:
+                continue
+            
+            # get backend node id for DOM injection
+            backend_id = node.get("backendDOMNodeId")
+            if not backend_id:
+                continue
+            
+            # inject data-akira-index onto the real DOM node
+            try:
+                driver.execute_cdp_cmd("DOM.setAttributeValue", {
+                    "nodeId": backend_id,
+                    "name": "data-akira-index",
+                    "value": str(idx)
+                })
+            except Exception:
+                # DOM.setAttributeValue needs nodeId not backendDOMNodeId — resolve it
+                try:
+                    resolve = driver.execute_cdp_cmd("DOM.resolveNode", {"backendNodeId": backend_id})
+                    obj_id = resolve.get("object", {}).get("objectId")
+                    if obj_id:
+                        driver.execute_cdp_cmd("Runtime.callFunctionOn", {
+                            "objectId": obj_id,
+                            "functionDeclaration": f"function(){{this.setAttribute('data-akira-index','{idx}')}}",
+                            "returnByValue": True
+                        })
+                except Exception:
+                    pass
+            
+            # get href if link
+            href = None
+            if role == "link":
+                try:
+                    resolve = driver.execute_cdp_cmd("DOM.resolveNode", {"backendNodeId": backend_id})
+                    obj_id = resolve.get("object", {}).get("objectId")
+                    if obj_id:
+                        href_result = driver.execute_cdp_cmd("Runtime.callFunctionOn", {
+                            "objectId": obj_id,
+                            "functionDeclaration": "function(){return this.href || null}",
+                            "returnByValue": True
+                        })
+                        href = href_result.get("result", {}).get("value")
+                except Exception:
+                    pass
+            
+            items.append({
+                "index": idx,
+                "role": role,
+                "text": name[:150],
+                "href": href
+            })
+            idx += 1
+        
+        if items:
+            print(f"[DEBUG] extract_interactive_elements (CDP) found {len(items)} elements")
+            return items
+            
+    except Exception as e:
+        print(f"[DEBUG] CDP accessibility failed, falling back to DOM: {e}")
+    
+    # DOM fallback
     script = """
     const items = [];
     const selector = 'a, button, input, textarea, select, [role="button"], [onclick]';
@@ -210,18 +296,16 @@ def extract_interactive_elements(driver, max_elements=40):
             window.getComputedStyle(el).visibility !== 'hidden' &&
             window.getComputedStyle(el).display !== 'none';
         if (!visible) continue;
-
-        let text = (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('alt') || '');
-        text = text.replace(/\\s+/g, ' ').trim().slice(0, 100);
+        let text = (el.innerText || el.value || el.placeholder || 
+                   el.getAttribute('aria-label') || el.getAttribute('title') || 
+                   el.getAttribute('alt') || '');
+        text = text.replace(/\\s+/g, ' ').trim().slice(0, 150);
         if (!text && el.tagName !== 'INPUT') continue;
-
         const isActionable = ['INPUT', 'TEXTAREA', 'BUTTON', 'SELECT'].includes(el.tagName);
         if (!el.href && !isActionable) continue;
-
         items.push({
             index: idx,
-            tag: el.tagName.toLowerCase(),
-            type: el.type || null,
+            role: el.tagName.toLowerCase(),
             text: text,
             href: el.href || null
         });
@@ -232,7 +316,7 @@ def extract_interactive_elements(driver, max_elements=40):
     return items;
     """
     elements = driver.execute_script(script, max_elements)
-    print(f"[DEBUG] extract_interactive_elements found {len(elements)} elements")
+    print(f"[DEBUG] extract_interactive_elements (DOM fallback) found {len(elements)} elements")
     return elements
 
 
