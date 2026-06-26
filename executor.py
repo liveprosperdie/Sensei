@@ -165,6 +165,35 @@ RISKY_KEYWORDS = [
     "unsubscribe", "forward"
 ]
 
+SITE_DOMAINS = {
+    "youtube.com": "youtube",
+    "amazon.in": "amazon",
+    "amazon.com": "amazon",
+    "flipkart.com": "flipkart",
+    "github.com": "github",
+    "reddit.com": "reddit",
+    "netflix.com": "netflix",
+    "spotify.com": "spotify",
+    "instagram.com": "instagram",
+    "twitter.com": "twitter",
+    "x.com": "twitter",
+    "pinterest.com": "pinterest",
+    "stackoverflow.com": "stackoverflow",
+    "wikipedia.org": "wikipedia",
+}
+
+def get_current_site(driver):
+    try:
+        from urllib.parse import urlparse
+        domain = urlparse(driver.current_url).netloc.replace("www.", "")
+        for key in SITE_DOMAINS:
+            if key in domain:
+                return SITE_DOMAINS[key]
+    except:
+        pass
+    return None
+
+
 def extract_interactive_elements(driver, max_elements=40):
     """
     Returns a list of visible, interactive elements on the current page,
@@ -926,6 +955,8 @@ def execute(action, parameter):
         return "Bookmarked."
     if action == "new_tab":
         return new_tab(parameter)
+    if action == "youtube_control":
+        return youtube_control(parameter)
     if action == "adjust_volume":
         return adjust_volume(parameter)
     if action == "close_application":
