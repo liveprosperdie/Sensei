@@ -316,62 +316,8 @@ conversation_history=[]
 
 MAX_HISTORY = 6
 
-def get_pc_context():
-    """Returns current PC state for Akira's awareness."""
-    import pygetwindow as gw
-    
-    # open windows
-    try:
-        windows = [w.title for w in gw.getAllWindows() if w.title.strip()]
-    except:
-        windows = []
-    
-    # browser tabs
-    tabs = []
-    current_url = None
-    current_title = None
-    try:
-        browser = get_browser()
-        current_handle = browser.current_window_handle
-        for handle in browser.window_handles:
-            try:
-                browser.switch_to.window(handle)
-                if browser.title:
-                    tabs.append(browser.title)
-            except:
-                pass
-        # restore
-        try:
-            browser.switch_to.window(browser._akira_tab)
-        except:
-            browser.switch_to.window(current_handle)
-        current_url = browser.current_url
-        current_title = browser.title
-    except:
-        pass
-    
-    return {
-        "open_windows": windows[:10],
-        "browser_tabs": tabs,
-        "current_url": current_url,
-        "current_page_title": current_title
-    }
-
 
 def ask_akira(text):
-    from executor import get_pc_context
-    try:
-        ctx = get_pc_context()
-        context_str = (
-            f"[CURRENT PC STATE — use this to inform your response]\n"
-            f"Current page: {ctx['current_page_title']} | {ctx['current_url']}\n"
-            f"Open tabs: {', '.join(ctx['browser_tabs'][:5])}\n"
-            f"Open windows: {', '.join(ctx['open_windows'][:5])}\n"
-        )
-        full_text = context_str + "\n" + text
-    except:
-        full_text = text
-    conversation_history.append({"role": "user", "content": full_text})def ask_akira(text):
     from executor import get_pc_context
     try:
         ctx = get_pc_context()
