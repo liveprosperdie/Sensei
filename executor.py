@@ -912,13 +912,25 @@ def execute(action, parameter):
             parts = parameter.split("|browser:")
             parameter = parts[0].strip()
             browser_name = parts[1].strip()
-        print(f"[DEBUG] browser_name={browser_name} query={parameter}")
-        query = urllib.parse.quote(parameter)
+
+        # context-aware routing — if on a supported site, search there unless user said "on the web"
+        explicit_web = any(w in parameter.lower() for w in ["on the web", "on google", "google it", "on web"])
+        parameter_clean = parameter.lower().replace("on the web","").replace("on google","").replace("google it","").replace("on web","").strip()
+
         try:
             browser = get_browser(name=browser_name)
         except RuntimeError as e:
             print(f"[DEBUG] get_browser raised: {e}")
             return str(e)
+
+        if not explicit_web:
+            current_site = get_current_site(browser)
+            if current_site and current_site in SEARCH_URL_MAP:
+                print(f"[DEBUG] web_search: routing to site_search for {current_site}")
+                return execute("site_search", f"{current_site}|{parameter_clean}")
+
+        print(f"[DEBUG] browser_name={browser_name} query={parameter_clean}")
+        query = urllib.parse.quote(parameter_clean if explicit_web else parameter)
         print(f"[DEBUG] got browser, all handles: {browser.window_handles}")
         print(f"[DEBUG] akira_tab: {browser._akira_tab}")
         print(f"[DEBUG] current handle before switch: {browser.current_window_handle}")
