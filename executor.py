@@ -775,10 +775,32 @@ def youtube_control(parameter):
             return "Give me seconds to seek."
 
     if param == "like":
-        browser.execute_script("""
-            var btn = document.querySelector('button[aria-label*="like this video"], button[aria-label*="Like"]');
-            if (btn) btn.click();
+        liked = browser.execute_script("""
+            var selectors = [
+                'like-button-view-model button',
+                'button[aria-label*="like this video"]',
+                'button[aria-label*="Like this video"]',
+                '#top-level-buttons-computed ytd-toggle-button-renderer:first-child button',
+                'ytd-segmented-like-dislike-button-renderer #like-button button'
+            ];
+            for (var s of selectors) {
+                var btn = document.querySelector(s);
+                if (btn) { btn.click(); return true; }
+            }
+            return false;
         """)
+        if not liked:
+            # vision fallback
+            import datetime as dt
+            screenshot_path = os.path.join(_home, "Pictures", "Screenshots", f"akira_vision_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+            img = ImageGrab.grab()
+            img.save(screenshot_path)
+            from claude_handler import vision_match
+            coords = vision_match(screenshot_path, "like button thumbs up")
+            os.remove(screenshot_path)
+            if coords:
+                x, y = coords
+                browser.execute_script(f"document.elementFromPoint({x},{y})?.click();")
         return "Liked."
 
     if param == "dislike":
