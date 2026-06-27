@@ -883,8 +883,8 @@ def youtube_control(parameter):
                 idx = find_element_index(elements, click_targets[param])
             if idx is None:
                 print(f"[DEBUG] youtube_control: trying vision fallback for {param}")
-                import datetime
-                screenshot_path = os.path.join(_home, "Pictures", "Screenshots", f"akira_vision_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+                import datetime as dt
+                screenshot_path = os.path.join(_home, "Pictures", "Screenshots", f"akira_vision_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
                 from PIL import ImageGrab
                 img = ImageGrab.grab()
                 img.save(screenshot_path)
@@ -929,6 +929,7 @@ def youtube_control(parameter):
 
     if param.startswith("play video ") or param.startswith("click video "):
         description = param.replace("play video ", "").replace("click video ", "").strip()
+        time.sleep(1.5)
         elements = extract_interactive_elements(browser, max_elements=100)
         from claude_handler import find_element_index
         idx = find_element_index(elements, description)
@@ -940,7 +941,8 @@ def youtube_control(parameter):
             return f"Playing {description}."
         # vision fallback
         print(f"[DEBUG] play video: trying vision fallback")
-        screenshot_path = os.path.join(_home, "Pictures", "Screenshots", f"akira_vision_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+        import datetime as dt
+        screenshot_path = os.path.join(_home, "Pictures", "Screenshots", f"akira_vision_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
         img = ImageGrab.grab()
         img.save(screenshot_path)
         from claude_handler import vision_match
@@ -1259,14 +1261,8 @@ def execute(action, parameter):
         if not parameter or not parameter.startswith(("https://", "http://")):
             return "That doesn't look like a valid URL."
         browser = get_browser()
-        existing = set(browser.window_handles)
-        browser.execute_cdp_cmd('Target.createTarget', {'url': parameter})
-        for _ in range(10):
-            new_handles = [h for h in browser.window_handles if h not in existing]
-            if new_handles:
-                break
-            time.sleep(0.3)
-        browser.switch_to.window(new_handles[0])
+        browser.switch_to.window(browser._akira_tab)
+        browser.get(parameter)
         return f"Opening {parameter}."
     if action == "fill":
         # parameter format: "description|text to type|submit" or "description|text to type"
