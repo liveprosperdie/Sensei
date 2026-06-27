@@ -658,6 +658,193 @@ def vision_click(browser, instruction):
     return True
 
 
+def youtube_control(parameter):
+    browser = get_browser(_last_browser_name)
+    param = parameter.lower().strip()
+
+    # wait for page
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    try:
+        browser.switch_to.window(browser._akira_tab)
+        WebDriverWait(browser, 8).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+    except Exception:
+        pass
+
+    # ── Group A: JS media controls — fast, free, reliable ────────────
+
+    if param in ("play", "pause"):
+        browser.execute_script("document.querySelector('video')?.click();")
+        return "Done."
+
+    if param == "skip ad":
+        browser.execute_script("""
+            var btn = document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern');
+            if (btn) btn.click();
+        """)
+        return "Ad skipped."
+
+    if param.startswith("volume "):
+        try:
+            val = max(0, min(100, int(param.replace("volume","").replace("%","").strip())))
+            browser.execute_script(f"document.querySelector('video').volume = {val/100};")
+            return f"Volume set to {val}%."
+        except ValueError:
+            return "Give me a number."
+
+    if param == "mute video":
+        browser.execute_script("document.querySelector('video').muted = true;")
+        return "Muted."
+
+    if param == "unmute video":
+        browser.execute_script("document.querySelector('video').muted = false;")
+        return "Unmuted."
+
+    if param in ("fullscreen", "full screen"):
+        browser.execute_script("document.querySelector('.ytp-fullscreen-button')?.click();")
+        return "Fullscreen."
+
+    if param in ("theatre mode", "theater mode", "theatre", "theater"):
+        browser.execute_script("document.querySelector('.ytp-size-button')?.click();")
+        return "Theatre mode."
+
+    if param in ("default view", "exit fullscreen", "exit theatre", "exit theater"):
+        browser.execute_script("""
+            if (document.fullscreenElement) document.exitFullscreen();
+            else document.querySelector('.ytp-size-button')?.click();
+        """)
+        return "Default view."
+
+    if param.startswith("speed "):
+        speeds = {"0.25":0.25,"0.5":0.5,"0.75":0.75,"normal":1,"1":1,
+                  "1.25":1.25,"1.5":1.5,"1.75":1.75,"2":2,"2x":2}
+        val = param.replace("speed","").strip()
+        rate = speeds.get(val)
+        if rate:
+            browser.execute_script(f"document.querySelector('video').playbackRate = {rate};")
+            return f"Speed set to {val}."
+        return "Valid speeds: 0.25, 0.5, 0.75, normal, 1.25, 1.5, 1.75, 2."
+
+    if param in ("captions on", "subtitles on", "cc on"):
+        browser.execute_script("document.querySelector('.ytp-subtitles-button')?.click();")
+        return "Captions on."
+
+    if param in ("captions off", "subtitles off", "cc off"):
+        browser.execute_script("""
+            var btn = document.querySelector('.ytp-subtitles-button');
+            if (btn && btn.getAttribute('aria-pressed') === 'true') btn.click();
+        """)
+        return "Captions off."
+
+    if param == "loop":
+        browser.execute_script("document.querySelector('video').loop = !document.querySelector('video').loop;")
+        return "Loop toggled."
+
+    if param.startswith("seek "):
+        try:
+            seconds = int(param.replace("seek","").replace("s","").strip())
+            browser.execute_script(f"document.querySelector('video').currentTime += {seconds};")
+            return f"Seeked {seconds}s."
+        except ValueError:
+            return "Give me seconds to seek."
+
+    if param == "go back":
+        browser.back()
+        return "Going back."
+
+    if param == "go forward":
+        browser.forward()
+        return "Going forward."
+
+    if param.startswith("search "):
+        query = urllib.parse.quote(param.replace("search","").strip())
+        browser.execute_script(f"window.location.href='https://www.youtube.com/results?search_query={query}';")
+        return "Searching on YouTube."
+
+    if param.startswith("go to channel"):
+        channel = param.replace("go to channel","").strip()
+        if not channel:
+            # already on video page — click the channel name
+            vision_click(browser, "channel name link below the video title")
+            return "Going to channel."
+        query = urllib.parse.quote(channel)
+        browser.execute_script(f"window.location.href='https://www.youtube.com/results?search_query={query}+channel';")
+        return f"Searching for {channel}'s channel."
+
+    # ── Group B: play video by description — CDP then vision ─────────
+
+    if param.startswith("play video") or param.startswith("click video"):
+        description = param.replace("play video","").replace("click video","").strip()
+        time.sleep(1.0)
+        elements = extract_interactive_elements(browser, max_elements=100)
+        from claude_handler import find_element_index
+        idx = find_element_index(elements, description)
+        if idx is not None:
+            clicked = browser.execute_script(f"""
+                var el = document.querySelector('[data-akira-index="{idx}"]');
+                if (el) {{ el.click(); return true; }}
+                return false;
+            """)
+            print(f"[DEBUG] play video: CDP click={clicked} idx={idx}")
+            if clicked:
+                return f"Playing {description}."
+        # vision fallback
+        print(f"[DEBUG] play video: vision fallback")
+        success = vision_click(browser, f"video thumbnail or title: {description}")
+        return "Playing it." if success else "Couldn't find that video."
+
+    # ── Group C: everything else — vision only ────────────────────────
+
+    # map common commands to clearer visual descriptions for Sonnet
+    vision_descriptions = {
+        "like":             "like button thumbs up below the video",
+        "dislike":          "dislike button thumbs down below the video",
+        "subscribe":        "subscribe button below the video title",
+        "unsubscribe":      "unsubscribe button below the video title",
+        "share":            "share button below the video",
+        "save":             "save button below the video",
+        "play next":        "next video button in the player controls",
+        "next video":       "next video button in the player controls",
+        "history":          "history item in the left sidebar",
+        "watch later":      "watch later item in the left sidebar",
+        "liked videos":     "liked videos item in the left sidebar",
+        "playlists":        "playlists item in the left sidebar",
+        "your channel":     "your channel item in the left sidebar",
+        "downloads":        "downloads item in the left sidebar",
+        "home":             "home button in the left sidebar",
+        "open comments":    "comments section on the page",
+        "settings":         "settings gear icon in the video player",
+        "ambient mode":     "ambient mode toggle in settings menu",
+        "sleep timer":      "sleep timer option in settings menu",
+        "quality":          "quality option in settings menu",
+        "switch account":   "account avatar button top right",
+        "sign out":         "sign out option in account menu",
+        "music":            "music filter chip at the top of the page",
+        "gaming":           "gaming filter chip at the top of the page",
+        "live":             "live filter chip at the top of the page",
+        "news":             "news filter chip at the top of the page",
+        "ask":              "ask button below the video",
+        "clips":            "clip button below the video",
+    }
+
+    visual_instruction = vision_descriptions.get(param, param)
+
+    # for settings menu items, open settings first
+    settings_items = {"ambient mode", "sleep timer", "quality", "playback speed menu"}
+    if param in settings_items:
+        browser.execute_script("document.querySelector('.ytp-settings-button')?.click();")
+        time.sleep(0.5)
+
+    # for account menu items, open account first
+    account_items = {"switch account", "sign out", "manage premium"}
+    if param in account_items:
+        browser.execute_script("document.querySelector('button#avatar-btn')?.click();")
+        time.sleep(0.5)
+
+    success = vision_click(browser, visual_instruction)
+    return "Done." if success else f"Couldn't find {param} on the page."
 
 
 def scroll(parameter):
