@@ -899,12 +899,11 @@ def youtube_control(parameter):
                     if (el) el.click();
                 """)
                 return "Done."
-        sel = f'[data-akira-index="{idx}"]'
-        els = browser.find_elements(By.CSS_SELECTOR, sel)
-        if els:
-            els[0].click()
-            return f"Done."
-        return f"Couldn't click {param}."
+        browser.execute_script(f"""
+            var el = document.querySelector('[data-akira-index="{idx}"]');
+            if (el) el.click();
+        """)
+        return "Done."
 
     # ── Group D: Navigation ───────────────────────────────────────────
 
@@ -933,14 +932,25 @@ def youtube_control(parameter):
         elements = extract_interactive_elements(browser, max_elements=100)
         from claude_handler import find_element_index
         idx = find_element_index(elements, description)
-        if idx is None:
-            return "Couldn't find that video."
-        sel = f'[data-akira-index="{idx}"]'
-        els = browser.find_elements(By.CSS_SELECTOR, sel)
-        if els:
-            els[0].click()
+        if idx is not None:
+            browser.execute_script(f"""
+                var el = document.querySelector('[data-akira-index="{idx}"]');
+                if (el) el.click();
+            """)
             return f"Playing {description}."
-        return "Couldn't click that video."
+        # vision fallback
+        print(f"[DEBUG] play video: trying vision fallback")
+        screenshot_path = os.path.join(_home, "Pictures", "Screenshots", f"akira_vision_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+        img = ImageGrab.grab()
+        img.save(screenshot_path)
+        from claude_handler import vision_match
+        coords = vision_match(screenshot_path, description)
+        os.remove(screenshot_path)
+        if coords is None:
+            return "Couldn't find that video."
+        x, y = coords
+        browser.execute_script(f"document.elementFromPoint({x},{y})?.click();")
+        return f"Playing {description}."
 
     # ── Group E: Account (confirmation handled by sensei.py) ─────────
 
@@ -954,7 +964,7 @@ def youtube_control(parameter):
         if idx is not None:
             sel = f'[data-akira-index="{idx}"]'
             els = browser.find_elements(By.CSS_SELECTOR, sel)
-            if els: els[0].click()
+            if els: browser.execute_script("arguments[0].click();", els[0])
         return f"Opened {param}."
 
     return f"I don't know that YouTube control: {param}"
