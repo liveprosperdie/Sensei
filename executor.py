@@ -1284,25 +1284,9 @@ def execute(action, parameter):
         index = find_element_index(elements, parameter)
         print(f"[DEBUG] click: matched index={index} for instruction='{parameter}'")
         if index is None or index >= len(elements):
-            # vision fallback
-            print(f"[DEBUG] click: element not found, trying vision fallback")
-            import datetime
-            screenshot_path = os.path.join(_home, "Pictures", "Screenshots", f"akira_vision_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
-            from PIL import ImageGrab
-            img = ImageGrab.grab()
-            img.save(screenshot_path)
-            from claude_handler import vision_match
-            coords = vision_match(screenshot_path, parameter)
-            os.remove(screenshot_path)
-            if coords is None:
-                return "I couldn't find that on the page."
-            x, y = coords
-            browser.execute_script(f"""
-                var el = document.elementFromPoint({x}, {y});
-                if (el) el.click();
-            """)
-            print(f"[DEBUG] click: vision fallback clicked at ({x}, {y})")
-            return f"Clicked it."
+            print(f"[DEBUG] click: trying vision fallback")
+            success = vision_click(browser, parameter)
+            return "Done." if success else "I couldn't find that on the page."
         target = elements[index]
         try:
             result = click_element(browser, index, expected_text=target["text"], expected_href=target["href"], instruction=parameter)
