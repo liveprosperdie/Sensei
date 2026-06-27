@@ -331,24 +331,11 @@ def get_pc_context():
         windows = []
     
     # browser tabs
-    tabs = []
     current_url = None
     current_title = None
     try:
         browser = get_browser()
-        current_handle = browser.current_window_handle
-        for handle in browser.window_handles:
-            try:
-                browser.switch_to.window(handle)
-                if browser.title:
-                    tabs.append(browser.title)
-            except:
-                pass
-        # restore
-        try:
-            browser.switch_to.window(browser._akira_tab)
-        except:
-            browser.switch_to.window(current_handle)
+        browser.switch_to.window(browser._akira_tab)
         current_url = browser.current_url
         current_title = browser.title
     except:
@@ -356,7 +343,6 @@ def get_pc_context():
     
     return {
         "open_windows": windows[:10],
-        "browser_tabs": tabs,
         "current_url": current_url,
         "current_page_title": current_title
     }
@@ -1311,14 +1297,8 @@ def execute(action, parameter):
         url_template = SEARCH_URL_MAP.get(site)
         url = url_template.format(urllib.parse.quote(query)) if url_template else f"https://www.google.com/search?q={urllib.parse.quote(query)}+site:{site}.com"
         browser = get_browser(_last_browser_name)
-        existing = set(browser.window_handles)
-        browser.execute_cdp_cmd('Target.createTarget', {'url': url})
-        for _ in range(10):
-            new_handles = [h for h in browser.window_handles if h not in existing]
-            if new_handles:
-                break
-            time.sleep(0.3)
-        browser.switch_to.window(new_handles[0])
+        browser.switch_to.window(browser._akira_tab)
+        browser.get(url)
         return f"Searching {query} on {site}."
     if action == "web_search":
         print(f"[DEBUG] web_search called with action={action} parameter={parameter}")

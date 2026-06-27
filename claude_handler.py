@@ -322,9 +322,8 @@ def ask_akira(text):
     try:
         ctx = get_pc_context()
         context_str = (
-            f"[CURRENT PC STATE — use this to inform your response]\n"
+            f"[CURRENT PC STATE]\n"
             f"Current page: {ctx['current_page_title']} | {ctx['current_url']}\n"
-            f"Open tabs: {', '.join(ctx['browser_tabs'][:5])}\n"
             f"Open windows: {', '.join(ctx['open_windows'][:5])}\n"
         )
         full_text = context_str + "\n" + text
