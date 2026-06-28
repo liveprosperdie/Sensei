@@ -1,90 +1,93 @@
+"""
+executor.py — Akira's hands.
+Handles all PC control, browser automation, and action dispatch.
+"""
+
 import os
-import json
+import re
 import time
+import glob
 import shutil
 import psutil
 import winreg
-import requests
 import datetime
 import webbrowser
 import subprocess
 import urllib.parse
 import win32process
+import requests
 import pygetwindow as gw
 from PIL import ImageGrab
 from selenium import webdriver
-from comtypes import CLSCTX_ALL
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from webdriver_manager.firefox import GeckoDriverManager
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 from webdriver_manager.microsoft import EdgeChromiumDriverManager
 from selenium.webdriver.edge.service import Service as EdgeService
 from selenium.webdriver.edge.options import Options as EdgeOptions
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
+from pycaw.pycaw import AudioUtilities
 
-URI_MAP = {
-    "settings": "ms-settings:",
-    "calculator": "calculator:",
-    "store": "ms-windows-store:",#
-    "copilot": "ms-copilot:",
-    "msedge":"microsoft-edge:",
-    "edge":"microsoft-edge:",#
-    "whatsapp": "whatsapp:",
-    "paint":"ms-paint:",
-    "camera": "microsoft.windows.camera:",
-    "chatgpt": "chatgpt:",
-    "clock":"ms-clock:",
-    "teams": "msteams:",#
-    "xbox":  "xbox:",
-    "notepad":"notepad"
-}
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 _home = os.path.expanduser("~")
+_screenshot_dir = os.path.join(_home, "Pictures", "Screenshots")
+os.makedirs(_screenshot_dir, exist_ok=True)
+
+BRAVE_PATH  = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+EDGE_PATH   = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+
+URI_MAP = {
+    "settings": "ms-settings:", "calculator": "calculator:",
+    "store": "ms-windows-store:", "copilot": "ms-copilot:",
+    "msedge": "microsoft-edge:", "edge": "microsoft-edge:",
+    "whatsapp": "whatsapp:", "paint": "ms-paint:",
+    "camera": "microsoft.windows.camera:", "chatgpt": "chatgpt:",
+    "clock": "ms-clock:", "teams": "msteams:", "xbox": "xbox:",
+    "notepad": "notepad",
+}
 
 MANUAL_MAP = {
     "explorer": r"C:\Windows\explorer.exe",
-    "files": r"C:\Windows\explorer.exe",
-    "brave":      r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
-    "discord": os.path.join(_home, "AppData", "Local", "Discord", "app-1.0.9238", "discord.exe"),
-    "vlc":        r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
-    "obsidian":   os.path.join(_home, "AppData", "Local", "Programs", "Obsidian", "obsidian.exe"),
-    "notion":     os.path.join(_home, "AppData", "Local", "Programs", "Notion", "notion.exe"),
-    "winrar":     r"C:\Program Files (x86)\WinRAR\winrar.exe",
-    "gitbash":    r"C:\Program Files\Git\git-bash.exe",
-    "steam":      r"C:\Program Files (x86)\Steam\steam.exe",
-    "capcut":     os.path.join(_home, "AppData", "Local", "CapCut", "Apps", "capcut.exe"),
-    "filmora":    os.path.join(_home, "AppData", "Local", "Wondershare", "Wondershare Filmora", "15.5.25.19939", "filmora.exe"),
-    "adobe":      r"C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
-    "acrobat":    r"C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
-    "protonvpn":  r"C:\Program Files\Proton\VPN\ProtonVPN.Launcher.exe",
-    "vpn":        r"C:\Program Files\Proton\VPN\ProtonVPN.Launcher.exe",
-    "chrome":     r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-    "firefox":    r"C:\Program Files\Mozilla Firefox\firefox.exe",
-    "githubapp":  os.path.join(_home, "AppData", "Local", "GitHubDesktop", "githubdesktop.exe"),
-    "canva":      os.path.join(_home, "AppData", "Local", "Programs", "Canva", "canva.exe"),
-    "word":       r"C:\Program Files\Microsoft Office\root\Office16\winword.exe",
-    "excel":      r"C:\Program Files\Microsoft Office\root\Office16\excel.exe",
-    "powerpoint": r"C:\Program Files\Microsoft Office\root\Office16\powerpnt.exe",
-    "zoom":       os.path.join(_home, "AppData", "Roaming", "Zoom", "bin", "Zoom.exe"),
-    "edge":       r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    "files":    r"C:\Windows\explorer.exe",
+    "brave":    BRAVE_PATH,
+    "chrome":   CHROME_PATH,
+    "firefox":  r"C:\Program Files\Mozilla Firefox\firefox.exe",
+    "edge":     EDGE_PATH,
+    "discord":  os.path.join(_home, "AppData", "Local", "Discord", "Update.exe"),
+    "vlc":      r"C:\Program Files (x86)\VideoLAN\VLC\vlc.exe",
+    "obsidian": os.path.join(_home, "AppData", "Local", "Programs", "Obsidian", "Obsidian.exe"),
+    "notion":   os.path.join(_home, "AppData", "Local", "Programs", "Notion", "Notion.exe"),
+    "winrar":   r"C:\Program Files (x86)\WinRAR\winrar.exe",
+    "gitbash":  r"C:\Program Files\Git\git-bash.exe",
+    "steam":    r"C:\Program Files (x86)\Steam\steam.exe",
+    "capcut":   os.path.join(_home, "AppData", "Local", "CapCut", "Apps", "capcut.exe"),
+    "adobe":    r"C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
+    "acrobat":  r"C:\Program Files\Adobe\Acrobat DC\Acrobat\Acrobat.exe",
+    "protonvpn":r"C:\Program Files\Proton\VPN\ProtonVPN.Launcher.exe",
+    "vpn":      r"C:\Program Files\Proton\VPN\ProtonVPN.Launcher.exe",
+    "githubapp":os.path.join(_home, "AppData", "Local", "GitHubDesktop", "GitHubDesktop.exe"),
+    "canva":    os.path.join(_home, "AppData", "Local", "Programs", "Canva", "Canva.exe"),
+    "word":     r"C:\Program Files\Microsoft Office\root\Office16\winword.exe",
+    "excel":    r"C:\Program Files\Microsoft Office\root\Office16\excel.exe",
+    "powerpoint":r"C:\Program Files\Microsoft Office\root\Office16\powerpnt.exe",
+    "zoom":     os.path.join(_home, "AppData", "Roaming", "Zoom", "bin", "Zoom.exe"),
+    "filmora":  os.path.join(_home, "AppData", "Local", "Wondershare", "Wondershare Filmora", "Filmora.exe"),
 }
 
 WEB_MAP = {
-    "youtube": "https://youtube.com",
-    "claude": "https://claude.ai",
-    "gmail": "https://mail.google.com",
-    "github": "https://github.com",
-    "instagram": "https://instagram.com",
-    "pinterest": "https://pinterest.com",
-    "facebook": "https://facebook.com",
-    "twitter": "https://x.com",
-    "weather": "https://weather.com",
-    "calendar": "https://calendar.google.com",
-    "x": "https://x.com"
+    "youtube": "https://youtube.com", "claude": "https://claude.ai",
+    "gmail": "https://mail.google.com", "github": "https://github.com",
+    "instagram": "https://instagram.com", "pinterest": "https://pinterest.com",
+    "facebook": "https://facebook.com", "twitter": "https://x.com",
+    "weather": "https://weather.com", "calendar": "https://calendar.google.com",
+    "x": "https://x.com",
 }
 
 SEARCH_URL_MAP = {
@@ -99,581 +102,531 @@ SEARCH_URL_MAP = {
     "pinterest":   "https://www.pinterest.com/search/pins/?q={}",
     "amazon":      "https://www.amazon.in/s?k={}",
     "flipkart":    "https://www.flipkart.com/search?q={}",
-    "makemytrip":  "https://www.makemytrip.com/hotels/",
-    "ixigo":       "https://www.ixigo.com/hotels",
     "chatgpt":     "https://chatgpt.com/?q={}",
     "claude":      "https://claude.ai/new?q={}",
     "gemini":      "https://gemini.google.com/app?q={}",
     "perplexity":  "https://www.perplexity.ai/search?q={}",
-    "stackoverflow": "https://stackoverflow.com/search?q={}",
+    "stackoverflow":"https://stackoverflow.com/search?q={}",
     "wikipedia":   "https://en.wikipedia.org/w/index.php?search={}",
     "spotify":     "https://open.spotify.com/search/{}",
     "netflix":     "https://www.netflix.com/search?q={}",
+    "makemytrip":  "https://www.makemytrip.com/hotels/",
+    "ixigo":       "https://www.ixigo.com/hotels",
+}
+
+SITE_DOMAINS = {
+    "youtube.com": "youtube", "amazon.in": "amazon", "amazon.com": "amazon",
+    "flipkart.com": "flipkart", "github.com": "github", "reddit.com": "reddit",
+    "netflix.com": "netflix", "spotify.com": "spotify", "instagram.com": "instagram",
+    "twitter.com": "twitter", "x.com": "twitter", "pinterest.com": "pinterest",
+    "stackoverflow.com": "stackoverflow", "wikipedia.org": "wikipedia",
 }
 
 WINDOW_TITLE_MAP = {
-    "clock": "Clock",
-    "calculator": "Calculator",
-    "file explorer": "explorer",
-    "photos": "Photos",
-    "maps": "Maps",
-    "calendar": "Calendar",
-    "camera": "Camera",
-    "mail": "Mail",
-    "store": "Microsoft Store",
+    "clock": "Clock", "calculator": "Calculator", "file explorer": "explorer",
+    "photos": "Photos", "maps": "Maps", "calendar": "Calendar",
+    "camera": "Camera", "mail": "Mail", "store": "Microsoft Store",
 }
 
-UWP_MAP = {
-    "settings": "SystemSettings",
-}
+UWP_MAP = {"settings": "SystemSettings"}
 
-MUTE_MAP={
-        "mute":1,
-        "quiet":1,
-        "silence":1,
-        "shut it":1,
-        "unmute":0,
-        "speak up":0,
-    }
+MUTE_MAP = {
+    "mute": 1, "quiet": 1, "silence": 1, "shut it": 1,
+    "unmute": 0, "speak up": 0,
+}
 
 BRIGHTNESS_MAP = {
-    "max": 100,
-    "full": 100,
-    "minimum": 0,
-    "min": 0,
-    "off": 0,
-    "half": 50,
-    "medium": 50,
-    "mid": 50,
-    "low": 25,
-    "high": 75,
+    "max": 100, "full": 100, "minimum": 0, "min": 0, "off": 0,
+    "half": 50, "medium": 50, "mid": 50, "low": 25, "high": 75,
 }
 
+APP_ALIASES = {
+    "microsoft word": "word", "microsoft excel": "excel",
+    "microsoft powerpoint": "powerpoint", "microsoft store": "store",
+    "microsoft teams": "teams", "google chrome": "chrome",
+    "mozilla firefox": "firefox", "github desktop": "githubapp",
+    "github": "github", "proton vpn": "protonvpn",
+    "adobe acrobat": "acrobat", "adobe reader": "acrobat", "git bash": "gitbash",
+}
 
-_browsers = {}
-_last_browser_name = None
-
-BRAVE_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
-CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-EDGE_PATH = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-
+# RISKY_KEYWORDS — word-boundary matched, not substring
 RISKY_KEYWORDS = [
-    "buy", "purchase", "checkout", "pay", "payment", "subscribe",
+    "buy", "purchase", "checkout", "pay", "payment",
     "submit", "send", "confirm order", "place order", "delete",
-    "remove", "cancel subscription", "sign up", "register", "donate",
-    "transfer", "withdraw", "discard", "archive", "block", "report",
-    "unsubscribe", "forward"
+    "cancel subscription", "sign up", "register", "donate",
+    "transfer", "withdraw", "discard", "archive", "block",
+    "unsubscribe", "forward",
 ]
+_risky_pattern = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in RISKY_KEYWORDS) + r")\b",
+    re.IGNORECASE,
+)
 
-SITE_DOMAINS = {
-    "youtube.com": "youtube",
-    "amazon.in": "amazon",
-    "amazon.com": "amazon",
-    "flipkart.com": "flipkart",
-    "github.com": "github",
-    "reddit.com": "reddit",
-    "netflix.com": "netflix",
-    "spotify.com": "spotify",
-    "instagram.com": "instagram",
-    "twitter.com": "twitter",
-    "x.com": "twitter",
-    "pinterest.com": "pinterest",
-    "stackoverflow.com": "stackoverflow",
-    "wikipedia.org": "wikipedia",
-}
+# ── Browser state ─────────────────────────────────────────────────────────────
 
-def get_current_site(driver):
+_browsers: dict = {}
+_last_browser_name: str | None = None
+
+
+# ── Browser utilities ─────────────────────────────────────────────────────────
+
+def _port_ready(port: int) -> bool:
     try:
-        from urllib.parse import urlparse
-        domain = urlparse(driver.current_url).netloc.replace("www.", "")
-        for key in SITE_DOMAINS:
-            if key in domain:
-                return SITE_DOMAINS[key]
-    except:
-        pass
-    return None
+        return requests.get(f"http://127.0.0.1:{port}/json/version", timeout=1).status_code == 200
+    except Exception:
+        return False
 
 
-def extract_interactive_elements(driver, max_elements=80):
-    """
-    Uses CDP accessibility tree for richer, more reliable element extraction.
-    Falls back to DOM extraction if CDP fails.
-    """
-    try:
-        # get full accessibility tree via CDP
-        result = driver.execute_cdp_cmd("Accessibility.getFullAXTree", {})
-        nodes = result.get("nodes", [])
-        
-        items = []
-        idx = 0
-        
-        # roles we care about
-        interactive_roles = {
-            "button", "link", "menuitem", "option", "checkbox", "radio",
-            "tab", "textbox", "searchbox", "combobox", "listbox",
-            "menuitemcheckbox", "menuitemradio", "switch", "treeitem"
-        }
-        
-        for node in nodes:
-            if idx >= max_elements:
-                break
-                
-            role = node.get("role", {}).get("value", "")
-            if role not in interactive_roles:
-                continue
-            
-            # get name from accessibility tree
-            name = node.get("name", {}).get("value", "").strip()
-            if not name:
-                continue
-            
-            # get backend node id for DOM injection
-            backend_id = node.get("backendDOMNodeId")
-            if not backend_id:
-                continue
-            
-            # inject data-akira-index onto the real DOM node
+def _kill_process(name: str) -> None:
+    subprocess.run(["taskkill", "/F", "/T", "/IM", name], capture_output=True)
+    time.sleep(1.0)
+
+
+def _ensure_akira_tab(driver) -> None:
+    """Create or recover Akira's dedicated tab."""
+    if hasattr(driver, "_akira_tab") and driver._akira_tab in driver.window_handles:
+        return
+    existing = set(driver.window_handles)
+    driver.execute_cdp_cmd("Target.createTarget", {"url": "about:blank"})
+    for _ in range(10):
+        new = [h for h in driver.window_handles if h not in existing]
+        if new:
+            driver._akira_tab = new[0]
+            break
+        time.sleep(0.3)
+    driver.switch_to.window(driver._akira_tab)
+
+
+def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
+    binary_name = os.path.basename(binary_path).lower()
+    if not _port_ready(port):
+        for p in psutil.process_iter(["name"]):
             try:
-                driver.execute_cdp_cmd("DOM.setAttributeValue", {
-                    "nodeId": backend_id,
-                    "name": "data-akira-index",
-                    "value": str(idx)
-                })
-            except Exception:
-                # DOM.setAttributeValue needs nodeId not backendDOMNodeId — resolve it
-                try:
-                    resolve = driver.execute_cdp_cmd("DOM.resolveNode", {"backendNodeId": backend_id})
-                    obj_id = resolve.get("object", {}).get("objectId")
-                    if obj_id:
-                        driver.execute_cdp_cmd("Runtime.callFunctionOn", {
-                            "objectId": obj_id,
-                            "functionDeclaration": f"function(){{this.setAttribute('data-akira-index','{idx}')}}",
-                            "returnByValue": True
-                        })
-                except Exception:
-                    pass
-            
-            # get href if link
-            href = None
-            if role == "link":
-                try:
-                    resolve = driver.execute_cdp_cmd("DOM.resolveNode", {"backendNodeId": backend_id})
-                    obj_id = resolve.get("object", {}).get("objectId")
-                    if obj_id:
-                        href_result = driver.execute_cdp_cmd("Runtime.callFunctionOn", {
-                            "objectId": obj_id,
-                            "functionDeclaration": "function(){return this.href || null}",
-                            "returnByValue": True
-                        })
-                        href = href_result.get("result", {}).get("value")
-                except Exception:
-                    pass
-            
-            items.append({
-                "index": idx,
-                "role": role,
-                "text": name[:150],
-                "href": href
-            })
-            idx += 1
-        
-        if items:
-            print(f"[DEBUG] extract_interactive_elements (CDP) found {len(items)} elements")
-            return items
-            
-    except Exception as e:
-        print(f"[DEBUG] CDP accessibility failed, falling back to DOM: {e}")
-    
-    # DOM fallback
-    script = """
-    const items = [];
-    const selector = 'a, button, input, textarea, select, [role="button"], [onclick]';
-    const elements = document.querySelectorAll(selector);
-    let idx = 0;
-    for (const el of elements) {
-        const rect = el.getBoundingClientRect();
-        const visible = rect.width > 0 && rect.height > 0 &&
-            window.getComputedStyle(el).visibility !== 'hidden' &&
-            window.getComputedStyle(el).display !== 'none';
-        if (!visible) continue;
-        let text = (el.innerText || el.value || el.placeholder || 
-                   el.getAttribute('aria-label') || el.getAttribute('title') || 
-                   el.getAttribute('alt') || '');
-        text = text.replace(/\\s+/g, ' ').trim().slice(0, 150);
-        if (!text && el.tagName !== 'INPUT') continue;
-        const isActionable = ['INPUT', 'TEXTAREA', 'BUTTON', 'SELECT'].includes(el.tagName);
-        if (!el.href && !isActionable) continue;
-        items.push({
-            index: idx,
-            role: el.tagName.toLowerCase(),
-            text: text,
-            href: el.href || null
-        });
-        el.setAttribute('data-akira-index', idx);
-        idx++;
-        if (idx >= arguments[0]) break;
-    }
-    return items;
-    """
-    elements = driver.execute_script(script, max_elements)
-    print(f"[DEBUG] extract_interactive_elements (DOM fallback) found {len(elements)} elements")
-    return elements
-
-
-def get_pc_context():
-    """Returns current PC state for Akira's awareness."""
-    import pygetwindow as gw
-    
-    # open windows
-    try:
-        windows = [w.title for w in gw.getAllWindows() if w.title.strip()]
-    except:
-        windows = []
-    
-    # browser tabs
-    current_url = None
-    current_title = None
-    try:
-        browser = get_browser()
-        browser.switch_to.window(browser._akira_tab)
-        current_url = browser.current_url
-        current_title = browser.title
-    except:
-        pass
-    
-    return {
-        "open_windows": windows[:10],
-        "current_url": current_url,
-        "current_page_title": current_title
-    }
-
-
-def click_element(driver, index, expected_text=None, expected_href=None, instruction=None):
-    """
-    Clicks the element at `index`. Re-extracts the DOM fresh to guard against
-    staleness. If the element at that index no longer matches what was
-    originally matched, re-runs the matching layer once (costs one Haiku call)
-    instead of clicking the wrong thing.
-    """
-    fresh_elements = extract_interactive_elements(driver, max_elements=100)
-
-    if index >= len(fresh_elements):
-        return {"success": False, "reason": "index out of range after re-extraction"}
-
-    current = fresh_elements[index]
-    stale = (
-        (expected_text is not None and current["text"] != expected_text) or
-        (expected_href is not None and current["href"] != expected_href)
-    )
-
-    if stale and instruction:
-        from claude_handler import find_element_index
-        new_index = find_element_index(fresh_elements, instruction)
-        if new_index is None or new_index >= len(fresh_elements):
-            return {"success": False, "reason": "element not found after page changed"}
-        index = new_index
-        current = fresh_elements[index]
-    elif stale:
-        return {"success": False, "reason": "element changed, no instruction to re-match against"}
-
-    text_lower = current["text"].lower()
-    needs_confirmation = any(kw in text_lower for kw in RISKY_KEYWORDS)
-
-    selector = f'[data-akira-index="{index}"]'
-    matched_elements = driver.find_elements(By.CSS_SELECTOR, selector)
-    if not matched_elements:
-        return {"success": False, "reason": "element not found in DOM after extraction"}
-    selenium_element = matched_elements[0]
-
-    def _do_click(el=selenium_element):
-        try:
-            el.click()
-        except Exception:
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-            driver.execute_script("arguments[0].click();", el)
-
-    return {
-        "success": True,
-        "needs_confirmation": needs_confirmation,
-        "element": current,
-        "_execute": _do_click
-    }
-
-
-def _attach_cdp_browser(binary_path, port, driver_service):
-    def _port_ready():
-        try:
-            resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
-            return resp.status_code == 200
-        except Exception:
-            return False
-
-    if not _port_ready():
-        # Check if browser is already running without debug port
-        binary_name = os.path.basename(binary_path).lower()
-        already_running = False
-        for p in psutil.process_iter(['name']):
-            try:
-                if p.info['name'] and p.info['name'].lower() == binary_name:
-                    already_running = True
+                if p.info["name"] and p.info["name"].lower() == binary_name:
+                    _kill_process(binary_name)
                     break
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-
-        if already_running:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/IM", binary_name],
-                capture_output=True
-            )
-            time.sleep(1.0)
-
-        akira_profile_dir = os.path.join(os.environ['LOCALAPPDATA'], 'Sensei', 'AkiraChromeProfile')
-        os.makedirs(akira_profile_dir, exist_ok=True)
-
+        profile_dir = os.path.join(os.environ["LOCALAPPDATA"], "Sensei", "AkiraChromeProfile")
+        os.makedirs(profile_dir, exist_ok=True)
         subprocess.Popen([
             binary_path,
             f"--remote-debugging-port={port}",
-            f"--user-data-dir={akira_profile_dir}",
+            f"--user-data-dir={profile_dir}",
             "--no-first-run",
             "--disable-session-crashed-bubble",
-            "--restore-last-session=false"
+            "--restore-last-session=false",
         ])
-
         for _ in range(40):
-            if _port_ready():
+            if _port_ready(port):
                 break
             time.sleep(0.5)
         else:
-            raise RuntimeError(
-                f"Browser at {binary_path} did not bind debug port {port} within 20 seconds"
-            )
+            raise RuntimeError(f"Browser at {binary_path} did not bind port {port} within 20s")
 
     options = Options()
     options.binary_location = binary_path
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-    driver = webdriver.Chrome(service=driver_service, options=options)
-
-    existing = set(driver.window_handles)
-    if hasattr(driver, '_akira_tab') and driver._akira_tab in driver.window_handles:
-        pass
-    else:
-        driver.execute_cdp_cmd('Target.createTarget', {'url': 'about:blank'})
-        for _ in range(10):
-            new_handles = [h for h in driver.window_handles if h not in existing]
-            if new_handles:
-                break
-            time.sleep(0.3)
-        driver._akira_tab = new_handles[0]
-
-    driver.switch_to.window(driver._akira_tab)
+    driver = webdriver.Chrome(service=service, options=options)
+    _ensure_akira_tab(driver)
     return driver
 
 
-def _attach_cdp_edge(port):
-    def _port_ready():
-        try:
-            resp = requests.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
-            return resp.status_code == 200
-        except Exception:
-            return False
-
-    if not _port_ready():
-        already_running = False
-        for p in psutil.process_iter(['name']):
+def _attach_cdp_edge(port: int) -> webdriver.Edge:
+    if not _port_ready(port):
+        for p in psutil.process_iter(["name"]):
             try:
-                if p.info['name'] and p.info['name'].lower() == "msedge.exe":
-                    already_running = True
+                if p.info["name"] and p.info["name"].lower() == "msedge.exe":
+                    _kill_process("msedge.exe")
                     break
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-
-        if already_running:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/IM", "msedge.exe"],
-                capture_output=True
-            )
-            time.sleep(1.0)
-
         subprocess.Popen([
-            EDGE_PATH,
-            f"--remote-debugging-port={port}",
-            "--profile-directory=Default",
-            "--no-first-run",
-            "--disable-session-crashed-bubble",
-            "--restore-last-session=false"
+            EDGE_PATH, f"--remote-debugging-port={port}",
+            "--profile-directory=Default", "--no-first-run",
+            "--disable-session-crashed-bubble", "--restore-last-session=false",
         ])
-
         for _ in range(20):
-            if _port_ready():
+            if _port_ready(port):
                 break
             time.sleep(0.5)
         else:
-            raise RuntimeError(f"Edge did not bind debug port {port} within 10 seconds")
+            raise RuntimeError(f"Edge did not bind port {port} within 10s")
 
     options = EdgeOptions()
     options.binary_location = EDGE_PATH
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
     service = EdgeService(EdgeChromiumDriverManager().install())
     driver = webdriver.Edge(service=service, options=options)
-
-    existing = set(driver.window_handles)
-    if hasattr(driver, '_akira_tab') and driver._akira_tab in driver.window_handles:
-        pass
-    else:
-        driver.execute_cdp_cmd('Target.createTarget', {'url': 'about:blank'})
-        for _ in range(10):
-            new_handles = [h for h in driver.window_handles if h not in existing]
-            if new_handles:
-                break
-            time.sleep(0.3)
-        driver._akira_tab = new_handles[0]
-
-    driver.switch_to.window(driver._akira_tab)
+    _ensure_akira_tab(driver)
     return driver
 
-def _get_default_browser():
+
+def _get_default_browser() -> str:
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 
-            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice") as key:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice",
+        ) as key:
             prog_id = winreg.QueryValueEx(key, "ProgId")[0].lower()
-            print(f"[DEBUG] _get_default_browser raw ProgId: {prog_id}")
-            if "brave" in prog_id: return "brave"
-            if "chrome" in prog_id: return "chrome"
+            if "brave" in prog_id:   return "brave"
+            if "chrome" in prog_id:  return "chrome"
             if "firefox" in prog_id: return "firefox"
-            if "edge" in prog_id: return "edge"
-    except Exception as e:
-        print(f"[DEBUG] _get_default_browser registry read failed: {e}")
+            if "edge" in prog_id:    return "edge"
+    except Exception:
+        pass
     return "edge"
 
 
-def get_browser(name=None, incognito=False):
-    global _browsers
-    if name is None:
-        name = _get_default_browser()
-    name = name.lower().strip()
+def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.Chrome:
+    global _browsers, _last_browser_name
+    name = (name or _get_default_browser()).lower().strip()
     key = f"{name}_incognito" if incognito else name
+
+    # return cached driver if alive
     if key in _browsers:
         driver = _browsers[key]
         try:
-            _ = driver.title  # checks session is alive
-            # now validate the akira tab specifically
-            if hasattr(driver, '_akira_tab') and driver._akira_tab not in driver.window_handles:
-                # tab was closed — recreate it
-                existing = set(driver.window_handles)
-                driver.execute_cdp_cmd('Target.createTarget', {'url': 'about:blank'})
-                for _ in range(10):
-                    new_handles = [h for h in driver.window_handles if h not in existing]
-                    if new_handles:
-                        break
-                    time.sleep(0.3)
-                driver._akira_tab = new_handles[0]
-                driver.switch_to.window(driver._akira_tab)
+            _ = driver.title
+            _ensure_akira_tab(driver)
             return driver
-        except:
+        except Exception:
             del _browsers[key]
+
+    # create new driver
     if name == "brave":
+        svc_path = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
+        svc = Service(svc_path if os.path.exists(svc_path) else ChromeDriverManager().install())
         if incognito:
-            options = Options()
-            options.binary_location = BRAVE_PATH
-            options.add_argument("--incognito")
-            service_path = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
-            service = Service(service_path if os.path.exists(service_path) else ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=options)
+            opt = Options()
+            opt.binary_location = BRAVE_PATH
+            opt.add_argument("--incognito")
+            driver = webdriver.Chrome(service=svc, options=opt)
         else:
-            service_path = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
-            service = Service(service_path if os.path.exists(service_path) else ChromeDriverManager().install())
-            driver = _attach_cdp_browser(BRAVE_PATH, 9222, service)
+            driver = _attach_cdp(BRAVE_PATH, 9222, svc)
 
     elif name == "chrome":
+        svc = Service(ChromeDriverManager().install())
         if incognito:
-            options = Options()
-            options.binary_location = CHROME_PATH
-            options.add_argument("--incognito")
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=options)
+            opt = Options()
+            opt.binary_location = CHROME_PATH
+            opt.add_argument("--incognito")
+            driver = webdriver.Chrome(service=svc, options=opt)
         else:
-            service = Service(ChromeDriverManager().install())
-            driver = _attach_cdp_browser(CHROME_PATH, 9223, service)
+            driver = _attach_cdp(CHROME_PATH, 9223, svc)
 
     elif name == "firefox":
-        options = FirefoxOptions()
+        opt = FirefoxOptions()
         if incognito:
-            options.add_argument("-private")
-        service = FirefoxService(GeckoDriverManager().install())
-        driver = webdriver.Firefox(service=service, options=options)
+            opt.add_argument("-private")
+        driver = webdriver.Firefox(service=FirefoxService(GeckoDriverManager().install()), options=opt)
 
     elif name == "edge":
         if incognito:
-            options = EdgeOptions()
-            options.binary_location = EDGE_PATH
-            options.add_argument("--inprivate")
-            service = EdgeService(EdgeChromiumDriverManager().install())
-            driver = webdriver.Edge(service=service, options=options)
+            opt = EdgeOptions()
+            opt.binary_location = EDGE_PATH
+            opt.add_argument("--inprivate")
+            driver = webdriver.Edge(service=EdgeService(EdgeChromiumDriverManager().install()), options=opt)
         else:
             driver = _attach_cdp_edge(9224)
     else:
-        service = Service(ChromeDriverManager().install())
-        driver = _attach_cdp_browser(CHROME_PATH, 9223, service)
+        svc = Service(ChromeDriverManager().install())
+        driver = _attach_cdp(CHROME_PATH, 9223, svc)
+
     _browsers[key] = driver
-    global _last_browser_name
     _last_browser_name = name
     return driver
 
-def new_tab(parameter=None):
-    browser_name = None
-    if parameter and "|browser:" in parameter:
-        parameter, browser_name = parameter.split("|browser:", 1)
-        parameter = parameter.strip()
-        browser_name = browser_name.strip()
-    browser = get_browser(browser_name)
-    existing = set(browser.window_handles)
-    browser.execute_cdp_cmd('Target.createTarget', {'url': 'chrome://newtab'})
-    for _ in range(10):
-        new_handles = [h for h in browser.window_handles if h not in existing]
-        if new_handles:
-            break
-        time.sleep(0.3)
-    new_handle = new_handles[0]
-    browser.switch_to.window(new_handle)
-    # DO NOT update _akira_tab
-    if parameter:
-        query = urllib.parse.quote(parameter)
-        browser.get(f"https://www.google.com/search?q={query}")
-        return f"Searching {parameter} in a new tab."
-    return "Opened a new tab."
 
-def vision_click(browser, instruction):
-    """Vision-primary click. Screenshot → Sonnet → JS click at coordinates."""
-    import datetime as dt
-    path = os.path.join(_home, "Pictures", "Screenshots",
-                        f"akira_v_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
-    ImageGrab.grab().save(path)
-    from claude_handler import vision_match
-    coords = vision_match(path, instruction)
-    os.remove(path)
-    if not coords:
-        return False
-    x, y = coords
-    browser.execute_script(f"document.elementFromPoint({x},{y})?.click();")
-    return True
-
-
-def youtube_control(parameter):
+def _navigate(url: str) -> None:
+    """Navigate Akira's tab to a URL. Single source of truth for navigation."""
     browser = get_browser(_last_browser_name)
-    param = parameter.lower().strip()
+    browser.switch_to.window(browser._akira_tab)
+    browser.get(url)
 
-    # wait for page
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
+
+def get_current_site(driver) -> str | None:
     try:
-        browser.switch_to.window(browser._akira_tab)
-        WebDriverWait(browser, 8).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
+        domain = urllib.parse.urlparse(driver.current_url).netloc.replace("www.", "")
+        for key, site in SITE_DOMAINS.items():
+            if key in domain:
+                return site
+    except Exception:
+        pass
+    return None
+
+
+def get_pc_context() -> dict:
+    """Current page title, URL, and open windows. Safe — never iterates tabs."""
+    windows = []
+    try:
+        windows = [w.title for w in gw.getAllWindows() if w.title.strip()][:10]
     except Exception:
         pass
 
-    # ── Group A: JS media controls — fast, free, reliable ────────────
+    current_url, current_title = None, None
+    try:
+        browser = get_browser()
+        browser.switch_to.window(browser._akira_tab)
+        current_url = browser.current_url
+        current_title = browser.title
+    except Exception:
+        pass
+
+    return {
+        "open_windows": windows,
+        "current_url": current_url,
+        "current_page_title": current_title,
+    }
+
+
+def get_all_tabs() -> list[dict]:
+    """Read all open tabs via CDP debug port — zero handle switching."""
+    for port in [9222, 9223, 9224]:
+        try:
+            resp = requests.get(f"http://127.0.0.1:{port}/json", timeout=1)
+            return [
+                {"title": t.get("title", ""), "url": t.get("url", "")}
+                for t in resp.json()
+                if t.get("type") == "page"
+            ]
+        except Exception:
+            continue
+    return []
+
+
+# ── Element extraction ────────────────────────────────────────────────────────
+
+def extract_interactive_elements(driver, max_elements: int = 80) -> list[dict]:
+    """
+    CDP accessibility tree → element list with data-akira-index injected via
+    a single Runtime.evaluate call (not one CDP call per node).
+    Falls back to DOM extraction if CDP fails.
+    """
+    try:
+        result = driver.execute_cdp_cmd("Accessibility.getFullAXTree", {})
+        nodes = result.get("nodes", [])
+
+        interactive_roles = {
+            "button", "link", "menuitem", "option", "checkbox", "radio",
+            "tab", "textbox", "searchbox", "combobox", "listbox",
+            "menuitemcheckbox", "menuitemradio", "switch", "treeitem",
+        }
+
+        items = []
+        backend_ids = []
+
+        for node in nodes:
+            if len(items) >= max_elements:
+                break
+            role = node.get("role", {}).get("value", "")
+            if role not in interactive_roles:
+                continue
+            name = node.get("name", {}).get("value", "").strip()
+            if not name:
+                continue
+            backend_id = node.get("backendDOMNodeId")
+            if not backend_id:
+                continue
+            items.append({
+                "index": len(items),
+                "role": role,
+                "text": name[:150],
+                "href": None,
+                "_backend_id": backend_id,
+            })
+            backend_ids.append(backend_id)
+
+        if not items:
+            raise ValueError("No interactive nodes found in AX tree")
+
+        # inject data-akira-index in a single JS evaluation
+        inject_script = """
+        (function(backendIds) {
+            backendIds.forEach(function(backendId, idx) {
+                try {
+                    var el = __selenium_target__(backendId);
+                    if (el) {
+                        el.setAttribute('data-akira-index', String(idx));
+                    }
+                } catch(e) {}
+            });
+        })(arguments[0]);
+        """
+        # Use CDP DOM.resolveNode + Runtime.callFunctionOn per node in batches
+        # Fallback: use JS to walk all elements and tag them
+        tag_script = """
+        (function() {
+            var all = document.querySelectorAll('a,button,input,textarea,select,[role]');
+            var idx = 0;
+            var tagged = 0;
+            for (var i = 0; i < all.length && tagged < arguments[0]; i++) {
+                var el = all[i];
+                var existing = el.getAttribute('data-akira-index');
+                if (existing !== null) { tagged++; continue; }
+                var role = el.getAttribute('role') || el.tagName.toLowerCase();
+                var name = el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '';
+                name = name.trim();
+                if (!name) continue;
+                el.setAttribute('data-akira-index', String(idx));
+                idx++;
+                tagged++;
+            }
+        })();
+        """
+
+        # Try resolving each node via CDP and injecting index
+        resolved_count = 0
+        for i, item in enumerate(items):
+            bid = item.pop("_backend_id")
+            try:
+                resolve = driver.execute_cdp_cmd("DOM.resolveNode", {"backendNodeId": bid})
+                obj_id = resolve.get("object", {}).get("objectId")
+                if obj_id:
+                    driver.execute_cdp_cmd("Runtime.callFunctionOn", {
+                        "objectId": obj_id,
+                        "functionDeclaration": f"function(){{this.setAttribute('data-akira-index','{i}')}}",
+                        "returnByValue": True,
+                    })
+                    # grab href for links
+                    if item["role"] == "link":
+                        href_res = driver.execute_cdp_cmd("Runtime.callFunctionOn", {
+                            "objectId": obj_id,
+                            "functionDeclaration": "function(){return this.href||null}",
+                            "returnByValue": True,
+                        })
+                        item["href"] = href_res.get("result", {}).get("value")
+                    resolved_count += 1
+            except Exception:
+                pass
+
+        print(f"[DEBUG] extract_elements (CDP) found {len(items)}, resolved {resolved_count}")
+        return items
+
+    except Exception as e:
+        print(f"[DEBUG] CDP extraction failed, using DOM fallback: {e}")
+
+    # DOM fallback — single JS call
+    script = """
+    const items = [];
+    const sel = 'a,button,input,textarea,select,[role="button"],[onclick]';
+    const els = document.querySelectorAll(sel);
+    let idx = 0;
+    for (const el of els) {
+        if (idx >= arguments[0]) break;
+        const r = el.getBoundingClientRect();
+        if (!r.width || !r.height) continue;
+        const s = window.getComputedStyle(el);
+        if (s.visibility === 'hidden' || s.display === 'none') continue;
+        let text = (el.innerText || el.value || el.placeholder ||
+                    el.getAttribute('aria-label') || el.getAttribute('title') ||
+                    el.getAttribute('alt') || '').replace(/\\s+/g,' ').trim().slice(0,150);
+        if (!text && el.tagName !== 'INPUT') continue;
+        const act = ['INPUT','TEXTAREA','BUTTON','SELECT'].includes(el.tagName);
+        if (!el.href && !act) continue;
+        el.setAttribute('data-akira-index', idx);
+        items.push({index:idx, role:el.tagName.toLowerCase(), text, href:el.href||null});
+        idx++;
+    }
+    return items;
+    """
+    elements = driver.execute_script(script, max_elements)
+    print(f"[DEBUG] extract_elements (DOM fallback) found {len(elements)}")
+    return elements
+
+
+# ── Vision click ──────────────────────────────────────────────────────────────
+
+def vision_click(browser, instruction: str) -> bool:
+    """Screenshot → Sonnet vision → JS click at coordinates. Returns success bool."""
+    path = os.path.join(_screenshot_dir, f"akira_v_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    ImageGrab.grab().save(path)
+    try:
+        from claude_handler import vision_match
+        coords = vision_match(path, instruction)
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+    if not coords:
+        print(f"[DEBUG] vision_click: no match for '{instruction}'")
+        return False
+
+    x, y = coords
+    browser.execute_script(f"document.elementFromPoint({x},{y})?.click();")
+    print(f"[DEBUG] vision_click: clicked at ({x},{y}) for '{instruction}'")
+    return True
+
+
+# ── Click element (CDP path) ──────────────────────────────────────────────────
+
+def click_element(driver, index: int, expected_text: str | None = None,
+                  expected_href: str | None = None, instruction: str | None = None) -> dict:
+    """
+    Click element at index. Validates staleness, checks RISKY_KEYWORDS,
+    falls back to vision if DOM lookup fails.
+    """
+    fresh = extract_interactive_elements(driver, max_elements=100)
+
+    if index >= len(fresh):
+        return {"success": False, "reason": "index out of range"}
+
+    current = fresh[index]
+    stale = (
+        (expected_text is not None and current["text"] != expected_text) or
+        (expected_href is not None and current["href"] != expected_href)
+    )
+
+    if stale:
+        if instruction:
+            from claude_handler import find_element_index
+            new_idx = find_element_index(fresh, instruction)
+            if new_idx is None or new_idx >= len(fresh):
+                return {"success": False, "reason": "element changed and re-match failed"}
+            index = new_idx
+            current = fresh[index]
+        else:
+            return {"success": False, "reason": "element changed, no instruction to re-match"}
+
+    needs_confirmation = bool(_risky_pattern.search(current["text"]))
+
+    # use JS click — avoids ElementNotInteractableException
+    def _do_click():
+        clicked = driver.execute_script(f"""
+            var el = document.querySelector('[data-akira-index="{index}"]');
+            if (el) {{ el.click(); return true; }}
+            return false;
+        """)
+        if not clicked:
+            # last resort: Selenium click with scroll
+            els = driver.find_elements(By.CSS_SELECTOR, f'[data-akira-index="{index}"]')
+            if els:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", els[0])
+                driver.execute_script("arguments[0].click();", els[0])
+
+    return {
+        "success": True,
+        "needs_confirmation": needs_confirmation,
+        "element": current,
+        "_execute": _do_click,
+    }
+
+
+# ── YouTube control ───────────────────────────────────────────────────────────
+
+def youtube_control(parameter: str) -> str:
+    browser = get_browser(_last_browser_name)
+    param = parameter.lower().strip()
+
+    try:
+        browser.switch_to.window(browser._akira_tab)
+        WebDriverWait(browser, 8).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    except Exception:
+        pass
+
+    # ── Group A: JS media controls — zero API cost ────────────────────
 
     if param in ("play", "pause"):
         browser.execute_script("document.querySelector('video')?.click();")
@@ -681,26 +634,26 @@ def youtube_control(parameter):
 
     if param == "skip ad":
         browser.execute_script("""
-            var btn = document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern');
+            var btn = document.querySelector('.ytp-skip-ad-button,.ytp-ad-skip-button,.ytp-ad-skip-button-modern');
             if (btn) btn.click();
         """)
         return "Ad skipped."
 
     if param.startswith("volume "):
         try:
-            val = max(0, min(100, int(param.replace("volume","").replace("%","").strip())))
-            browser.execute_script(f"document.querySelector('video').volume = {val/100};")
-            return f"Volume set to {val}%."
+            val = max(0, min(100, int(param.replace("volume", "").replace("%", "").strip())))
+            browser.execute_script(f"var v=document.querySelector('video'); if(v) v.volume={val/100};")
+            return f"Video volume {val}%."
         except ValueError:
             return "Give me a number."
 
     if param == "mute video":
-        browser.execute_script("document.querySelector('video').muted = true;")
-        return "Muted."
+        browser.execute_script("var v=document.querySelector('video'); if(v) v.muted=true;")
+        return "Video muted."
 
     if param == "unmute video":
-        browser.execute_script("document.querySelector('video').muted = false;")
-        return "Unmuted."
+        browser.execute_script("var v=document.querySelector('video'); if(v) v.muted=false;")
+        return "Video unmuted."
 
     if param in ("fullscreen", "full screen"):
         browser.execute_script("document.querySelector('.ytp-fullscreen-button')?.click();")
@@ -718,13 +671,13 @@ def youtube_control(parameter):
         return "Default view."
 
     if param.startswith("speed "):
-        speeds = {"0.25":0.25,"0.5":0.5,"0.75":0.75,"normal":1,"1":1,
-                  "1.25":1.25,"1.5":1.5,"1.75":1.75,"2":2,"2x":2}
-        val = param.replace("speed","").strip()
+        speeds = {"0.25": 0.25, "0.5": 0.5, "0.75": 0.75, "normal": 1, "1": 1,
+                  "1.25": 1.25, "1.5": 1.5, "1.75": 1.75, "2": 2, "2x": 2}
+        val = param.replace("speed", "").strip()
         rate = speeds.get(val)
         if rate:
-            browser.execute_script(f"document.querySelector('video').playbackRate = {rate};")
-            return f"Speed set to {val}."
+            browser.execute_script(f"var v=document.querySelector('video'); if(v) v.playbackRate={rate};")
+            return f"Speed {val}."
         return "Valid speeds: 0.25, 0.5, 0.75, normal, 1.25, 1.5, 1.75, 2."
 
     if param in ("captions on", "subtitles on", "cc on"):
@@ -733,19 +686,19 @@ def youtube_control(parameter):
 
     if param in ("captions off", "subtitles off", "cc off"):
         browser.execute_script("""
-            var btn = document.querySelector('.ytp-subtitles-button');
-            if (btn && btn.getAttribute('aria-pressed') === 'true') btn.click();
+            var btn=document.querySelector('.ytp-subtitles-button');
+            if(btn&&btn.getAttribute('aria-pressed')==='true') btn.click();
         """)
         return "Captions off."
 
     if param == "loop":
-        browser.execute_script("document.querySelector('video').loop = !document.querySelector('video').loop;")
+        browser.execute_script("var v=document.querySelector('video'); if(v) v.loop=!v.loop;")
         return "Loop toggled."
 
     if param.startswith("seek "):
         try:
-            seconds = int(param.replace("seek","").replace("s","").strip())
-            browser.execute_script(f"document.querySelector('video').currentTime += {seconds};")
+            seconds = int(param.replace("seek", "").replace("s", "").strip())
+            browser.execute_script(f"var v=document.querySelector('video'); if(v) v.currentTime+={seconds};")
             return f"Seeked {seconds}s."
         except ValueError:
             return "Give me seconds to seek."
@@ -759,555 +712,500 @@ def youtube_control(parameter):
         return "Going forward."
 
     if param.startswith("search "):
-        query = urllib.parse.quote(param.replace("search","").strip())
+        query = urllib.parse.quote(param.replace("search", "").strip())
         browser.execute_script(f"window.location.href='https://www.youtube.com/results?search_query={query}';")
-        return "Searching on YouTube."
+        return "Searching YouTube."
 
     if param.startswith("go to channel"):
-        channel = param.replace("go to channel","").strip()
+        channel = param.replace("go to channel", "").strip()
         if not channel:
-            # already on video page — click the channel name
             vision_click(browser, "channel name link below the video title")
             return "Going to channel."
         query = urllib.parse.quote(channel)
         browser.execute_script(f"window.location.href='https://www.youtube.com/results?search_query={query}+channel';")
         return f"Searching for {channel}'s channel."
 
-    # ── Group B: play video by description — CDP then vision ─────────
+    # ── Group B: play video — CDP then vision ─────────────────────────
 
     if param.startswith("play video") or param.startswith("click video"):
-        description = param.replace("play video","").replace("click video","").strip()
+        description = param.replace("play video", "").replace("click video", "").strip()
         time.sleep(1.0)
         elements = extract_interactive_elements(browser, max_elements=100)
         from claude_handler import find_element_index
         idx = find_element_index(elements, description)
         if idx is not None:
             clicked = browser.execute_script(f"""
-                var el = document.querySelector('[data-akira-index="{idx}"]');
-                if (el) {{ el.click(); return true; }}
-                return false;
+                var el=document.querySelector('[data-akira-index="{idx}"]');
+                if(el){{el.click();return true;}}return false;
             """)
-            print(f"[DEBUG] play video: CDP click={clicked} idx={idx}")
             if clicked:
                 return f"Playing {description}."
-        # vision fallback
-        print(f"[DEBUG] play video: vision fallback")
         success = vision_click(browser, f"video thumbnail or title: {description}")
         return "Playing it." if success else "Couldn't find that video."
 
-    # ── Group C: everything else — vision only ────────────────────────
+    # ── Group C: everything else — vision primary ─────────────────────
 
-    # map common commands to clearer visual descriptions for Sonnet
     vision_descriptions = {
-        "like":             "like button thumbs up below the video",
-        "dislike":          "dislike button thumbs down below the video",
-        "subscribe":        "subscribe button below the video title",
-        "unsubscribe":      "unsubscribe button below the video title",
-        "share":            "share button below the video",
-        "save":             "save button below the video",
-        "play next":        "next video button in the player controls",
-        "next video":       "next video button in the player controls",
-        "history":          "history item in the left sidebar",
-        "watch later":      "watch later item in the left sidebar",
-        "liked videos":     "liked videos item in the left sidebar",
-        "playlists":        "playlists item in the left sidebar",
-        "your channel":     "your channel item in the left sidebar",
-        "downloads":        "downloads item in the left sidebar",
-        "home":             "home button in the left sidebar",
-        "open comments":    "comments section on the page",
-        "settings":         "settings gear icon in the video player",
-        "ambient mode":     "ambient mode toggle in settings menu",
-        "sleep timer":      "sleep timer option in settings menu",
-        "quality":          "quality option in settings menu",
-        "switch account":   "account avatar button top right",
-        "sign out":         "sign out option in account menu",
-        "music":            "music filter chip at the top of the page",
-        "gaming":           "gaming filter chip at the top of the page",
-        "live":             "live filter chip at the top of the page",
-        "news":             "news filter chip at the top of the page",
-        "ask":              "ask button below the video",
-        "clips":            "clip button below the video",
+        "like":           "like button thumbs up below the video",
+        "dislike":        "dislike button thumbs down below the video",
+        "subscribe":      "subscribe button below the video title",
+        "unsubscribe":    "unsubscribe button below the video title",
+        "share":          "share button below the video",
+        "save":           "save button below the video",
+        "play next":      "next video button in player controls",
+        "next video":     "next video button in player controls",
+        "history":        "history item in left sidebar",
+        "watch later":    "watch later item in left sidebar",
+        "liked videos":   "liked videos item in left sidebar",
+        "playlists":      "playlists item in left sidebar",
+        "your channel":   "your channel item in left sidebar",
+        "downloads":      "downloads item in left sidebar",
+        "home":           "home button in left sidebar",
+        "open comments":  "comments section on page",
+        "settings":       "settings gear icon in video player",
+        "ambient mode":   "ambient mode toggle in settings menu",
+        "sleep timer":    "sleep timer option in settings menu",
+        "quality":        "quality option in settings menu",
+        "switch account": "account avatar button top right",
+        "sign out":       "sign out option in account menu",
+        "music":          "music filter chip at top of page",
+        "gaming":         "gaming filter chip at top of page",
+        "live":           "live filter chip at top of page",
+        "news":           "news filter chip at top of page",
+        "ask":            "ask button below the video",
+        "clips":          "clip button below the video",
     }
 
-    visual_instruction = vision_descriptions.get(param, param)
-
-    # for settings menu items, open settings first
-    settings_items = {"ambient mode", "sleep timer", "quality", "playback speed menu"}
-    if param in settings_items:
+    # pre-open menus for nested items
+    if param in {"ambient mode", "sleep timer", "quality", "playback speed menu"}:
         browser.execute_script("document.querySelector('.ytp-settings-button')?.click();")
         time.sleep(0.5)
-
-    # for account menu items, open account first
-    account_items = {"switch account", "sign out", "manage premium"}
-    if param in account_items:
+    elif param in {"switch account", "sign out", "manage premium"}:
         browser.execute_script("document.querySelector('button#avatar-btn')?.click();")
         time.sleep(0.5)
 
-    success = vision_click(browser, visual_instruction)
+    instruction = vision_descriptions.get(param, param)
+    success = vision_click(browser, instruction)
     return "Done." if success else f"Couldn't find {param} on the page."
 
 
-def scroll(parameter):
-    browser = get_browser(_last_browser_name)
-    param = parameter.lower().strip()
-    
-    if param == "down":
-        browser.execute_script("window.scrollBy(0, 500);")
-    elif param == "up":
-        browser.execute_script("window.scrollBy(0, -500);")
-    elif param == "top":
-        browser.execute_script("window.scrollTo(0, 0);")
-    elif param == "bottom":
-        browser.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    else:
-        try:
-            px = int(param)
-            browser.execute_script(f"window.scrollBy(0, {px});")
-        except ValueError:
-            return "I don't understand that scroll direction."
-    return f"Scrolled {parameter}."
+# ── System actions ────────────────────────────────────────────────────────────
+
+def _find_exe(name: str) -> str | None:
+    """Try to find an executable using glob for version-agnostic paths."""
+    if name in MANUAL_MAP:
+        path = MANUAL_MAP[name]
+        if os.path.exists(path):
+            return path
+        # try glob for versioned paths
+        parent = os.path.dirname(path)
+        pattern = os.path.join(os.path.dirname(parent), "**", os.path.basename(path))
+        matches = glob.glob(pattern, recursive=True)
+        if matches:
+            return matches[0]
+    return shutil.which(name)
 
 
-def _open_single_app(parameter):
-    param = parameter.lower().strip()
-    ALIASES = {
-        "microsoft word": "word",
-        "microsoft excel": "excel",
-        "microsoft powerpoint": "powerpoint",
-        "microsoft store": "store",
-        "microsoft teams": "teams",
-        "google chrome": "chrome",
-        "mozilla firefox": "firefox",
-        "github desktop": "githubapp",
-        "github": "github",
-        "proton vpn": "protonvpn",
-        "adobe acrobat": "acrobat",
-        "adobe reader": "acrobat",
-        "git bash": "gitbash",
-    }
-    param = ALIASES.get(param, param)
+def _open_single_app(name: str) -> str:
+    param = APP_ALIASES.get(name.lower().strip(), name.lower().strip())
+
     if param in URI_MAP:
         try:
             os.startfile(URI_MAP[param])
-            return f"Opening {parameter}."
+            return f"Opening {name}."
         except Exception:
-            return f"Couldn't open {parameter}."
+            return f"Couldn't open {name}."
 
     if param in WEB_MAP:
         webbrowser.open(WEB_MAP[param])
-        return f"Opening {parameter} in your browser."
+        return f"Opening {name}."
 
-    if param in MANUAL_MAP:
-        path = MANUAL_MAP[param]
-        if os.path.exists(path):
-            subprocess.Popen(path)
-            return f"Opening {parameter}."
-        else:
-            return f"I couldn't find {parameter} on this PC."
-    
-    exe = shutil.which(param)
+    exe = _find_exe(param)
     if exe:
         subprocess.Popen(exe)
-        return f"Opening {parameter}."
+        return f"Opening {name}."
+
+    # last resort
     try:
-        os.startfile(f"{param}:")
-        return f"Opening {parameter}."
-    except:
-        pass
-    subprocess.Popen(["cmd", "/c", "start", "", parameter])
-    return f"Trying to open {parameter}."
+        subprocess.Popen(["cmd", "/c", "start", "", name])
+        return f"Trying to open {name}."
+    except Exception:
+        return f"Couldn't find {name}."
 
 
-def open_application(parameter):
-    apps = [p.strip() for p in parameter.split(",")]
-    for app in apps:
+def open_application(parameter: str) -> str:
+    for app in [p.strip() for p in parameter.split(",")]:
         _open_single_app(app)
     return "Done."
 
 
-def _close_single_app(parameter):
-    param = parameter.lower().strip()
-
+def _close_single_app(name: str) -> str:
+    param = name.lower().strip()
     try:
-        import pygetwindow as gw
         title = WINDOW_TITLE_MAP.get(param, param.title())
         wins = gw.getWindowsWithTitle(title)
         if wins:
             wins[0].close()
-            return f"Closed {parameter}."
+            return f"Closed {name}."
     except Exception:
         pass
-
     if param in UWP_MAP:
         result = subprocess.run(["taskkill", "/F", "/IM", UWP_MAP[param] + ".exe"], capture_output=True)
-        return f"Closed {parameter}." if result.returncode == 0 else f"Couldn't close {parameter}."
-
-    if param in MANUAL_MAP:
-        name = os.path.basename(MANUAL_MAP[param])
-    else:
-        name = param + ".exe"
-
-    result = subprocess.run(["taskkill", "/F", "/IM", name], capture_output=True)
-    return f"Closed {parameter}." if result.returncode == 0 else f"Couldn't find {parameter} running."
+        return f"Closed {name}." if result.returncode == 0 else f"Couldn't close {name}."
+    exe_name = os.path.basename(MANUAL_MAP[param]) if param in MANUAL_MAP else param + ".exe"
+    result = subprocess.run(["taskkill", "/F", "/IM", exe_name], capture_output=True)
+    return f"Closed {name}." if result.returncode == 0 else f"Couldn't find {name} running."
 
 
-def close_application(parameter):
+def close_application(parameter: str) -> str:
     if parameter.strip().lower() == "all":
-        for proc in psutil.process_iter(['name']):
+        safe = {"explorer.exe", "python.exe", "pythonw.exe", "svchost.exe",
+                "system", "registry", "smss.exe", "sensei.py"}
+        for proc in psutil.process_iter(["name"]):
             try:
-                if proc.info['name'].lower() not in [
-                    "explorer.exe", "sensei.py", "python.exe", "pythonw.exe",
-                    "svchost.exe", "system", "registry", "smss.exe"
-                ]:
+                if proc.info["name"].lower() not in safe:
                     proc.kill()
-            except:
+            except Exception:
                 pass
         return "Closed everything."
-    apps = [p.strip() for p in parameter.split(",")]
-    for app in apps:
+    for app in [p.strip() for p in parameter.split(",")]:
         _close_single_app(app)
     return "Done."
 
 
-def lock_screen():
-    subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"])
-    return "Locking your screen."
-
-
-def adjust_volume(parameter):
+def adjust_volume(parameter: str) -> str:
     devices = AudioUtilities.GetSpeakers()
-    volume = devices.EndpointVolume  
-    parameter=parameter.lower().strip()
-    if parameter.startswith("+") or parameter.startswith("-"):
-        current = round(volume.GetMasterVolumeLevelScalar() * 100)
-        new = max(0, min(100, current + int(parameter)))
-        volume.SetMasterVolumeLevelScalar(new / 100.0, None)
-        return f"Volume set to {new}%."
-    if parameter in MUTE_MAP:
-        volume.SetMute(MUTE_MAP[parameter],None)
-        return f"Volume {'muted' if MUTE_MAP[parameter] else 'unmuted'}."   
-    try:
-        p=int(parameter)
-        if p<0:
-            p=0
-        elif p>100:
-            p=100
-        vol=p/100.0
-        volume.SetMasterVolumeLevelScalar(vol,None)
-        return f"Volume set to {p}%."
-    except ValueError:
-        return f"I don't understand '{parameter}' as a volume level."
-
-
-def hibernate():
-    subprocess.Popen(["shutdown", "/h"])
-    return "Hibernating. See you later."
-
-
-def screenshot():
-    filename = f"screenshot_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-    path = os.path.join(_home, "Pictures", "Screenshots", filename)
-    img = ImageGrab.grab()
-    img.save(path)
-    return f"Screenshot saved as {filename}."
-
-
-def adjust_brightness(parameter):
+    volume = devices.EndpointVolume
     param = parameter.lower().strip()
+    if param in MUTE_MAP:
+        volume.SetMute(MUTE_MAP[param], None)
+        return f"Volume {'muted' if MUTE_MAP[param] else 'unmuted'}."
+    if param.startswith(("+", "-")):
+        current = round(volume.GetMasterVolumeLevelScalar() * 100)
+        new = max(0, min(100, current + int(param)))
+        volume.SetMasterVolumeLevelScalar(new / 100.0, None)
+        return f"Volume {new}%."
+    try:
+        p = max(0, min(100, int(param)))
+        volume.SetMasterVolumeLevelScalar(p / 100.0, None)
+        return f"Volume {p}%."
+    except ValueError:
+        return f"Don't understand '{parameter}' as volume."
 
+
+def adjust_brightness(parameter: str) -> str:
+    param = parameter.lower().strip()
     if param in BRIGHTNESS_MAP:
         new = BRIGHTNESS_MAP[param]
-    elif param.startswith("+") or param.startswith("-"):
+    elif param.startswith(("+", "-")):
         try:
-            get_cmd = "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness).CurrentBrightness"
-            result = subprocess.run(["powershell", "-Command", get_cmd], capture_output=True, text=True)
+            result = subprocess.run(
+                ["powershell", "-Command",
+                 "(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightness).CurrentBrightness"],
+                capture_output=True, text=True,
+            )
             current = int(result.stdout.strip())
             new = max(0, min(100, current + int(param)))
-        except:
+        except Exception:
             return "Couldn't read current brightness."
     else:
         try:
             new = max(0, min(100, int(param)))
         except ValueError:
-            return f"I don't understand '{parameter}' as a brightness level."
-    try:
-        set_cmd = f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1, {new})"
-        result = subprocess.run(["powershell", "-Command", set_cmd], capture_output=True)
-        if result.returncode != 0:
-            return "Couldn't change brightness — WMI may not be supported on this display."
-        return f"Brightness set to {new}%."
-    except Exception as e:
-        return f"Failed to set brightness: {e}"
+            return f"Don't understand '{parameter}' as brightness."
+    result = subprocess.run(
+        ["powershell", "-Command",
+         f"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,{new})"],
+        capture_output=True,
+    )
+    return f"Brightness {new}%." if result.returncode == 0 else "Couldn't change brightness."
 
 
-def switch_window(parameter):
-    if not parameter:
-        return "Which window do you want to switch to?"
-    param = parameter.lower().strip()
-    for win in gw.getAllWindows():
-        if param in win.title.lower() and win.title:
-            try:
-                win.activate()
-            except:
-                pass
-            return f"Switched to {parameter}."
-    for win in gw.getAllWindows():
-        if not win.title:
-            continue
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(win._hWnd)
-            proc = psutil.Process(pid)
-            if param in proc.name().lower():
-                try:
-                    win.activate()
-                except:
-                    pass
-                return f"Switched to {parameter}."
-        except:
-            continue
-    return f"Couldn't find {parameter} window."
+def screenshot() -> str:
+    path = os.path.join(_screenshot_dir, f"screenshot_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+    ImageGrab.grab().save(path)
+    return f"Screenshot saved."
 
 
-def maximize_window(parameter):
-    if not parameter:
-        return "Which window do you want to maximize?"
-    param = parameter.lower().strip()   
-    for win in gw.getAllWindows():
-        if param in win.title.lower() and win.title:
-            try:
-                win.activate()
-            except:
-                pass
-            win.maximize()
-            return f"Maximized {parameter}."    
-    for win in gw.getAllWindows():
-        if not win.title:
-            continue
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(win._hWnd)
-            proc = psutil.Process(pid)
-            if param in proc.name().lower():
-                try:
-                    win.activate()
-                except:
-                    pass
-                win.maximize()
-                return f"Maximized {parameter}."
-        except:
-            continue
-    return f"Couldn't find {parameter} window."
+def lock_screen() -> str:
+    subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"])
+    return "Locking screen."
 
 
-def minimize_window(parameter):
-    if not parameter:
-        return "Which window do you want to minimize?"
-    param = parameter.lower().strip()   
-    for win in gw.getAllWindows():
-        if param in win.title.lower() and win.title:
-            win.minimize()
-            return f"Minimized {parameter}."   
-    for win in gw.getAllWindows():
-        if not win.title:
-            continue
-        try:
-            _, pid = win32process.GetWindowThreadProcessId(win._hWnd)
-            proc = psutil.Process(pid)
-            if param in proc.name().lower():
-                win.minimize()
-                return f"Minimized {parameter}."
-        except:
-            continue
-    return f"Couldn't find {parameter} window."
+def hibernate() -> str:
+    subprocess.Popen(["shutdown", "/h"])
+    return "Hibernating."
 
 
-def shutdown():
+def shutdown() -> str:
     subprocess.Popen(["shutdown", "/s", "/t", "0", "/f"])
-    return "Shutting down. Goodbye."
+    return "Shutting down."
 
 
-def restart():
+def restart() -> str:
     subprocess.Popen(["shutdown", "/r", "/t", "0", "/f"])
-    return "Restarting. Be right back."
+    return "Restarting."
 
 
-def execute(action, parameter):
-    if action == "open_application":
-        return open_application(parameter)
-    if action == "open_url":
-        if not parameter or not parameter.startswith(("https://", "http://")):
-            return "That doesn't look like a valid URL."
-        browser = get_browser()
-        browser.switch_to.window(browser._akira_tab)
-        browser.get(parameter)
-        return f"Opening {parameter}."
-    if action == "fill":
-        # parameter format: "description|text to type|submit" or "description|text to type"
-        # submit is optional, if present hits Enter after typing
-        if not parameter or "|" not in parameter:
-            return "I need a field description and text to type."
-        parts = parameter.split("|")
-        instruction = parts[0].strip()
-        text = parts[1].strip()
-        should_submit = len(parts) > 2 and parts[2].strip().lower() == "submit"
-        browser = get_browser(_last_browser_name)
-        elements = extract_interactive_elements(browser, max_elements=100)
-        from claude_handler import find_element_index
-        index = find_element_index(elements, instruction)
-        if index is None or index >= len(elements):
-            return "I couldn't find that field on the page."
-        selector = f'[data-akira-index="{index}"]'
-        matched = browser.find_elements(By.CSS_SELECTOR, selector)
-        if not matched:
-            return "Couldn't locate that field in the DOM."
-        el = matched[0]
+def _find_window(param: str):
+    for win in gw.getAllWindows():
+        if win.title and param in win.title.lower():
+            return win
+    for win in gw.getAllWindows():
+        if not win.title:
+            continue
         try:
-            el.click()
-            el.clear()
-            el.send_keys(text)
-            if should_submit:
-                from selenium.webdriver.common.keys import Keys
-                el.send_keys(Keys.RETURN)
-        except Exception as e:
-            return f"Couldn't type into that field: {e}"
-        return f"Typed '{text}' into {instruction}." + (" Submitted." if should_submit else "")
-    if action == "site_search":
-        if not parameter or "|" not in parameter:
-            return "I need a site and a query to search."
-        site, query = parameter.split("|", 1)
-        site = site.strip().lower()
-        query = query.strip()
-        url_template = SEARCH_URL_MAP.get(site)
-        url = url_template.format(urllib.parse.quote(query)) if url_template else f"https://www.google.com/search?q={urllib.parse.quote(query)}+site:{site}.com"
-        browser = get_browser(_last_browser_name)
-        browser.switch_to.window(browser._akira_tab)
-        browser.get(url)
-        return f"Searching {query} on {site}."
-    if action == "web_search":
-        print(f"[DEBUG] web_search called with action={action} parameter={parameter}")
-        browser_name = None
-        if parameter and "|browser:" in parameter:
-            parts = parameter.split("|browser:")
-            parameter = parts[0].strip()
-            browser_name = parts[1].strip()
+            _, pid = win32process.GetWindowThreadProcessId(win._hWnd)
+            proc = psutil.Process(pid)
+            if param in proc.name().lower():
+                return win
+        except Exception:
+            continue
+    return None
 
-        # context-aware routing — if on a supported site, search there unless user said "on the web"
-        explicit_web = any(w in parameter.lower() for w in ["on the web", "on google", "google it", "on web"])
-        parameter_clean = parameter.lower().replace("on the web","").replace("on google","").replace("google it","").replace("on web","").strip()
 
+def switch_window(parameter: str) -> str:
+    win = _find_window(parameter.lower().strip())
+    if win:
         try:
-            browser = get_browser(name=browser_name)
-        except RuntimeError as e:
-            print(f"[DEBUG] get_browser raised: {e}")
-            return str(e)
-
-        if not explicit_web:
-            current_site = get_current_site(browser)
-            if current_site and current_site in SEARCH_URL_MAP:
-                print(f"[DEBUG] web_search: routing to site_search for {current_site}")
-                return execute("site_search", f"{current_site}|{parameter_clean}")
-
-        print(f"[DEBUG] browser_name={browser_name} query={parameter_clean}")
-        query = urllib.parse.quote(parameter_clean if explicit_web else parameter)
-        print(f"[DEBUG] got browser, all handles: {browser.window_handles}")
-        print(f"[DEBUG] akira_tab: {browser._akira_tab}")
-        print(f"[DEBUG] current handle before switch: {browser.current_window_handle}")
-        browser.switch_to.window(browser._akira_tab)
-        print(f"[DEBUG] navigating to: https://www.google.com/search?q={query}")
-        browser.get(f"https://www.google.com/search?q={query}")
-        print(f"[DEBUG] done, current url: {browser.current_url}")
-        try:
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-            reject_selectors = [
-                "button[id*='reject']",
-                "button[aria-label*='Reject']",
-                "button[aria-label*='Accept all']",
-                "form[action*='consent'] button",
-            ]
-            for selector in reject_selectors:
-                try:
-                    btn = WebDriverWait(browser, 2).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                    )
-                    btn.click()
-                    print(f"[DEBUG] web_search: dismissed popup via selector: {selector}")
-                    break
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"[DEBUG] web_search: popup dismiss failed silently: {e!r}")
-        return f"Searching for {parameter}."
-    if action == "bookmark_page":
-        get_browser().execute_script("window.bookmarks = window.bookmarks || []; window.bookmarks.push(document.URL);")
-        get_browser().execute_script("document.title = document.title;")
-        get_browser().find_element(By.TAG_NAME, "body").send_keys("\ue009d")
-        return "Bookmarked."
-    if action == "new_tab":
-        return new_tab(parameter)
-    if action == "youtube_control":
-        return youtube_control(parameter)
-    if action == "adjust_volume":
-        return adjust_volume(parameter)
-    if action == "close_application":
-        return close_application(parameter)
-    if action == "hibernate":
-        return hibernate()
-    if action == "lock_screen":
-        return lock_screen()
-    if action == "adjust_brightness":
-        return adjust_brightness(parameter)
-    if action == "screenshot":
-        return screenshot()
-    if action == "switch_window":
-        return switch_window(parameter)
-    if action == "maximize_window":
-        return maximize_window(parameter)
-    if action == "minimize_window":
-        return minimize_window(parameter)
-    if action == "shutdown":
-        return shutdown()
-    if action == "restart":
-        return restart()
-    if action == "click":
-        browser = get_browser(_last_browser_name)
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-        from selenium.webdriver.common.by import By as SeleniumBy
-        try:
-            WebDriverWait(browser, 5).until(
-                EC.presence_of_element_located((SeleniumBy.TAG_NAME, "body"))
-            )
+            win.activate()
         except Exception:
             pass
-        elements = extract_interactive_elements(browser, max_elements=100)
-        from claude_handler import find_element_index
-        index = find_element_index(elements, parameter)
-        print(f"[DEBUG] click: matched index={index} for instruction='{parameter}'")
-        if index is None or index >= len(elements):
-            print(f"[DEBUG] click: trying vision fallback")
-            success = vision_click(browser, parameter)
-            return "Done." if success else "I couldn't find that on the page."
-        target = elements[index]
+        return f"Switched to {parameter}."
+    return f"Couldn't find {parameter}."
+
+
+def maximize_window(parameter: str) -> str:
+    win = _find_window(parameter.lower().strip())
+    if win:
         try:
-            result = click_element(browser, index, expected_text=target["text"], expected_href=target["href"], instruction=parameter)
-        except Exception as e:
-            print(f"[DEBUG] click: EXCEPTION in click_element: {e!r}")
-            return f"Couldn't click that: {e}"
-        print(f"[DEBUG] click: click_element returned keys={list(result.keys()) if isinstance(result, dict) else result!r}")
-        if not result["success"]:
-            print(f"[DEBUG] click: returning failure")
-            return f"Couldn't click that: {result['reason']}"
-        if result["needs_confirmation"]:
-            print(f"[DEBUG] click: needs confirmation, returning dict")
-            return {"needs_click_confirmation": True, "element_text": result["element"]["text"], "_execute": result["_execute"], "retry_parameter": parameter}
-        print(f"[DEBUG] click: calling _execute()")
+            win.activate()
+        except Exception:
+            pass
+        win.maximize()
+        return f"Maximized {parameter}."
+    return f"Couldn't find {parameter}."
+
+
+def minimize_window(parameter: str) -> str:
+    win = _find_window(parameter.lower().strip())
+    if win:
+        win.minimize()
+        return f"Minimized {parameter}."
+    return f"Couldn't find {parameter}."
+
+
+def scroll(parameter: str) -> str:
+    browser = get_browser(_last_browser_name)
+    param = parameter.lower().strip()
+    scripts = {
+        "down":   "window.scrollBy(0,500);",
+        "up":     "window.scrollBy(0,-500);",
+        "top":    "window.scrollTo(0,0);",
+        "bottom": "window.scrollTo(0,document.body.scrollHeight);",
+    }
+    if param in scripts:
+        browser.execute_script(scripts[param])
+        return f"Scrolled {param}."
+    try:
+        browser.execute_script(f"window.scrollBy(0,{int(param)});")
+        return f"Scrolled {param}px."
+    except ValueError:
+        return "Don't understand that scroll direction."
+
+
+def new_tab(parameter: str | None = None) -> str:
+    browser_name = None
+    if parameter and "|browser:" in parameter:
+        parameter, browser_name = parameter.split("|browser:", 1)
+        parameter = parameter.strip()
+        browser_name = browser_name.strip()
+    browser = get_browser(browser_name)
+    existing = set(browser.window_handles)
+    browser.execute_cdp_cmd("Target.createTarget", {"url": "chrome://newtab"})
+    for _ in range(10):
+        new_handles = [h for h in browser.window_handles if h not in existing]
+        if new_handles:
+            break
+        time.sleep(0.3)
+    browser.switch_to.window(new_handles[0])
+    if parameter:
+        browser.get(f"https://www.google.com/search?q={urllib.parse.quote(parameter)}")
+        return f"Searching {parameter} in new tab."
+    return "New tab opened."
+
+
+def fill(parameter: str) -> str:
+    if not parameter or "|" not in parameter:
+        return "I need a field description and text to type."
+    parts = parameter.split("|")
+    instruction, text = parts[0].strip(), parts[1].strip()
+    should_submit = len(parts) > 2 and parts[2].strip().lower() == "submit"
+    browser = get_browser(_last_browser_name)
+    elements = extract_interactive_elements(browser, max_elements=100)
+    from claude_handler import find_element_index
+    index = find_element_index(elements, instruction)
+    if index is None or index >= len(elements):
+        return "Couldn't find that field."
+    el = browser.find_elements(By.CSS_SELECTOR, f'[data-akira-index="{index}"]')
+    if not el:
+        return "Couldn't locate field in DOM."
+    try:
+        el[0].click()
+        el[0].clear()
+        el[0].send_keys(text)
+        if should_submit:
+            from selenium.webdriver.common.keys import Keys
+            el[0].send_keys(Keys.RETURN)
+    except Exception as e:
+        return f"Couldn't type: {e}"
+    return f"Typed '{text}'." + (" Submitted." if should_submit else "")
+
+
+# ── Action dispatch ───────────────────────────────────────────────────────────
+
+def _handle_open_url(parameter: str) -> str:
+    if not parameter or not parameter.startswith(("https://", "http://")):
+        return "That doesn't look like a valid URL."
+    _navigate(parameter)
+    return f"Opening {parameter}."
+
+
+def _handle_web_search(parameter: str) -> str:
+    browser_name = None
+    if parameter and "|browser:" in parameter:
+        parameter, browser_name = parameter.split("|browser:", 1)
+        parameter, browser_name = parameter.strip(), browser_name.strip()
+
+    explicit_web = any(w in parameter.lower() for w in ["on the web", "on google", "google it", "on web"])
+    query_clean = re.sub(r"\b(on the web|on google|google it|on web)\b", "", parameter, flags=re.I).strip()
+
+    browser = get_browser(name=browser_name)
+
+    if not explicit_web:
+        current_site = get_current_site(browser)
+        if current_site and current_site in SEARCH_URL_MAP:
+            return _handle_site_search(f"{current_site}|{query_clean}")
+
+    _navigate(f"https://www.google.com/search?q={urllib.parse.quote(query_clean if explicit_web else parameter)}")
+
+    # dismiss consent popups
+    try:
+        for selector in [
+            "button[id*='reject']", "button[aria-label*='Reject']",
+            "button[aria-label*='Accept all']", "form[action*='consent'] button",
+        ]:
+            try:
+                btn = WebDriverWait(browser, 2).until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                btn.click()
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return f"Searching for {parameter}."
+
+
+def _handle_site_search(parameter: str) -> str:
+    if not parameter or "|" not in parameter:
+        return "I need a site and a query."
+    site, query = parameter.split("|", 1)
+    site, query = site.strip().lower(), query.strip()
+    template = SEARCH_URL_MAP.get(site)
+    url = template.format(urllib.parse.quote(query)) if template else \
+          f"https://www.google.com/search?q={urllib.parse.quote(query)}+site:{site}.com"
+    _navigate(url)
+    return f"Searching {query} on {site}."
+
+
+def _handle_click(parameter: str) -> str | dict:
+    browser = get_browser(_last_browser_name)
+    try:
+        WebDriverWait(browser, 5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    except Exception:
+        pass
+
+    elements = extract_interactive_elements(browser, max_elements=100)
+    from claude_handler import find_element_index
+    index = find_element_index(elements, parameter)
+    print(f"[DEBUG] click: matched index={index} for '{parameter}'")
+
+    if index is None or index >= len(elements):
+        print(f"[DEBUG] click: vision fallback")
+        return "Done." if vision_click(browser, parameter) else "Couldn't find that on the page."
+
+    target = elements[index]
+    try:
+        result = click_element(browser, index, expected_text=target["text"],
+                               expected_href=target["href"], instruction=parameter)
+    except Exception as e:
+        print(f"[DEBUG] click_element exception: {e!r}")
+        return f"Couldn't click that: {e}"
+
+    if not result["success"]:
+        # fallback to vision on element failure
+        print(f"[DEBUG] click: element failed ({result['reason']}), trying vision")
+        return "Done." if vision_click(browser, parameter) else f"Couldn't click that: {result['reason']}"
+
+    if result["needs_confirmation"]:
+        return {
+            "needs_click_confirmation": True,
+            "element_text": result["element"]["text"],
+            "_execute": result["_execute"],
+            "retry_parameter": parameter,
+        }
+
+    try:
+        result["_execute"]()
+    except Exception as e:
+        print(f"[DEBUG] _execute exception: {e!r}")
+        return f"Couldn't click that: {e}"
+
+    return f"Clicked {result['element']['text']}."
+
+
+# Dispatch table — replaces 150-line if/elif chain
+_ACTION_MAP = {
+    "open_application":  open_application,
+    "close_application": close_application,
+    "open_url":          _handle_open_url,
+    "web_search":        _handle_web_search,
+    "site_search":       _handle_site_search,
+    "fill":              fill,
+    "scroll":            scroll,
+    "new_tab":           new_tab,
+    "click":             _handle_click,
+    "youtube_control":   youtube_control,
+    "adjust_volume":     adjust_volume,
+    "adjust_brightness": adjust_brightness,
+    "screenshot":        lambda _: screenshot(),
+    "lock_screen":       lambda _: lock_screen(),
+    "hibernate":         lambda _: hibernate(),
+    "shutdown":          lambda _: shutdown(),
+    "restart":           lambda _: restart(),
+    "switch_window":     switch_window,
+    "maximize_window":   maximize_window,
+    "minimize_window":   minimize_window,
+    "bookmark_page":     lambda _: _bookmark(),
+}
+
+
+def _bookmark() -> str:
+    try:
+        browser = get_browser(_last_browser_name)
+        browser.find_element(By.TAG_NAME, "body").send_keys("\ue009d")
+        return "Bookmarked."
+    except Exception:
+        return "Couldn't bookmark."
+
+
+def execute(action: str, parameter) -> str | dict:
+    handler = _ACTION_MAP.get(action)
+    if handler:
         try:
-            result["_execute"]()
+            return handler(parameter)
         except Exception as e:
-            print(f"[DEBUG] click: EXCEPTION in _execute(): {e!r}")
-            return f"Couldn't click that: {e}"
-        print(f"[DEBUG] click: _execute() done, returning success")
-        return f"Clicked {result['element']['text']}."
-    if action == "scroll":
-        return scroll(parameter)
-    return f"I don't know how to handle action: {action}"
+            print(f"[DEBUG] execute: unhandled exception in {action}: {e!r}")
+            return f"Something went wrong with {action}: {e}"
+    return f"Unknown action: {action}"
