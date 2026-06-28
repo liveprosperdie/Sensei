@@ -1,4 +1,10 @@
+"""
+sensei.py — Akira's ears and orchestration loop.
+Handles wake word detection, VAD, recording, transcription, and action execution.
+"""
+
 import os
+import re
 import time
 import json
 import torch
@@ -11,92 +17,129 @@ import openwakeword
 import claude_handler
 from groq import Groq
 import soundfile as sf
-from executor import execute
+from executor import execute, get_all_tabs, get_pc_context
 from openwakeword import Model as WakeModel
 
+# ── Init ──────────────────────────────────────────────────────────────────────
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 openwakeword.utils.download_models()
 oww_model = WakeModel(wakeword_models=["sensei.onnx"], inference_framework="onnx")
 
 mic = pyaudio.PyAudio()
-stream = mic.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1280)
+stream = mic.open(format=pyaudio.paInt16, channels=1, rate=16000,
+                  input=True, frames_per_buffer=1280)
+
+vad_model, _ = torch.hub.load(
+    repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=False
+)
+
+# ── Session state ─────────────────────────────────────────────────────────────
+
+COOLDOWN_TIME   = 3.0
+SESSION_TIMEOUT = 45  # seconds — enough for natural pauses
+
 last_activation_time = 0.0
-COOLDOWN_TIME = 3.0
-session_active = False
-SESSION_TIMEOUT = 20
-session_start_time = 0.0
-pending_action = None
+session_active       = False
+session_start_time   = 0.0
+
+# Pending confirmation state
+pending_action    = None   # action name or list of actions
 pending_parameter = None
-pending_execute = None
-akira_speaking = False
-user_speaking = threading.Event()
-vad_model, _ = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=False)
-vad_audio_buffer = []
+pending_execute   = None   # callable for click confirmation
+
+# VAD barge-in state
+akira_speaking  = False
+user_speaking   = threading.Event()
 vad_buffer_lock = threading.Lock()
+vad_audio_buffer: list[np.ndarray] = []
+
+# Dangerous actions — safety net catches these if Claude forgets to gate them
+DANGEROUS_ACTIONS = frozenset({
+    "close_application", "shutdown", "restart", "hibernate",
+    "delete_files", "move_files", "edit_file", "uninstall_application",
+})
+
+FAILURE_PREFIXES = (
+    "I couldn't find", "Couldn't click", "Couldn't find",
+    "Skipped", "Something went wrong", "Unknown action",
+)
+
 print("Listening for 'Sensei'...")
 
 
-def record_command(pre_audio=None):
+# ── Audio utilities ───────────────────────────────────────────────────────────
+
+def record_command(pre_audio: np.ndarray | None = None) -> np.ndarray | None:
+    """
+    Record until silence or MAX_CHUNKS. Returns normalised float32 audio or None.
+    pre_audio: VAD-captured audio from during Akira's speech (barge-in buffer).
+    """
     command_audio = [pre_audio] if pre_audio is not None else []
-    chunk_count = 1 if pre_audio is not None else 0
+    chunk_count   = 1 if pre_audio is not None else 0
     silent_chunks = 15
-    MAX_CHUNKS = 200
-    MIN_CHUNKS = 48
-    MAX_SILENT = 15
+    MAX_CHUNKS    = 200
+    MIN_CHUNKS    = 48
+    MAX_SILENT    = 15
+
     while chunk_count < MAX_CHUNKS:
-        audio_chunk = stream.read(1280, exception_on_overflow=False)
-        audio_np = np.frombuffer(audio_chunk, dtype=np.int16)
+        chunk = stream.read(1280, exception_on_overflow=False)
+        audio_np = np.frombuffer(chunk, dtype=np.int16)
         rms = np.sqrt(np.mean(audio_np.astype(np.float32) ** 2))
         command_audio.append(audio_np.astype(np.float32))
         chunk_count += 1
         if chunk_count > MIN_CHUNKS:
-            if rms < 150:
-                silent_chunks += 1
-            else:
-                silent_chunks = 0
+            silent_chunks = silent_chunks + 1 if rms < 150 else 0
             if silent_chunks >= MAX_SILENT:
                 break
-    if len(command_audio) == 0:
-        print("record_command: no audio or too quiet")
+
+    if not command_audio:
+        print("[record] no audio captured")
         return None
-    command = np.concatenate(command_audio)
-    final_command = command / 32768.0
-    if pre_audio is None and np.sqrt(np.mean(command ** 2)) < 100:
-        print("record_command: no audio or too quiet")
+
+    raw = np.concatenate(command_audio)
+    normalised = raw / 32768.0
+    if pre_audio is None and np.sqrt(np.mean(raw ** 2)) < 100:
+        print("[record] too quiet")
         return None
-    return final_command
+    return normalised
 
 
-def transcribe_command(final_command):
+def transcribe_command(audio: np.ndarray) -> str:
+    """Write audio to temp file and transcribe via Groq Whisper."""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         temp_path = f.name
-    sf.write(temp_path, final_command, 16000)
-    with open(temp_path, "rb") as f:
-        result = groq_client.audio.transcriptions.create(
-            model="whisper-large-v3-turbo",
-            file=f,
-            language="en"
-        )
-    os.remove(temp_path)
-    return result.text.strip()
+    sf.write(temp_path, audio, 16000)
+    try:
+        with open(temp_path, "rb") as f:
+            result = groq_client.audio.transcriptions.create(
+                model="whisper-large-v3-turbo", file=f, language="en"
+            )
+        return result.text.strip()
+    finally:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
 
 
-def flush_stream():
+def flush_stream() -> None:
     if not user_speaking.is_set():
         available = stream.get_read_available()
         if available > 0:
             stream.read(available, exception_on_overflow=False)
 
 
-def vad_listener():
-    global vad_audio_buffer
+# ── VAD barge-in listener ─────────────────────────────────────────────────────
+
+def _vad_listener() -> None:
+    """Daemon thread: runs VAD while Akira is speaking to detect barge-in."""
     while True:
         if akira_speaking:
-            audio_chunk = stream.read(512, exception_on_overflow=False)
-            audio_np = np.frombuffer(audio_chunk, dtype=np.int16)
-            audio_float = torch.FloatTensor(audio_np.astype(np.float32) / 32768.0)
-            confidence = vad_model(audio_float, 16000).item()
+            chunk = stream.read(512, exception_on_overflow=False)
+            audio_np = np.frombuffer(chunk, dtype=np.int16)
+            audio_f  = torch.FloatTensor(audio_np.astype(np.float32) / 32768.0)
+            confidence = vad_model(audio_f, 16000).item()
             if confidence > 0.5:
                 user_speaking.set()
                 with vad_buffer_lock:
@@ -105,9 +148,12 @@ def vad_listener():
             time.sleep(0.01)
 
 
-def speak_and_wait(text):
-    """Sets akira_speaking before speech starts (so VAD listens during it),
-    runs speak() in a thread, and blocks here until it's done before returning."""
+vad_thread = threading.Thread(target=_vad_listener, daemon=True)
+vad_thread.start()
+
+
+def speak_and_wait(text: str) -> None:
+    """Speak text while VAD listens for barge-in. Blocks until done."""
     global akira_speaking
     akira_speaking = True
     thread = claude_handler.speak_async(text)
@@ -116,37 +162,35 @@ def speak_and_wait(text):
     user_speaking.clear()
 
 
-def run_actions(response, step_results=None):
-    """Execute one action or a list of actions with full chain/dependency support.
+# ── Action execution ──────────────────────────────────────────────────────────
 
-    Supports:
-    - id/depends_on dependency graph
-    - {{stepX.result}} substitution before each step runs
-    - per-step result storage
-    - dependent steps halt on failed dependency
-    - independent steps never blocked by each other
-    - click confirmation pause via existing pending state
+def run_actions(response: dict, step_results: dict | None = None) -> list:
+    """
+    Execute one or many actions with dependency graph support.
+    - id / depends_on for chaining
+    - {{stepX.result}} substitution
+    - click confirmation pause
+    - failure tracking per step id
     """
     global pending_action, pending_parameter, pending_execute
 
     if step_results is None:
         step_results = {}
 
-    results = []
     steps = response.get("actions", [])
     if not steps and response.get("action"):
         steps = [{"action": response["action"], "parameter": response.get("parameter")}]
 
+    results    = []
     failed_ids = set()
 
     for step in steps:
-        step_id = step.get("id")
+        step_id    = step.get("id")
         depends_on = step.get("depends_on")
 
-        # dependency check — skip if dependency failed
         if depends_on and depends_on in failed_ids:
             msg = f"Skipped {step.get('action')} because {depends_on} failed."
-            print(f"[DEBUG] run_actions: {msg}")
+            print(f"[run_actions] {msg}")
             results.append(msg)
             if step_id:
                 failed_ids.add(step_id)
@@ -155,45 +199,37 @@ def run_actions(response, step_results=None):
         # {{stepX.result}} substitution
         parameter = step.get("parameter")
         if parameter and isinstance(parameter, str) and "{{" in parameter:
-            import re
-            def substitute(match):
-                ref_id = match.group(1)
-                return str(step_results.get(ref_id, match.group(0)))
-            parameter = re.sub(r"\{\{(\w+)\.result\}\}", substitute, parameter)
-            print(f"[DEBUG] run_actions: substituted parameter={parameter!r}")
+            parameter = re.sub(
+                r"\{\{(\w+)\.result\}\}",
+                lambda m: str(step_results.get(m.group(1), m.group(0))),
+                parameter,
+            )
+            print(f"[run_actions] substituted parameter={parameter!r}")
 
-        print(f"[DEBUG] run_actions: executing action={step['action']} parameter={parameter!r} id={step_id}")
+        print(f"[run_actions] {step['action']} | {parameter!r} | id={step_id}")
 
         try:
             result = execute(step["action"], parameter)
         except Exception as e:
-            print(f"[DEBUG] run_actions: EXCEPTION in execute: {e!r}")
+            print(f"[run_actions] EXCEPTION in execute: {e!r}")
             result = f"Something went wrong running {step['action']}: {e}"
 
-        # click confirmation — pause chain, store state
+        # click confirmation — pause chain
         if isinstance(result, dict) and result.get("needs_click_confirmation"):
-            pending_action = "click_confirmed"
+            pending_action    = "click_confirmed"
             pending_parameter = result["retry_parameter"]
-            pending_execute = result["_execute"]
+            pending_execute   = result["_execute"]
             msg = f"Are you sure you want to click '{result['element_text']}'?"
             results.append(msg)
-            # store partial results so chain can resume later if needed
             if step_id:
                 step_results[step_id] = None
                 failed_ids.add(step_id)
             break
 
-        # store result by id for downstream substitution
         if step_id:
             step_results[step_id] = result
 
-        # track failures for dependent steps
-        if isinstance(result, str) and (
-            result.startswith("Couldn't") or
-            result.startswith("I couldn't") or
-            result.startswith("Something went wrong") or
-            result.startswith("Skipped")
-        ):
+        if isinstance(result, str) and result.startswith(FAILURE_PREFIXES):
             if step_id:
                 failed_ids.add(step_id)
 
@@ -202,98 +238,84 @@ def run_actions(response, step_results=None):
     return results
 
 
-def handle_response(response):
-    global session_start_time, pending_action, pending_parameter, pending_execute, akira_speaking
+# ── Response handling ─────────────────────────────────────────────────────────
 
-    DANGEROUS_ACTIONS = {
-        "close_application", "shutdown", "restart", "hibernate",
-        "delete_files", "move_files", "edit_file", "uninstall_application"
-    }
+def handle_response(response: dict) -> bool:
+    """
+    Process a parsed Akira response dict.
+    Returns True to keep session alive, False to end it.
+    """
+    global session_start_time, pending_action, pending_parameter
 
-    if response["mode"] == "command":
+    mode = response.get("mode")
 
-        if response.get("actions") or response.get("action"):
+    if mode == "command":
+        actions_to_run = response.get("actions", [])
+        if response.get("action"):
+            actions_to_run = [{"action": response["action"], "parameter": response.get("parameter")}]
 
-            # normalize to actions list
-            actions_to_check = response.get("actions", [])
-            if response.get("action"):
-                actions_to_check = [{"action": response["action"], "parameter": response.get("parameter")}]
+        # safety net: catch dangerous actions Claude forgot to gate
+        unsafe = [a for a in actions_to_run if a["action"] in DANGEROUS_ACTIONS]
+        safe   = [a for a in actions_to_run if a["action"] not in DANGEROUS_ACTIONS]
 
-            # safety net — catch dangerous actions Claude forgot to gate
-            unsafe = [a for a in actions_to_check if a["action"] in DANGEROUS_ACTIONS]
-            safe = [a for a in actions_to_check if a["action"] not in DANGEROUS_ACTIONS]
+        if unsafe and not response.get("confirmation_required"):
+            print(f"[handle_response] safety net caught: {[a['action'] for a in unsafe]}")
+            response["confirmation_required"] = True
+            response["pending_actions"]       = unsafe
+            response["actions"]               = safe
+            response.pop("action", None)
+            response.pop("parameter", None)
+            response["confirmation_message"]  = "Just confirming before I do that."
 
-            if unsafe and not response.get("confirmation_required"):
-                print(f"[DEBUG] handle_response: safety net caught ungated dangerous actions: {[a['action'] for a in unsafe]}")
-                response["confirmation_required"] = True
-                response["pending_actions"] = unsafe
-                response["actions"] = safe
-                response.pop("action", None)
-                response.pop("parameter", None)
-                response["confirmation_message"] = "Just confirming before I do that."
+        run_results = []
+        if safe and not response.get("confirmation_required"):
+            run_results = run_actions({"actions": safe})
+        elif not unsafe:
+            run_results = run_actions(response)
 
-            # run safe actions now
-            if safe and not response.get("confirmation_required"):
-                run_results = run_actions({"actions": safe})
-            elif not unsafe:
-                run_results = run_actions(response)
-            else:
-                run_results = []
+        # override spoken response on execution failure
+        for r in reversed(run_results):
+            if isinstance(r, str) and r.startswith(FAILURE_PREFIXES):
+                response["response"] = r
+                break
 
-            # override spoken response if execution produced a more useful message
-            if run_results:
-                override_prefixes = (
-                    "I couldn't find",
-                    "Couldn't click",
-                    "Skipped",
-                    "Something went wrong",
-                )
-                for r in reversed(run_results):
-                    if isinstance(r, str) and r.startswith(override_prefixes):
-                        response["response"] = r
-                        break
+        # click confirmation discovered at runtime
+        if pending_action == "click_confirmed" and run_results:
+            response["response"] = run_results[-1]
 
-            # click confirmation discovered at runtime
-            if pending_action == "click_confirmed" and run_results:
-                response["response"] = run_results[-1]
+        # store pending dangerous actions
+        if response.get("confirmation_required"):
+            if response.get("pending_actions"):
+                pending_action    = response["pending_actions"]
+                pending_parameter = None
+            elif response.get("action"):
+                pending_action    = response["action"]
+                pending_parameter = response.get("parameter")
 
-        # store pending dangerous actions for confirmation
-        if response.get("confirmation_required") and response.get("pending_actions"):
-            pending_action = response["pending_actions"]
-            pending_parameter = None
-        elif response.get("confirmation_required") and response.get("action"):
-            pending_action = response["action"]
-            pending_parameter = response.get("parameter")
+    speak_and_wait(response.get("response", ""))
 
-        speak_and_wait(response["response"])
-
-        if response.get("end_session"):
-            flush_stream()
-            claude_handler.clear_history()
-            return False
-
+    if response.get("end_session"):
         flush_stream()
-        time.sleep(0.5)
-        session_start_time = time.time()
-        return True
+        claude_handler.clear_history()
+        return False
 
-    elif response["mode"] == "conversation":
-        if response["end_session"]:
-            speak_and_wait(response["response"])
-            claude_handler.clear_history()
-            return False
-        speak_and_wait(response["response"])
-        flush_stream()
-        time.sleep(0.5)
-        session_start_time = time.time()
-        return True
-
-    return False
+    flush_stream()
+    time.sleep(0.4)
+    session_start_time = time.time()
+    return True
 
 
-def get_akira_response(text):
+# ── LLM query ─────────────────────────────────────────────────────────────────
+
+def get_akira_response(text: str) -> dict | None:
+    """
+    Get Akira's response for user text.
+    Handles pending confirmation state before calling the LLM.
+    Returns parsed dict or None (when confirmation was handled inline).
+    """
     global pending_action, pending_parameter, pending_execute
 
+    # handle pending confirmation
     if pending_action is not None:
         confirmed = claude_handler.ask_confirmation(text)
         if confirmed:
@@ -302,89 +324,135 @@ def get_akira_response(text):
                     pending_execute()
                     speak_text = "Done."
                 except Exception as e:
-                    print(f"[DEBUG] get_akira_response: EXCEPTION in pending_execute: {e!r}")
-                    speak_text = f"Couldn't click that: {e}"
-                pending_action = None
-                pending_parameter = None
-                pending_execute = None
-                speak_and_wait(speak_text)
-                return None
+                    speak_text = f"Couldn't do that: {e}"
             else:
-                actions = pending_action if isinstance(pending_action, list) else [{"action": pending_action, "parameter": pending_parameter}]
-                pending_action = None
-                pending_parameter = None
-                pending_execute = None
+                actions = (
+                    pending_action if isinstance(pending_action, list)
+                    else [{"action": pending_action, "parameter": pending_parameter}]
+                )
                 run_actions({"actions": actions})
-                speak_and_wait("Done.")
-                return None
+                speak_text = "Done."
+            pending_action = pending_parameter = pending_execute = None
+            speak_and_wait(speak_text)
+            return None
         else:
-            pending_action = None
-            pending_parameter = None
-            pending_execute = None
+            pending_action = pending_parameter = pending_execute = None
+            # fall through to normal LLM call (user said something else)
 
     try:
         raw = claude_handler.ask_akira(text).replace("```json", "").replace("```", "").strip()
         if not raw:
-            return {"mode": "conversation", "response": "Sorry, having trouble connecting right now.", "end_session": False}
+            return {"mode": "conversation",
+                    "response": "Having trouble connecting right now.", "end_session": False}
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        print(f"[DEBUG] get_akira_response: JSONDecodeError: {e!r} | raw was: {raw!r}")
-        return {"mode": "conversation", "response": "Something went wrong on my end. Say that again.", "end_session": False}
+        print(f"[get_akira_response] JSONDecodeError: {e!r} | raw: {raw!r}")
+        return {"mode": "conversation",
+                "response": "Something went wrong on my end. Say that again.", "end_session": False}
+    except Exception as e:
+        print(f"[get_akira_response] unexpected error: {e!r}")
+        return {"mode": "conversation",
+                "response": "Something went wrong. Try again.", "end_session": False}
 
-vad_thread = threading.Thread(target=vad_listener, daemon=True)
-vad_thread.start()
+
+def _build_session_context() -> str:
+    """Build a one-time context string injected at session start."""
+    try:
+        tabs = get_all_tabs()
+        ctx  = get_pc_context()
+        tabs_str    = ", ".join(f"{t['title']}" for t in tabs[:6]) or "none"
+        windows_str = ", ".join(ctx["open_windows"][:5]) or "none"
+        url_str     = ctx.get("current_url") or "none"
+        return (
+            f"[SESSION START] Open tabs: {tabs_str} | "
+            f"Current page: {url_str} | "
+            f"Windows: {windows_str}\n\n"
+        )
+    except Exception:
+        return ""
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+def _process_command(text: str, inject_context: bool = False) -> bool:
+    """
+    Transcribe → LLM → execute → speak.
+    Returns True to keep session alive, False to end it.
+    inject_context: True on the first command of a new session.
+    """
+    if not text:
+        return False
+
+    if inject_context:
+        text = _build_session_context() + text
+
+    response = get_akira_response(text)
+    if response is None:
+        return True  # confirmation was handled inline, stay alive
+
+    print(response)
+    return handle_response(response)
+
 
 while True:
-    current_time = time.time()
-    if session_active and (current_time - session_start_time) < SESSION_TIMEOUT:
-        with vad_buffer_lock:
-            if user_speaking.is_set() and len(vad_audio_buffer) > 0:
-                pre_audio = np.concatenate(vad_audio_buffer)
-                vad_audio_buffer.clear()
-                user_speaking.clear()
-            else:
-                pre_audio = None
-                vad_audio_buffer.clear()
-        r = record_command(pre_audio=pre_audio)
-        if r is None:
-            session_active = False
-            oww_model.reset()
-            continue
-        text = transcribe_command(r)
-        if not text:
-            continue
-        response = get_akira_response(text)
-        if not response:
-            continue
-        print(response)
-        session_active = handle_response(response)
-        if session_active:
-            print("session continuing")
-        else:
-            oww_model.reset()
-    else:
-        session_active = False
-        audio_chunk = stream.read(1280, exception_on_overflow=False)
-        audio_np = np.frombuffer(audio_chunk, dtype=np.int16)
-        prediction = oww_model.predict(audio_np)
-        score = list(prediction.values())[0]
+    try:
         current_time = time.time()
-        if score > 0.2 and (current_time - last_activation_time) > COOLDOWN_TIME:
-            print("Wake word detected!")
-            winsound.Beep(1000, 200)
-            last_activation_time = time.time()
-            r = record_command()
-            if r is None:
-                continue
-            text = transcribe_command(r)
-            if not text:
-                continue
-            response = get_akira_response(text)
-            if not response:
-                continue
-            print(response)
-            session_active = handle_response(response)
-            if session_active:
-                last_activation_time = time.time()
-                session_start_time = time.time()
+
+        # ── Active session ────────────────────────────────────────────
+        if session_active and (current_time - session_start_time) < SESSION_TIMEOUT:
+
+            with vad_buffer_lock:
+                if user_speaking.is_set() and vad_audio_buffer:
+                    pre_audio = np.concatenate(vad_audio_buffer)
+                    vad_audio_buffer.clear()
+                    user_speaking.clear()
+                else:
+                    pre_audio = None
+                    vad_audio_buffer.clear()
+
+            audio = record_command(pre_audio=pre_audio)
+            if audio is None:
+                session_active = False
                 oww_model.reset()
+                continue
+
+            text = transcribe_command(audio)
+            session_active = _process_command(text)
+            if session_active:
+                print("[session] continuing")
+            else:
+                oww_model.reset()
+
+        # ── Idle — listening for wake word ────────────────────────────
+        else:
+            session_active = False
+            chunk    = stream.read(1280, exception_on_overflow=False)
+            audio_np = np.frombuffer(chunk, dtype=np.int16)
+            score    = list(oww_model.predict(audio_np).values())[0]
+
+            current_time = time.time()
+            if score > 0.2 and (current_time - last_activation_time) > COOLDOWN_TIME:
+                print("Wake word detected!")
+                winsound.Beep(1000, 200)
+                last_activation_time = current_time
+
+                audio = record_command()
+                if audio is None:
+                    continue
+
+                text = transcribe_command(audio)
+                session_active = _process_command(text, inject_context=True)
+
+                if session_active:
+                    last_activation_time = time.time()
+                    session_start_time   = time.time()
+                    oww_model.reset()
+
+    except KeyboardInterrupt:
+        print("\nShutting down Sensei.")
+        break
+    except Exception as e:
+        # outer safety net — log and continue, never crash the main loop
+        print(f"[main loop] unhandled exception: {e!r}")
+        time.sleep(1.0)
+        continue
