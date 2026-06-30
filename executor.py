@@ -155,7 +155,7 @@ RISKY_KEYWORDS = [
     "submit", "send", "confirm order", "place order", "delete",
     "cancel subscription", "sign up", "register", "donate",
     "transfer", "withdraw", "discard", "archive", "block",
-    "unsubscribe", "forward",
+    "unsubscribe", "forward", "subscribe", "remove", "report"
 ]
 _risky_pattern = re.compile(
     r"\b(" + "|".join(re.escape(k) for k in RISKY_KEYWORDS) + r")\b",
@@ -367,7 +367,7 @@ def get_pc_context() -> dict:
     current_url, current_title = None, None
     try:
         browser = get_browser()
-        browser.switch_to.window(browser._akira_tab)
+        # read whatever is currently active — don't switch, don't disrupt user's tab
         current_url = browser.current_url
         current_title = browser.title
     except Exception:
@@ -600,11 +600,12 @@ def click_element(driver, index: int, expected_text: str | None = None,
             return false;
         """)
         if not clicked:
-            # last resort: Selenium click with scroll
             els = driver.find_elements(By.CSS_SELECTOR, f'[data-akira-index="{index}"]')
             if els:
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", els[0])
                 driver.execute_script("arguments[0].click();", els[0])
+            else:
+                raise RuntimeError(f"element at index {index} not found in DOM after injection")
 
     return {
         "success": True,
@@ -1084,7 +1085,13 @@ def _handle_web_search(parameter: str) -> str:
 
     if not explicit_web:
         current_site = get_current_site(browser)
-        if current_site and current_site in SEARCH_URL_MAP:
+        # only route to site search if user is actively on that site's content page
+        # never route if on homepage, blank tab, or search results already
+        current_url = browser.current_url or ""
+        is_content_page = current_site and not any(
+            x in current_url for x in ["search_query=", "/results?", "about:blank", "newtab", "google.com"]
+        )
+        if is_content_page and current_site in SEARCH_URL_MAP:
             return _handle_site_search(f"{current_site}|{query_clean}")
 
     _navigate(f"https://www.google.com/search?q={urllib.parse.quote(query_clean if explicit_web else parameter)}")

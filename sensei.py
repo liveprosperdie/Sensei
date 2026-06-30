@@ -381,7 +381,7 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
     inject_context: True on the first command of a new session.
     """
     if not text:
-        return False
+        return True
 
     if inject_context:
         text = _build_session_context() + text
