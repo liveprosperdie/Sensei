@@ -15,6 +15,7 @@ import webbrowser
 import subprocess
 import urllib.parse
 import win32process
+import win32gui
 import requests
 import pygetwindow as gw
 from PIL import ImageGrab
@@ -183,18 +184,20 @@ def _kill_process(name: str) -> None:
 
 
 def _ensure_akira_tab(driver) -> None:
-    """Create or recover Akira's dedicated tab."""
+    """Only create Akira's tab if it genuinely doesn't exist. Never switch focus."""
     if hasattr(driver, "_akira_tab") and driver._akira_tab in driver.window_handles:
-        return
+        return  # tab exists, do nothing, don't switch
+    # tab was closed or never created — create it once
     existing = set(driver.window_handles)
     driver.execute_cdp_cmd("Target.createTarget", {"url": "about:blank"})
     for _ in range(10):
         new = [h for h in driver.window_handles if h not in existing]
         if new:
             driver._akira_tab = new[0]
+            print(f"[browser] Akira tab created: {driver._akira_tab}")
             break
         time.sleep(0.3)
-    driver.switch_to.window(driver._akira_tab)
+    # DO NOT switch focus here — only _navigate() switches when needed
 
 
 def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
@@ -356,8 +359,17 @@ def get_current_site(driver) -> str | None:
     return None
 
 
+def get_foreground_app() -> str | None:
+    """Returns the process name of the currently focused window, or None."""
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        return psutil.Process(pid).name()
+    except Exception:
+        return None
+
+
 def get_pc_context() -> dict:
-    """Current page title, URL, and open windows. Safe — never iterates tabs."""
     windows = []
     try:
         windows = [w.title for w in gw.getAllWindows() if w.title.strip()][:10]
@@ -367,7 +379,6 @@ def get_pc_context() -> dict:
     current_url, current_title = None, None
     try:
         browser = get_browser()
-        # read whatever is currently active — don't switch, don't disrupt user's tab
         current_url = browser.current_url
         current_title = browser.title
     except Exception:
@@ -377,6 +388,7 @@ def get_pc_context() -> dict:
         "open_windows": windows,
         "current_url": current_url,
         "current_page_title": current_title,
+        "foreground_app": get_foreground_app(),
     }
 
 
