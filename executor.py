@@ -183,21 +183,15 @@ def _kill_process(name: str) -> None:
     time.sleep(1.0)
 
 
-def _ensure_akira_tab(driver) -> None:
-    """Only create Akira's tab if it genuinely doesn't exist. Never switch focus."""
-    if hasattr(driver, "_akira_tab") and driver._akira_tab in driver.window_handles:
-        return  # tab exists, do nothing, don't switch
-    # tab was closed or never created — create it once
-    existing = set(driver.window_handles)
-    driver.execute_cdp_cmd("Target.createTarget", {"url": "about:blank"})
-    for _ in range(10):
-        new = [h for h in driver.window_handles if h not in existing]
-        if new:
-            driver._akira_tab = new[0]
-            print(f"[browser] Akira tab created: {driver._akira_tab}")
-            break
-        time.sleep(0.3)
-    # DO NOT switch focus here — only _navigate() switches when needed
+def _ensure_current_handle(driver) -> None:
+    """Ensure driver has a valid current window handle. Use whatever tab is active."""
+    try:
+        # Just verify we can access current handle - don't switch anything
+        _ = driver.current_window_handle
+    except Exception:
+        # Only if completely broken, use first available handle
+        if driver.window_handles:
+            driver.switch_to.window(driver.window_handles[0])
 
 
 def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
