@@ -449,11 +449,16 @@ def extract_interactive_elements(driver, max_elements: int = 150) -> list[dict]:
     
     // Helper to check visibility
     function isVisible(el) {
-        if (!el.offsetParent && el.tagName !== 'BODY') return false;
-        const r = el.getBoundingClientRect();
-        if (r.width === 0 || r.height === 0) return false;
-        const s = window.getComputedStyle(el);
-        return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+        try {
+            if (!el) return false;
+            const r = el.getBoundingClientRect();
+            // Be more lenient - allow elements slightly off-screen
+            if (r.width < 5 || r.height < 5) return false;
+            const s = window.getComputedStyle(el);
+            return s.visibility !== 'hidden' && s.display !== 'none';
+        } catch(e) {
+            return false;
+        }
     }
     
     function addElement(el, role, text, href = null) {
