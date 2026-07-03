@@ -1140,14 +1140,19 @@ def _handle_click(parameter: str) -> str | dict:
     except Exception:
         pass
 
-    elements = extract_interactive_elements(browser, max_elements=100)
+    elements = extract_interactive_elements(browser, max_elements=150)
     from claude_handler import find_element_index
     index = find_element_index(elements, parameter)
     print(f"[DEBUG] click: matched index={index} for '{parameter}'")
 
-    if index is None or index >= len(elements):
-        print(f"[DEBUG] click: vision fallback")
+    # Only use vision if we have ZERO elements or matching completely failed
+    if not elements or (index is None and len(elements) < 5):
+        print(f"[DEBUG] click: vision fallback (empty page or too few elements)")
         return "Done." if vision_click(browser, parameter) else "Couldn't find that on the page."
+
+    # If index not found but we have elements, it's genuinely not there
+    if index is None or index >= len(elements):
+        return "Couldn't find that on the page."
 
     target = elements[index]
     try:
@@ -1158,9 +1163,8 @@ def _handle_click(parameter: str) -> str | dict:
         return f"Couldn't click that: {e}"
 
     if not result["success"]:
-        # fallback to vision on element failure
-        print(f"[DEBUG] click: element failed ({result['reason']}), trying vision")
-        return "Done." if vision_click(browser, parameter) else f"Couldn't click that: {result['reason']}"
+        # Don't fallback to vision - if DOM click failed, vision won't help
+        return f"Couldn't click that: {result['reason']}"
 
     if result["needs_confirmation"]:
         return {
