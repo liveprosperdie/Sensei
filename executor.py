@@ -424,6 +424,7 @@ def extract_interactive_elements(driver, max_elements: int = 150) -> list[dict]:
                     "return document.querySelector('[data-akira-index=\"0\"]') !== null;"
                 )
                 if test:
+                    print(f"[EXTRACT] Using cached {len(cached)} elements")
                     return cached
             except Exception:
                 pass
@@ -433,102 +434,136 @@ def extract_interactive_elements(driver, max_elements: int = 150) -> list[dict]:
         current_url = None
         cache_key = None
 
-    # Aggressive DOM extraction script
+    # Aggressive DOM extraction script - wrapped in try-catch
     script = """
-    const items = [];
-    let idx = 0;
-    const maxItems = arguments[0];
-    
-    // Helper to get visible text
-    function getText(el) {
-        return (el.innerText || el.textContent || el.value || el.placeholder ||
-                el.getAttribute('aria-label') || el.getAttribute('title') ||
-                el.getAttribute('alt') || el.getAttribute('name') || '')
-               .replace(/\\s+/g,' ').trim().slice(0, 200);
-    }
-    
-    // Helper to check visibility
-    function isVisible(el) {
+    try {
+        const items = [];
+        let idx = 0;
+        const maxItems = arguments[0];
+        
+        // Helper to get visible text
+        function getText(el) {
+            try {
+                return (el.innerText || el.textContent || el.value || el.placeholder ||
+                        el.getAttribute('aria-label') || el.getAttribute('title') ||
+                        el.getAttribute('alt') || el.getAttribute('name') || '')
+                       .replace(/\\s+/g,' ').trim().slice(0, 200);
+            } catch(e) {
+                return '';
+            }
+        }
+        
+        // Helper to check visibility
+        function isVisible(el) {
+            try {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width < 5 || r.height < 5) return false;
+                const s = window.getComputedStyle(el);
+                return s.visibility !== 'hidden' && s.display !== 'none';
+            } catch(e) {
+                return false;
+            }
+        }
+        
+        function addElement(el, role, text, href = null) {
+            try {
+                if (idx >= maxItems) return false;
+                if (!text && role !== 'input' && role !== 'textbox') return true;
+                el.setAttribute('data-akira-index', String(idx));
+                items.push({index: idx, role: role, text: text, href: href});
+                idx++;
+                return true;
+            } catch(e) {
+                return true;
+            }
+        }
+        
+        // 1. PRIORITY: YouTube video thumbnails (most common miss)
         try {
-            if (!el) return false;
-            const r = el.getBoundingClientRect();
-            // Be more lenient - allow elements slightly off-screen
-            if (r.width < 5 || r.height < 5) return false;
-            const s = window.getComputedStyle(el);
-            return s.visibility !== 'hidden' && s.display !== 'none';
-        } catch(e) {
-            return false;
-        }
+            document.querySelectorAll('ytd-video-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer').forEach(el => {
+                if (!isVisible(el)) return;
+                const titleEl = el.querySelector('#video-title, .title');
+                const thumbnailEl = el.querySelector('a#thumbnail');
+                if (titleEl && thumbnailEl) {
+                    const text = getText(titleEl);
+                    const href = thumbnailEl.href;
+                    if (text) addElement(thumbnailEl, 'video', text, href);
+                }
+            });
+        } catch(e) {}
+        
+        // 2. Address bar (omnibox) - critical for URL editing
+        try {
+            const omnibox = document.querySelector('input[type="text"][role="combobox"]') ||
+                            document.querySelector('input.omnibox') ||
+                            document.querySelector('#searchInput');
+            if (omnibox && isVisible(omnibox)) {
+                addElement(omnibox, 'addressbar', 'address bar', null);
+            }
+        } catch(e) {}
+        
+        // 3. All standard links
+        try {
+            document.querySelectorAll('a[href]').forEach(el => {
+                if (!isVisible(el)) return;
+                const text = getText(el);
+                if (text) addElement(el, 'link', text, el.href);
+            });
+        } catch(e) {}
+        
+        // 4. Buttons (explicit and implicit)
+        try {
+            document.querySelectorAll('button, [role="button"], [onclick], input[type="button"], input[type="submit"]').forEach(el => {
+                if (!isVisible(el)) return;
+                const text = getText(el);
+                addElement(el, 'button', text || 'button', null);
+            });
+        } catch(e) {}
+        
+        // 5. Form inputs
+        try {
+            document.querySelectorAll('input:not([type="hidden"]), textarea, select').forEach(el => {
+                if (!isVisible(el)) return;
+                const text = getText(el) || el.type || 'input';
+                addElement(el, 'input', text, null);
+            });
+        } catch(e) {}
+        
+        // 6. Video controls (play/pause buttons)
+        try {
+            document.querySelectorAll('video, [class*="play"], [class*="pause"], [aria-label*="play"], [aria-label*="pause"]').forEach(el => {
+                if (!isVisible(el)) return;
+                const text = getText(el) || el.className.split(' ').find(c => c.includes('play') || c.includes('pause')) || 'media control';
+                if (text) addElement(el, 'media', text, null);
+            });
+        } catch(e) {}
+        
+        // 7. Clickable divs with role or aria-label (common in modern web apps)
+        try {
+            document.querySelectorAll('[role="menuitem"], [role="tab"], [role="option"], [role="checkbox"], [role="radio"], [aria-label][onclick]').forEach(el => {
+                if (!isVisible(el)) return;
+                const text = getText(el);
+                if (text) addElement(el, el.getAttribute('role') || 'clickable', text, null);
+            });
+        } catch(e) {}
+        
+        return items;
+    } catch(e) {
+        console.error('Element extraction failed:', e);
+        return [];
     }
-    
-    function addElement(el, role, text, href = null) {
-        if (idx >= maxItems) return false;
-        if (!text && role !== 'input' && role !== 'textbox') return true;
-        el.setAttribute('data-akira-index', String(idx));
-        items.push({index: idx, role, text, href});
-        idx++;
-        return true;
-    }
-    
-    // 1. PRIORITY: YouTube video thumbnails (most common miss)
-    document.querySelectorAll('ytd-video-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer').forEach(el => {
-        if (!isVisible(el)) return;
-        const titleEl = el.querySelector('#video-title, .title');
-        const thumbnailEl = el.querySelector('a#thumbnail');
-        if (titleEl && thumbnailEl) {
-            const text = getText(titleEl);
-            const href = thumbnailEl.href;
-            if (text) addElement(thumbnailEl, 'video', text, href);
-        }
-    });
-    
-    // 2. Address bar (omnibox) - critical for URL editing
-    const omnibox = document.querySelector('input[type="text"][role="combobox"]') ||
-                    document.querySelector('input.omnibox') ||
-                    document.querySelector('#searchInput');
-    if (omnibox && isVisible(omnibox)) {
-        addElement(omnibox, 'addressbar', 'address bar', null);
-    }
-    
-    // 3. All standard links
-    document.querySelectorAll('a[href]').forEach(el => {
-        if (!isVisible(el)) return;
-        const text = getText(el);
-        if (text) addElement(el, 'link', text, el.href);
-    });
-    
-    // 4. Buttons (explicit and implicit)
-    document.querySelectorAll('button, [role="button"], [onclick], input[type="button"], input[type="submit"]').forEach(el => {
-        if (!isVisible(el)) return;
-        const text = getText(el);
-        addElement(el, 'button', text || 'button', null);
-    });
-    
-    // 5. Form inputs
-    document.querySelectorAll('input:not([type="hidden"]), textarea, select').forEach(el => {
-        if (!isVisible(el)) return;
-        const text = getText(el) || el.type || 'input';
-        addElement(el, 'input', text, null);
-    });
-    
-    // 6. Video controls (play/pause buttons)
-    document.querySelectorAll('video, [class*="play"], [class*="pause"], [aria-label*="play"], [aria-label*="pause"]').forEach(el => {
-        if (!isVisible(el)) return;
-        const text = getText(el) || el.className.split(' ').find(c => c.includes('play') || c.includes('pause')) || 'media control';
-        if (text) addElement(el, 'media', text, null);
-    });
-    
-    // 7. Clickable divs with role or aria-label (common in modern web apps)
-    document.querySelectorAll('[role="menuitem"], [role="tab"], [role="option"], [role="checkbox"], [role="radio"], [aria-label][onclick]').forEach(el => {
-        if (!isVisible(el)) return;
-        const text = getText(el);
-        if (text) addElement(el, el.getAttribute('role') || 'clickable', text, null);
-    });
-    
-    return items;
     """
     
-    elements = driver.execute_script(script, max_elements)
+    try:
+        elements = driver.execute_script(script, max_elements)
+    except Exception as e:
+        print(f"[EXTRACT] Script execution failed: {e}")
+        return []
+    
+    if not elements:
+        print(f"[EXTRACT] No elements found on {current_url[:50] if current_url else 'page'}")
+        return []
     
     # Cache the result
     if cache_key:
