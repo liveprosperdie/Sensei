@@ -572,10 +572,10 @@ def vision_click(browser, instruction: str) -> bool:
 def click_element(driver, index: int, expected_text: str | None = None,
                   expected_href: str | None = None, instruction: str | None = None) -> dict:
     """
-    Click element at index. Validates staleness, checks RISKY_KEYWORDS,
-    falls back to vision if DOM lookup fails.
+    Click element at index. Validates staleness, checks RISKY_KEYWORDS.
+    No vision fallback here - that's handled by caller.
     """
-    fresh = extract_interactive_elements(driver, max_elements=100)
+    fresh = extract_interactive_elements(driver, max_elements=150)
 
     if index >= len(fresh):
         return {"success": False, "reason": "index out of range"}
@@ -733,23 +733,22 @@ def youtube_control(parameter: str) -> str:
         browser.execute_script(f"window.location.href='https://www.youtube.com/results?search_query={query}+channel';")
         return f"Searching for {channel}'s channel."
 
-    # ── Group B: play video — CDP then vision ─────────────────────────
+    # ── Group B: play video — DOM matching, NO vision ─────────────────────────
 
     if param.startswith("play video") or param.startswith("click video"):
         description = param.replace("play video", "").replace("click video", "").strip()
-        time.sleep(1.0)
-        elements = extract_interactive_elements(browser, max_elements=100)
+        time.sleep(0.8)
+        elements = extract_interactive_elements(browser, max_elements=150)
         from claude_handler import find_element_index
         idx = find_element_index(elements, description)
-        if idx is not None:
+        if idx is not None and idx < len(elements):
             clicked = browser.execute_script(f"""
                 var el=document.querySelector('[data-akira-index="{idx}"]');
                 if(el){{el.click();return true;}}return false;
             """)
             if clicked:
                 return f"Playing {description}."
-        success = vision_click(browser, f"video thumbnail or title: {description}")
-        return "Playing it." if success else "Couldn't find that video."
+        return f"Couldn't find that video on the page."
 
     # ── Group C: everything else — vision primary ─────────────────────
 
