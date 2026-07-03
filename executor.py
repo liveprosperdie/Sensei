@@ -750,50 +750,60 @@ def youtube_control(parameter: str) -> str:
                 return f"Playing {description}."
         return f"Couldn't find that video on the page."
 
-    # ── Group C: everything else — vision primary ─────────────────────
+    # ── Group C: common controls — DOM matching only ─────────────────────
 
-    vision_descriptions = {
-        "like":           "like button thumbs up below the video",
-        "dislike":        "dislike button thumbs down below the video",
-        "subscribe":      "subscribe button below the video title",
-        "unsubscribe":    "unsubscribe button below the video title",
-        "share":          "share button below the video",
-        "save":           "save button below the video",
-        "play next":      "next video button in player controls",
-        "next video":     "next video button in player controls",
-        "history":        "history item in left sidebar",
-        "watch later":    "watch later item in left sidebar",
-        "liked videos":   "liked videos item in left sidebar",
-        "playlists":      "playlists item in left sidebar",
-        "your channel":   "your channel item in left sidebar",
-        "downloads":      "downloads item in left sidebar",
-        "home":           "home button in left sidebar",
-        "open comments":  "comments section on page",
-        "settings":       "settings gear icon in video player",
-        "ambient mode":   "ambient mode toggle in settings menu",
-        "sleep timer":    "sleep timer option in settings menu",
-        "quality":        "quality option in settings menu",
-        "switch account": "account avatar button top right",
-        "sign out":       "sign out option in account menu",
-        "music":          "music filter chip at top of page",
-        "gaming":         "gaming filter chip at top of page",
-        "live":           "live filter chip at top of page",
-        "news":           "news filter chip at top of page",
-        "ask":            "ask button below the video",
-        "clips":          "clip button below the video",
+    # Map common commands to DOM selectors (no vision needed)
+    simple_actions = {
+        "like": ".ytp-like-button, button[aria-label*='like' i]",
+        "dislike": ".ytp-dislike-button, button[aria-label*='dislike' i]",
+        "subscribe": "button[aria-label*='subscribe' i]:not([aria-label*='unsubscribe' i])",
+        "unsubscribe": "button[aria-label*='unsubscribe' i]",
+        "share": "button[aria-label*='share' i]",
+        "save": "button[aria-label*='save' i]",
+        "play next": ".ytp-next-button",
+        "next video": ".ytp-next-button",
+        "open comments": "#comments",
+        "home": "a[title='Home' i]",
+        "music": "a[title='Music' i]",
+        "gaming": "a[title='Gaming' i]",
+        "live": "a[title='Live' i]",
+        "news": "a[title='News' i]",
     }
-
-    # pre-open menus for nested items
+    
+    if param in simple_actions:
+        selector = simple_actions[param]
+        clicked = browser.execute_script(f"""
+            var el = document.querySelector('{selector}');
+            if (el) {{ el.click(); return true; }}
+            return false;
+        """)
+        return "Done." if clicked else f"Couldn't find {param}."
+    
+    # Menu items that need menu to be opened first
     if param in {"ambient mode", "sleep timer", "quality", "playback speed menu"}:
         browser.execute_script("document.querySelector('.ytp-settings-button')?.click();")
         time.sleep(0.5)
-    elif param in {"switch account", "sign out", "manage premium"}:
+        elements = extract_interactive_elements(browser, max_elements=150)
+        from claude_handler import find_element_index
+        idx = find_element_index(elements, param)
+        if idx is not None:
+            browser.execute_script(f"document.querySelector('[data-akira-index=\"{idx}\"]')?.click();")
+            return "Done."
+        return f"Couldn't find {param} in settings."
+    
+    if param in {"switch account", "sign out"}:
         browser.execute_script("document.querySelector('button#avatar-btn')?.click();")
         time.sleep(0.5)
-
-    instruction = vision_descriptions.get(param, param)
-    success = vision_click(browser, instruction)
-    return "Done." if success else f"Couldn't find {param} on the page."
+        elements = extract_interactive_elements(browser, max_elements=150)
+        from claude_handler import find_element_index
+        idx = find_element_index(elements, param)
+        if idx is not None:
+            browser.execute_script(f"document.querySelector('[data-akira-index=\"{idx}\"]')?.click();")
+            return "Done."
+        return f"Couldn't find {param} in account menu."
+    
+    # If we get here, command not recognized
+    return f"Don't know how to do '{param}' on YouTube."
 
 
 # ── System actions ────────────────────────────────────────────────────────────
