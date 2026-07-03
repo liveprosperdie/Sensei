@@ -225,7 +225,6 @@ def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
     options.binary_location = binary_path
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
     driver = webdriver.Chrome(service=service, options=options)
-    _ensure_akira_tab(driver)
     return driver
 
 
@@ -255,7 +254,6 @@ def _attach_cdp_edge(port: int) -> webdriver.Edge:
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
     service = EdgeService(EdgeChromiumDriverManager().install())
     driver = webdriver.Edge(service=service, options=options)
-    _ensure_akira_tab(driver)
     return driver
 
 
@@ -285,7 +283,7 @@ def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.C
         driver = _browsers[key]
         try:
             _ = driver.title
-            _ensure_akira_tab(driver)
+            _ensure_current_handle(driver)
             return driver
         except Exception:
             del _browsers[key]
@@ -336,9 +334,8 @@ def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.C
 
 
 def _navigate(url: str) -> None:
-    """Navigate Akira's tab to a URL. Single source of truth for navigation."""
+    """Navigate current tab to URL. NO TAB SWITCHING."""
     browser = get_browser(_last_browser_name)
-    browser.switch_to.window(browser._akira_tab)
     browser.get(url)
 
 
@@ -403,141 +400,136 @@ def get_all_tabs() -> list[dict]:
 
 # ── Element extraction ────────────────────────────────────────────────────────
 
-def extract_interactive_elements(driver, max_elements: int = 80) -> list[dict]:
+# Element cache to avoid repeated extractions on same page
+_element_cache = {}
+
+def extract_interactive_elements(driver, max_elements: int = 150) -> list[dict]:
     """
-    CDP accessibility tree → element list with data-akira-index injected via
-    a single Runtime.evaluate call (not one CDP call per node).
-    Falls back to DOM extraction if CDP fails.
+    Extract interactive elements using aggressive DOM approach (no CDP tree overhead).
+    Captures YouTube video thumbnails, address bar, and all clickable elements.
     """
     try:
-        result = driver.execute_cdp_cmd("Accessibility.getFullAXTree", {})
-        nodes = result.get("nodes", [])
-
-        interactive_roles = {
-            "button", "link", "menuitem", "option", "checkbox", "radio",
-            "tab", "textbox", "searchbox", "combobox", "listbox",
-            "menuitemcheckbox", "menuitemradio", "switch", "treeitem",
-        }
-
-        items = []
-        backend_ids = []
-
-        for node in nodes:
-            if len(items) >= max_elements:
-                break
-            role = node.get("role", {}).get("value", "")
-            if role not in interactive_roles:
-                continue
-            name = node.get("name", {}).get("value", "").strip()
-            if not name:
-                continue
-            backend_id = node.get("backendDOMNodeId")
-            if not backend_id:
-                continue
-            items.append({
-                "index": len(items),
-                "role": role,
-                "text": name[:150],
-                "href": None,
-                "_backend_id": backend_id,
-            })
-            backend_ids.append(backend_id)
-
-        if not items:
-            raise ValueError("No interactive nodes found in AX tree")
-
-        # inject data-akira-index in a single JS evaluation
-        inject_script = """
-        (function(backendIds) {
-            backendIds.forEach(function(backendId, idx) {
-                try {
-                    var el = __selenium_target__(backendId);
-                    if (el) {
-                        el.setAttribute('data-akira-index', String(idx));
-                    }
-                } catch(e) {}
-            });
-        })(arguments[0]);
-        """
-        # Use CDP DOM.resolveNode + Runtime.callFunctionOn per node in batches
-        # Fallback: use JS to walk all elements and tag them
-        tag_script = """
-        (function() {
-            var all = document.querySelectorAll('a,button,input,textarea,select,[role]');
-            var idx = 0;
-            var tagged = 0;
-            for (var i = 0; i < all.length && tagged < arguments[0]; i++) {
-                var el = all[i];
-                var existing = el.getAttribute('data-akira-index');
-                if (existing !== null) { tagged++; continue; }
-                var role = el.getAttribute('role') || el.tagName.toLowerCase();
-                var name = el.textContent || el.value || el.getAttribute('aria-label') || el.getAttribute('title') || '';
-                name = name.trim();
-                if (!name) continue;
-                el.setAttribute('data-akira-index', String(idx));
-                idx++;
-                tagged++;
-            }
-        })();
-        """
-
-        # Try resolving each node via CDP and injecting index
-        resolved_count = 0
-        for i, item in enumerate(items):
-            bid = item.pop("_backend_id")
+        current_url = driver.current_url
+        cache_key = f"{current_url}_{max_elements}"
+        
+        # Return cached elements if URL hasn't changed (saves tons of time)
+        if cache_key in _element_cache:
+            cached = _element_cache[cache_key]
+            # Verify cache is still valid by spot-checking first element
             try:
-                resolve = driver.execute_cdp_cmd("DOM.resolveNode", {"backendNodeId": bid})
-                obj_id = resolve.get("object", {}).get("objectId")
-                if obj_id:
-                    driver.execute_cdp_cmd("Runtime.callFunctionOn", {
-                        "objectId": obj_id,
-                        "functionDeclaration": f"function(){{this.setAttribute('data-akira-index','{i}')}}",
-                        "returnByValue": True,
-                    })
-                    # grab href for links
-                    if item["role"] == "link":
-                        href_res = driver.execute_cdp_cmd("Runtime.callFunctionOn", {
-                            "objectId": obj_id,
-                            "functionDeclaration": "function(){return this.href||null}",
-                            "returnByValue": True,
-                        })
-                        item["href"] = href_res.get("result", {}).get("value")
-                    resolved_count += 1
+                test = driver.execute_script(
+                    "return document.querySelector('[data-akira-index=\"0\"]') !== null;"
+                )
+                if test:
+                    return cached
             except Exception:
                 pass
+            # Cache invalid, clear it
+            del _element_cache[cache_key]
+    except Exception:
+        current_url = None
+        cache_key = None
 
-        print(f"[DEBUG] extract_elements (CDP) found {len(items)}, resolved {resolved_count}")
-        return items
-
-    except Exception as e:
-        print(f"[DEBUG] CDP extraction failed, using DOM fallback: {e}")
-
-    # DOM fallback — single JS call
+    # Aggressive DOM extraction script
     script = """
     const items = [];
-    const sel = 'a,button,input,textarea,select,[role="button"],[onclick]';
-    const els = document.querySelectorAll(sel);
     let idx = 0;
-    for (const el of els) {
-        if (idx >= arguments[0]) break;
-        const r = el.getBoundingClientRect();
-        if (!r.width || !r.height) continue;
-        const s = window.getComputedStyle(el);
-        if (s.visibility === 'hidden' || s.display === 'none') continue;
-        let text = (el.innerText || el.value || el.placeholder ||
-                    el.getAttribute('aria-label') || el.getAttribute('title') ||
-                    el.getAttribute('alt') || '').replace(/\\s+/g,' ').trim().slice(0,150);
-        if (!text && el.tagName !== 'INPUT') continue;
-        const act = ['INPUT','TEXTAREA','BUTTON','SELECT'].includes(el.tagName);
-        if (!el.href && !act) continue;
-        el.setAttribute('data-akira-index', idx);
-        items.push({index:idx, role:el.tagName.toLowerCase(), text, href:el.href||null});
-        idx++;
+    const maxItems = arguments[0];
+    
+    // Helper to get visible text
+    function getText(el) {
+        return (el.innerText || el.textContent || el.value || el.placeholder ||
+                el.getAttribute('aria-label') || el.getAttribute('title') ||
+                el.getAttribute('alt') || el.getAttribute('name') || '')
+               .replace(/\\s+/g,' ').trim().slice(0, 200);
     }
+    
+    // Helper to check visibility
+    function isVisible(el) {
+        if (!el.offsetParent && el.tagName !== 'BODY') return false;
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) return false;
+        const s = window.getComputedStyle(el);
+        return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+    }
+    
+    function addElement(el, role, text, href = null) {
+        if (idx >= maxItems) return false;
+        if (!text && role !== 'input' && role !== 'textbox') return true;
+        el.setAttribute('data-akira-index', String(idx));
+        items.push({index: idx, role, text, href});
+        idx++;
+        return true;
+    }
+    
+    // 1. PRIORITY: YouTube video thumbnails (most common miss)
+    document.querySelectorAll('ytd-video-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer').forEach(el => {
+        if (!isVisible(el)) return;
+        const titleEl = el.querySelector('#video-title, .title');
+        const thumbnailEl = el.querySelector('a#thumbnail');
+        if (titleEl && thumbnailEl) {
+            const text = getText(titleEl);
+            const href = thumbnailEl.href;
+            if (text) addElement(thumbnailEl, 'video', text, href);
+        }
+    });
+    
+    // 2. Address bar (omnibox) - critical for URL editing
+    const omnibox = document.querySelector('input[type="text"][role="combobox"]') ||
+                    document.querySelector('input.omnibox') ||
+                    document.querySelector('#searchInput');
+    if (omnibox && isVisible(omnibox)) {
+        addElement(omnibox, 'addressbar', 'address bar', null);
+    }
+    
+    // 3. All standard links
+    document.querySelectorAll('a[href]').forEach(el => {
+        if (!isVisible(el)) return;
+        const text = getText(el);
+        if (text) addElement(el, 'link', text, el.href);
+    });
+    
+    // 4. Buttons (explicit and implicit)
+    document.querySelectorAll('button, [role="button"], [onclick], input[type="button"], input[type="submit"]').forEach(el => {
+        if (!isVisible(el)) return;
+        const text = getText(el);
+        addElement(el, 'button', text || 'button', null);
+    });
+    
+    // 5. Form inputs
+    document.querySelectorAll('input:not([type="hidden"]), textarea, select').forEach(el => {
+        if (!isVisible(el)) return;
+        const text = getText(el) || el.type || 'input';
+        addElement(el, 'input', text, null);
+    });
+    
+    // 6. Video controls (play/pause buttons)
+    document.querySelectorAll('video, [class*="play"], [class*="pause"], [aria-label*="play"], [aria-label*="pause"]').forEach(el => {
+        if (!isVisible(el)) return;
+        const text = getText(el) || el.className.split(' ').find(c => c.includes('play') || c.includes('pause')) || 'media control';
+        if (text) addElement(el, 'media', text, null);
+    });
+    
+    // 7. Clickable divs with role or aria-label (common in modern web apps)
+    document.querySelectorAll('[role="menuitem"], [role="tab"], [role="option"], [role="checkbox"], [role="radio"], [aria-label][onclick]').forEach(el => {
+        if (!isVisible(el)) return;
+        const text = getText(el);
+        if (text) addElement(el, el.getAttribute('role') || 'clickable', text, null);
+    });
+    
     return items;
     """
+    
     elements = driver.execute_script(script, max_elements)
-    print(f"[DEBUG] extract_elements (DOM fallback) found {len(elements)}")
+    
+    # Cache the result
+    if cache_key:
+        _element_cache[cache_key] = elements
+        # Keep cache size reasonable
+        if len(_element_cache) > 10:
+            _element_cache.pop(next(iter(_element_cache)))
+    
+    print(f"[DEBUG] extract_elements found {len(elements)} elements")
     return elements
 
 
