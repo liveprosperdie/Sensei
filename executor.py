@@ -1169,14 +1169,19 @@ def _handle_click(parameter: str) -> str | dict:
     except Exception:
         pass
 
-    elements = extract_interactive_elements(browser, max_elements=150)
+    elements = extract_interactive_elements(browser, max_elements=200)
+    
+    # Debug: print first 5 element texts to see what we're getting
+    if elements:
+        print(f"[DEBUG] First 5 elements: {[el['text'][:40] for el in elements[:5]]}")
+    
     from claude_handler import find_element_index
     index = find_element_index(elements, parameter)
-    print(f"[DEBUG] click: matched index={index} for '{parameter}'")
+    print(f"[CLICK] Matched index={index} for '{parameter}'")
 
     # Only use vision if we have ZERO elements or matching completely failed
     if not elements or (index is None and len(elements) < 5):
-        print(f"[DEBUG] click: vision fallback (empty page or too few elements)")
+        print(f"[CLICK] Vision fallback (empty page or too few elements)")
         return "Done." if vision_click(browser, parameter) else "Couldn't find that on the page."
 
     # If index not found but we have elements, it's genuinely not there
@@ -1184,15 +1189,16 @@ def _handle_click(parameter: str) -> str | dict:
         return "Couldn't find that on the page."
 
     target = elements[index]
+    print(f"[CLICK] Target: [{target['role']}] '{target['text'][:50]}'")
+    
     try:
         result = click_element(browser, index, expected_text=target["text"],
                                expected_href=target["href"], instruction=parameter)
     except Exception as e:
-        print(f"[DEBUG] click_element exception: {e!r}")
+        print(f"[CLICK] Exception: {e!r}")
         return f"Couldn't click that: {e}"
 
     if not result["success"]:
-        # Don't fallback to vision - if DOM click failed, vision won't help
         return f"Couldn't click that: {result['reason']}"
 
     if result["needs_confirmation"]:
@@ -1206,10 +1212,10 @@ def _handle_click(parameter: str) -> str | dict:
     try:
         result["_execute"]()
     except Exception as e:
-        print(f"[DEBUG] _execute exception: {e!r}")
+        print(f"[CLICK] Execute failed: {e!r}")
         return f"Couldn't click that: {e}"
 
-    return f"Clicked {result['element']['text']}."
+    return f"Clicked {result['element']['text'][:50]}."
 
 
 # Dispatch table — replaces 150-line if/elif chain
