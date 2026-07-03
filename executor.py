@@ -532,7 +532,7 @@ def extract_interactive_elements(driver, max_elements: int = 150) -> list[dict]:
         if len(_element_cache) > 10:
             _element_cache.pop(next(iter(_element_cache)))
     
-    print(f"[DEBUG] extract_elements found {len(elements)} elements")
+    print(f"[EXTRACT] Found {len(elements)} elements on {current_url[:50] if current_url else 'page'}")
     return elements
 
 

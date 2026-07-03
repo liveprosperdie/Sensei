@@ -400,22 +400,25 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
     for el in elements:
         text_lower = el['text'].lower()
         if instruction_lower in text_lower or text_lower in instruction_lower:
-            print(f"[DEBUG] find_element: FUZZY MATCH index={el['index']}")
+            print(f"[MATCH] FUZZY index={el['index']} text='{el['text'][:50]}'")
             return el['index']
     
     # Phase 2: Word overlap fuzzy match (FREE, catches another 20%)
     instruction_words = set(re.findall(r'\w+', instruction_lower))
-    if instruction_words:
+    if instruction_words and len(instruction_words) >= 2:
         best_match = None
         best_score = 0
         for el in elements:
             text_words = set(re.findall(r'\w+', el['text'].lower()))
             overlap = len(instruction_words & text_words)
-            if overlap > best_score and overlap >= 2:  # At least 2 words match
-                best_score = overlap
-                best_match = el['index']
+            # Require at least 2 words OR 50% overlap
+            overlap_ratio = overlap / len(instruction_words) if instruction_words else 0
+            if overlap >= 2 or overlap_ratio >= 0.5:
+                if overlap > best_score:
+                    best_score = overlap
+                    best_match = el['index']
         if best_match is not None:
-            print(f"[DEBUG] find_element: WORD OVERLAP index={best_match} score={best_score}")
+            print(f"[MATCH] WORD OVERLAP index={best_match} score={best_score}")
             return best_match
     
     # Phase 3: Special pattern matching (FREE, catches ordinals, positions)
@@ -429,48 +432,54 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
             # Filter by context if possible
             context_words = instruction_lower.replace(word, '').strip().split()
             if context_words:
-                for el in elements[offset:]:
+                for el in elements[offset:offset+10]:  # Check next 10 from offset
                     if any(w in el['text'].lower() for w in context_words):
-                        print(f"[DEBUG] find_element: ORDINAL MATCH index={el['index']}")
+                        print(f"[MATCH] ORDINAL+CONTEXT index={el['index']}")
                         return el['index']
             # Fallback to just position
             if offset < len(elements):
-                print(f"[DEBUG] find_element: POSITIONAL MATCH index={offset}")
+                print(f"[MATCH] POSITIONAL index={offset}")
                 return offset
     
     # Phase 4: LLM matching (COSTS TOKENS, only 10-20% of cases reach here)
-    print(f"[DEBUG] find_element: Using LLM for '{instruction}'")
+    print(f"[LLM] Calling Haiku for '{instruction}'")
     
-    # Limit to 50 most relevant elements based on role priority
+    # Limit to 40 most relevant elements based on role priority and early position
     priority_roles = {'video', 'link', 'button', 'input', 'addressbar'}
-    priority = [el for el in elements if el.get('role') in priority_roles][:30]
-    others = [el for el in elements if el.get('role') not in priority_roles][:20]
+    priority = [el for el in elements[:60] if el.get('role') in priority_roles][:30]
+    others = [el for el in elements[:60] if el.get('role') not in priority_roles][:10]
     subset = priority + others
     
     elements_text = "\n".join(
-        f"{el['index']}: [{el.get('role','?')}] \"{el['text'][:80]}\""
-        + (f" ({el['href'][:60]})" if el.get("href") else "")
+        f"{el['index']}: [{el.get('role','?')}] \"{el['text'][:100]}\""
+        + (f" (url:{el['href'][:50]})" if el.get("href") else "")
         for el in subset
     )
 
-    message = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=10,
-        system=(
-            "Match a user instruction to one element from a numbered list. "
-            "Reply with ONLY the index number. "
-            "Always pick the best match even if imperfect. "
-            "Reply NONE only if the list is empty or completely unrelated."
-        ),
-        messages=[{"role": "user", "content": f"Elements:\n{elements_text}\n\nInstruction: {instruction}"}],
-    )
-    result = message.content[0].text.strip()
-    print(f"[DEBUG] find_element: LLM returned '{result}'")
-    if result.upper() == "NONE":
-        return None
     try:
-        return int(result)
-    except ValueError:
+        message = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=20,
+            system=(
+                "Match instruction to element index. Reply ONLY with the number. "
+                "If no match, reply: NONE"
+            ),
+            messages=[{"role": "user", "content": f"Elements:\n{elements_text}\n\nFind: {instruction}"}],
+        )
+        result = message.content[0].text.strip()
+        print(f"[LLM] Returned: {result}")
+        
+        if "NONE" in result.upper():
+            return None
+        
+        # Extract first number from response
+        import re as regex
+        numbers = regex.findall(r'\d+', result)
+        if numbers:
+            return int(numbers[0])
+        return None
+    except Exception as e:
+        print(f"[LLM] Error: {e}")
         return None
 
 
