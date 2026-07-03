@@ -395,33 +395,60 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
         return None
     
     instruction_lower = instruction.lower()
+    instruction_words = set(re.findall(r'\w+', instruction_lower))
     
-    # Phase 1: Exact substring match (FREE, catches 60%+ of cases)
-    for el in elements:
+    # Extract filters from instruction (domain names, roles, etc)
+    filters = {
+        'imdb': lambda el: el.get('href') and 'imdb.com' in el.get('href', ''),
+        'youtube': lambda el: el.get('href') and 'youtube.com' in el.get('href', ''),
+        'wikipedia': lambda el: el.get('href') and 'wikipedia.org' in el.get('href', ''),
+        'reddit': lambda el: el.get('href') and 'reddit.com' in el.get('href', ''),
+        'github': lambda el: el.get('href') and 'github.com' in el.get('href', ''),
+        'button': lambda el: el.get('role') == 'button',
+        'link': lambda el: el.get('role') == 'link',
+        'video': lambda el: el.get('role') == 'video',
+    }
+    
+    # Apply filters
+    filtered = elements
+    for keyword, filter_func in filters.items():
+        if keyword in instruction_lower:
+            filtered = [el for el in filtered if filter_func(el)]
+            if filtered:
+                print(f"[FILTER] Applied '{keyword}' filter, {len(filtered)} matches")
+                break
+    
+    if not filtered:
+        filtered = elements  # Fallback to all if filter removed everything
+    
+    # Phase 1: Exact substring match on filtered elements
+    for el in filtered:
         text_lower = el['text'].lower()
         if instruction_lower in text_lower or text_lower in instruction_lower:
             print(f"[MATCH] FUZZY index={el['index']} text='{el['text'][:50]}'")
             return el['index']
     
-    # Phase 2: Word overlap fuzzy match (FREE, catches another 20%)
-    instruction_words = set(re.findall(r'\w+', instruction_lower))
+    # Phase 2: Word overlap on filtered elements - prioritize early matches
     if instruction_words and len(instruction_words) >= 2:
         best_match = None
         best_score = 0
-        for el in elements:
+        for el in filtered[:50]:  # Only check first 50 of filtered
             text_words = set(re.findall(r'\w+', el['text'].lower()))
             overlap = len(instruction_words & text_words)
             # Require at least 2 words OR 50% overlap
             overlap_ratio = overlap / len(instruction_words) if instruction_words else 0
             if overlap >= 2 or overlap_ratio >= 0.5:
-                if overlap > best_score:
-                    best_score = overlap
+                # Bonus for early position in list
+                position_bonus = (50 - filtered.index(el)) / 50.0
+                score = overlap + position_bonus
+                if score > best_score:
+                    best_score = score
                     best_match = el['index']
         if best_match is not None:
-            print(f"[MATCH] WORD OVERLAP index={best_match} score={best_score}")
+            print(f"[MATCH] WORD OVERLAP index={best_match} score={best_score:.2f}")
             return best_match
     
-    # Phase 3: Special pattern matching (FREE, catches ordinals, positions)
+    # Phase 3: Special pattern matching (ordinals, positions)
     ordinals = {
         'first': 0, 'second': 1, 'third': 2, 'fourth': 3, 'fifth': 4,
         '1st': 0, '2nd': 1, '3rd': 2, '4th': 3, '5th': 4,
@@ -429,26 +456,17 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
     }
     for word, offset in ordinals.items():
         if word in instruction_lower:
-            # Filter by context if possible
-            context_words = instruction_lower.replace(word, '').strip().split()
-            if context_words:
-                for el in elements[offset:offset+10]:  # Check next 10 from offset
-                    if any(w in el['text'].lower() for w in context_words):
-                        print(f"[MATCH] ORDINAL+CONTEXT index={el['index']}")
-                        return el['index']
-            # Fallback to just position
-            if offset < len(elements):
-                print(f"[MATCH] POSITIONAL index={offset}")
-                return offset
+            # Use filtered list for ordinals
+            if offset < len(filtered):
+                match = filtered[offset]
+                print(f"[MATCH] ORDINAL index={match['index']}")
+                return match['index']
     
-    # Phase 4: LLM matching (COSTS TOKENS, only 10-20% of cases reach here)
+    # Phase 4: LLM matching (COSTS TOKENS)
     print(f"[LLM] Calling Haiku for '{instruction}'")
     
-    # Limit to 40 most relevant elements based on role priority and early position
-    priority_roles = {'video', 'link', 'button', 'input', 'addressbar'}
-    priority = [el for el in elements[:60] if el.get('role') in priority_roles][:30]
-    others = [el for el in elements[:60] if el.get('role') not in priority_roles][:10]
-    subset = priority + others
+    # Use filtered list if available, otherwise prioritize early elements
+    subset = filtered[:40] if len(filtered) < len(elements) else elements[:40]
     
     elements_text = "\n".join(
         f"{el['index']}: [{el.get('role','?')}] \"{el['text'][:100]}\""

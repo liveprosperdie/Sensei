@@ -583,7 +583,7 @@ def click_element(driver, index: int, expected_text: str | None = None,
     Click element at index. Validates staleness, checks RISKY_KEYWORDS.
     No vision fallback here - that's handled by caller.
     """
-    fresh = extract_interactive_elements(driver, max_elements=150)
+    fresh = extract_interactive_elements(driver, max_elements=200)
 
     if index >= len(fresh):
         return {"success": False, "reason": "index out of range"}
