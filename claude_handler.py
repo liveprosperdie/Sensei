@@ -281,13 +281,14 @@ def ask_akira(text: str) -> str:
     try:
         from executor import get_pc_context
         ctx = get_pc_context()
+        fg = ctx.get("foreground_app") or "unknown"
         if ctx.get("current_url") and ctx["current_url"] not in ("about:blank", "chrome://newtab/", ""):
             context_str = (
-                f"[PC STATE] Page: {ctx.get('current_page_title', '')} | {ctx['current_url']} | "
+                f"[PC STATE] Focused app: {fg} | Page: {ctx.get('current_page_title', '')} | {ctx['current_url']} | "
                 f"Windows: {', '.join(ctx['open_windows'][:4])}\n\n"
             )
         else:
-            context_str = f"[PC STATE] Windows: {', '.join(ctx['open_windows'][:4])}\n\n"
+            context_str = f"[PC STATE] Focused app: {fg} | Windows: {', '.join(ctx['open_windows'][:4])}\n\n"
         full_text = context_str + text
     except Exception:
         full_text = text
@@ -403,7 +404,7 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
     )
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-haiku-4-5",
         max_tokens=10,
         system=(
             "Match a user instruction to one element from a numbered list. "

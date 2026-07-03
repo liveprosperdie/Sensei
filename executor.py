@@ -549,10 +549,19 @@ def extract_interactive_elements(driver, max_elements: int = 80) -> list[dict]:
 
 # ── Vision click ──────────────────────────────────────────────────────────────
 
+_vision_call_count = 0
+
 def vision_click(browser, instruction: str) -> bool:
     """Screenshot → Sonnet vision → JS click at coordinates. Returns success bool."""
+    global _vision_call_count
+    _vision_call_count += 1
+    print(f"[COST] vision_click call #{_vision_call_count} — instruction: '{instruction}'")
     path = os.path.join(_screenshot_dir, f"akira_v_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
-    ImageGrab.grab().save(path)
+    img = ImageGrab.grab()
+    if img.width > 1280:
+        ratio = 1280 / img.width
+        img = img.resize((1280, int(img.height * ratio)))
+    img.save(path)
     try:
         from claude_handler import vision_match
         coords = vision_match(path, instruction)
