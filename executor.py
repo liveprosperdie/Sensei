@@ -194,6 +194,22 @@ def _ensure_current_handle(driver) -> None:
             driver.switch_to.window(driver.window_handles[0])
 
 
+def _ensure_akira_tab(driver) -> None:
+    """Create Akira's own working tab if it doesn't exist. Never switches 
+    focus away from the user's active tab unless _navigate() is called."""
+    if hasattr(driver, "_akira_tab") and driver._akira_tab in driver.window_handles:
+        return
+    existing = set(driver.window_handles)
+    driver.execute_cdp_cmd("Target.createTarget", {"url": "about:blank"})
+    for _ in range(10):
+        new = [h for h in driver.window_handles if h not in existing]
+        if new:
+            driver._akira_tab = new[0]
+            print(f"[browser] Akira tab created: {driver._akira_tab}")
+            return
+        time.sleep(0.3)
+
+
 def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
     binary_name = os.path.basename(binary_path).lower()
     if not _port_ready(port):
@@ -1049,6 +1065,7 @@ def new_tab(parameter: str | None = None) -> str:
         browser_name = browser_name.strip()
     browser = get_browser(browser_name)
     existing = set(browser.window_handles)
+    new_handles = []
     browser.execute_cdp_cmd("Target.createTarget", {"url": "chrome://newtab"})
     for _ in range(10):
         new_handles = [h for h in browser.window_handles if h not in existing]
