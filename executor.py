@@ -1108,6 +1108,60 @@ def new_tab(parameter: str | None = None) -> str:
     return "New tab opened."
 
 
+def open_site_tab(parameter: str) -> str:
+    """Always opens the requested site in a NEW tab, separate from Akira's 
+    working tab and the user's existing tabs."""
+    browser = get_browser(_last_browser_name)
+    url = resolve_site_url(parameter.strip())
+    existing = set(browser.window_handles)
+    browser.execute_cdp_cmd("Target.createTarget", {"url": url})
+    for _ in range(10):
+        new_handles = [h for h in browser.window_handles if h not in existing]
+        if new_handles:
+            browser.switch_to.window(new_handles[0])
+            return f"Opened {parameter} in a new tab."
+        time.sleep(0.3)
+    return f"Tried to open {parameter} but couldn't confirm the new tab."
+
+
+def list_open_tabs() -> str:
+    tabs = get_all_tabs()
+    if not tabs:
+        return "No tabs open."
+    names = ", ".join(t["title"][:30] for t in tabs[:10] if t["title"])
+    return f"Open tabs: {names}."
+
+
+def switch_tab(parameter: str) -> str:
+    """Switch focus to a tab matching the given name/title fragment."""
+    browser = get_browser(_last_browser_name)
+    target = parameter.lower().strip()
+    for handle in browser.window_handles:
+        browser.switch_to.window(handle)
+        if target in browser.title.lower() or target in (browser.current_url or "").lower():
+            return f"Switched to {browser.title[:40]}."
+    return f"Couldn't find an open tab matching '{parameter}'."
+
+
+def close_tab(parameter: str) -> str:
+    """Close a tab matching the given name/title fragment. Never closes 
+    Akira's own working tab."""
+    browser = get_browser(_last_browser_name)
+    target = parameter.lower().strip()
+    for handle in browser.window_handles:
+        if handle == getattr(browser, "_akira_tab", None):
+            continue
+        browser.switch_to.window(handle)
+        if target in browser.title.lower() or target in (browser.current_url or "").lower():
+            title = browser.title[:40]
+            browser.close()
+            remaining = [h for h in browser.window_handles if h != handle]
+            if remaining:
+                browser.switch_to.window(remaining[0])
+            return f"Closed {title}."
+    return f"Couldn't find an open tab matching '{parameter}' to close."
+
+
 def fill(parameter: str) -> str:
     if not parameter or "|" not in parameter:
         return "I need a field description and text to type."
