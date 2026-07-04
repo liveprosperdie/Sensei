@@ -337,9 +337,6 @@ def _navigate(url: str) -> None:
     """Navigate current tab to URL. NO TAB SWITCHING."""
     browser = get_browser(_last_browser_name)
     browser.get(url)
-    # Clear element cache on navigation
-    global _element_cache
-    _element_cache.clear()
 
 
 def get_current_site(driver) -> str | None:
@@ -537,16 +534,11 @@ def extract_interactive_elements(driver, max_elements: int = 150) -> list[dict]:
         return []
     
     if not elements:
+        current_url = driver.current_url if hasattr(driver, 'current_url') else 'page'
         print(f"[EXTRACT] No elements found on {current_url[:50] if current_url else 'page'}")
         return []
     
-    # Cache the result
-    if cache_key:
-        _element_cache[cache_key] = elements
-        # Keep cache size reasonable
-        if len(_element_cache) > 10:
-            _element_cache.pop(next(iter(_element_cache)))
-    
+    current_url = driver.current_url if hasattr(driver, 'current_url') else 'page'
     print(f"[EXTRACT] Found {len(elements)} elements on {current_url[:50] if current_url else 'page'}")
     return elements
 
@@ -1189,14 +1181,9 @@ def _handle_click(parameter: str) -> str | dict:
     index = find_element_index(elements, parameter)
     print(f"[CLICK] Matched index={index} for '{parameter}'")
 
-    # Only use vision if we have ZERO elements or matching completely failed
-    if not elements or (index is None and len(elements) < 5):
-        print(f"[CLICK] Vision fallback (empty page or too few elements)")
-        return "Done." if vision_click(browser, parameter) else "Couldn't find that on the page."
-
-    # If index not found but we have elements, it's genuinely not there
     if index is None or index >= len(elements):
-        return "Couldn't find that on the page."
+        print(f"[CLICK] DOM match failed, trying vision fallback")
+        return "Done." if vision_click(browser, parameter) else "Couldn't find that on the page."
 
     target = elements[index]
     print(f"[CLICK] Target: [{target['role']}] '{target['text'][:50]}'")
