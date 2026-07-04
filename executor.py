@@ -1204,37 +1204,18 @@ def _handle_web_search(parameter: str) -> str:
         parameter, browser_name = parameter.split("|browser:", 1)
         parameter, browser_name = parameter.strip(), browser_name.strip()
 
+    explicit_web = any(w in parameter.lower() for w in ["on the web", "on google", "google it", "on web"])
     query_clean = re.sub(r"\b(on the web|on google|google it|on web)\b", "", parameter, flags=re.I).strip()
-    
-    browser = get_browser(name=browser_name)
-    
-    # ALWAYS check if we're on a content page that user might want to keep
-    # If current tab has actual content (not blank/search), open NEW tab for search
-    try:
-        current_url = browser.current_url or ""
-        is_meaningful_page = (
-            current_url and 
-            not any(x in current_url for x in ["about:blank", "newtab", "/search?", "results?search_query"])
-        )
-        
-        if is_meaningful_page:
-            # User has meaningful content open - use new tab
-            existing = set(browser.window_handles)
-            browser.execute_cdp_cmd("Target.createTarget", {"url": f"https://www.google.com/search?q={urllib.parse.quote(query_clean)}"})
-            for _ in range(10):
-                new_handles = [h for h in browser.window_handles if h not in existing]
-                if new_handles:
-                    browser.switch_to.window(new_handles[0])
-                    break
-                time.sleep(0.3)
-            return f"Searching for {parameter} in new tab."
-    except Exception:
-        pass
-    
-    # Current tab is blank or a search page - safe to navigate
-    _navigate(f"https://www.google.com/search?q={urllib.parse.quote(query_clean)}")
 
-    # dismiss consent popups
+    browser = get_browser(name=browser_name)
+    browser.switch_to.window(browser._akira_tab)
+    current_site = get_current_site(browser) if not explicit_web else None
+
+    if current_site and current_site in SEARCH_URL_MAP:
+        return _handle_site_search(f"{current_site}|{query_clean}")
+
+    _navigate(f"https://www.google.com/search?q={urllib.parse.quote(query_clean if explicit_web else parameter)}")
+
     try:
         for selector in [
             "button[id*='reject']", "button[aria-label*='Reject']",
