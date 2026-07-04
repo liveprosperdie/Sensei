@@ -403,36 +403,11 @@ def get_all_tabs() -> list[dict]:
 
 # ── Element extraction ────────────────────────────────────────────────────────
 
-# Element cache to avoid repeated extractions on same page
-_element_cache = {}
-
 def extract_interactive_elements(driver, max_elements: int = 150) -> list[dict]:
     """
     Extract interactive elements using aggressive DOM approach (no CDP tree overhead).
     Captures YouTube video thumbnails, address bar, and all clickable elements.
     """
-    try:
-        current_url = driver.current_url
-        cache_key = f"{current_url}_{max_elements}"
-        
-        # Return cached elements if URL hasn't changed (saves tons of time)
-        if cache_key in _element_cache:
-            cached = _element_cache[cache_key]
-            # Verify cache is still valid by spot-checking first element
-            try:
-                test = driver.execute_script(
-                    "return document.querySelector('[data-akira-index=\"0\"]') !== null;"
-                )
-                if test:
-                    print(f"[EXTRACT] Using cached {len(cached)} elements")
-                    return cached
-            except Exception:
-                pass
-            # Cache invalid, clear it
-            del _element_cache[cache_key]
-    except Exception:
-        current_url = None
-        cache_key = None
 
     # Aggressive DOM extraction script - wrapped in try-catch
     script = """
