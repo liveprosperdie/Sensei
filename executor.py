@@ -91,6 +91,32 @@ WEB_MAP = {
     "x": "https://x.com",
 }
 
+TOP_SITES_MAP = {
+    **WEB_MAP,
+    "netflix": "https://netflix.com", "prime video": "https://primevideo.com",
+    "hotstar": "https://hotstar.com", "spotify": "https://open.spotify.com",
+    "amazon": "https://amazon.in", "flipkart": "https://flipkart.com",
+    "reddit": "https://reddit.com", "linkedin": "https://linkedin.com",
+    "twitch": "https://twitch.tv", "discord": "https://discord.com/app",
+    "notion": "https://notion.so", "chatgpt": "https://chatgpt.com",
+    "claude": "https://claude.ai", "gemini": "https://gemini.google.com",
+    "wikipedia": "https://en.wikipedia.org", "stackoverflow": "https://stackoverflow.com",
+    "quora": "https://quora.com", "medium": "https://medium.com",
+    "zoom": "https://zoom.us", "canva": "https://canva.com",
+    "figma": "https://figma.com", "drive": "https://drive.google.com",
+    "docs": "https://docs.google.com", "sheets": "https://sheets.google.com",
+    "maps": "https://maps.google.com", "translate": "https://translate.google.com",
+}
+
+def resolve_site_url(name: str) -> str:
+    """Map a spoken site name to a URL. Falls back to guessing the domain, 
+    then Google search if the guess looks wrong."""
+    key = name.lower().strip()
+    if key in TOP_SITES_MAP:
+        return TOP_SITES_MAP[key]
+    guess = f"https://{key.replace(' ', '')}.com"
+    return guess
+
 SEARCH_URL_MAP = {
     "youtube":     "https://www.youtube.com/results?search_query={}",
     "google":      "https://www.google.com/search?q={}",
@@ -300,6 +326,7 @@ def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.C
         try:
             _ = driver.title
             _ensure_current_handle(driver)
+            _ensure_akira_tab(driver)
             return driver
         except Exception:
             del _browsers[key]
@@ -344,14 +371,16 @@ def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.C
         svc = Service(ChromeDriverManager().install())
         driver = _attach_cdp(CHROME_PATH, 9223, svc)
 
+    _ensure_akira_tab(driver)
     _browsers[key] = driver
     _last_browser_name = name
     return driver
 
 
 def _navigate(url: str) -> None:
-    """Navigate current tab to URL. NO TAB SWITCHING."""
+    """Navigate Akira's dedicated tab to a URL. Never touches user's other tabs."""
     browser = get_browser(_last_browser_name)
+    browser.switch_to.window(browser._akira_tab)
     browser.get(url)
 
 
