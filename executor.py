@@ -226,7 +226,7 @@ def _ensure_akira_tab(driver) -> None:
     if hasattr(driver, "_akira_tab") and driver._akira_tab in driver.window_handles:
         return
     existing = set(driver.window_handles)
-    driver.execute_cdp_cmd("Target.createTarget", {"url": "about:blank"})
+    driver.execute_cdp_cmd("Target.createTarget", {"url": "about:blank", "background": True})
     for _ in range(10):
         new = [h for h in driver.window_handles if h not in existing]
         if new:
@@ -689,6 +689,9 @@ def youtube_control(parameter: str) -> str:
     except Exception:
         pass
 
+    if "youtube.com" not in (browser.current_url or ""):
+        return "This isn't a YouTube tab right now. Switch to YouTube first."
+
     # ── Group A: JS media controls — zero API cost ────────────────────
 
     if param in ("play", "pause"):
@@ -827,11 +830,11 @@ def youtube_control(parameter: str) -> str:
     
     if param in simple_actions:
         selector = simple_actions[param]
-        clicked = browser.execute_script(f"""
-            var el = document.querySelector('{selector}');
-            if (el) {{ el.click(); return true; }}
+        clicked = browser.execute_script("""
+            var el = document.querySelector(arguments[0]);
+            if (el) { el.click(); return true; }
             return false;
-        """)
+        """, selector)
         return "Done." if clicked else f"Couldn't find {param}."
     
     # Menu items that need menu to be opened first
@@ -1119,6 +1122,7 @@ def open_site_tab(parameter: str) -> str:
         new_handles = [h for h in browser.window_handles if h not in existing]
         if new_handles:
             browser.switch_to.window(new_handles[0])
+            browser._akira_tab = new_handles[0]
             return f"Opened {parameter} in a new tab."
         time.sleep(0.3)
     return f"Tried to open {parameter} but couldn't confirm the new tab."
@@ -1133,14 +1137,22 @@ def list_open_tabs() -> str:
 
 
 def switch_tab(parameter: str) -> str:
-    """Switch focus to a tab matching the given name/title fragment."""
+    """Switch focus to a tab matching the given name/title fragment.
+    If multiple tabs match, prefer the last one in window_handles order 
+    (most recently opened, since Selenium appends new handles at the end)."""
     browser = get_browser(_last_browser_name)
     target = parameter.lower().strip()
+    matches = []
     for handle in browser.window_handles:
         browser.switch_to.window(handle)
         if target in browser.title.lower() or target in (browser.current_url or "").lower():
-            return f"Switched to {browser.title[:40]}."
-    return f"Couldn't find an open tab matching '{parameter}'."
+            matches.append((handle, browser.title[:40]))
+    if not matches:
+        return f"Couldn't find an open tab matching '{parameter}'."
+    chosen_handle, chosen_title = matches[-1]
+    browser.switch_to.window(chosen_handle)
+    browser._akira_tab = chosen_handle
+    return f"Switched to {chosen_title}."
 
 
 def close_tab(parameter: str) -> str:
