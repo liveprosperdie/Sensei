@@ -864,6 +864,134 @@ def youtube_control(parameter: str) -> str:
     return f"Don't know how to do '{param}' on YouTube."
 
 
+# ── Netflix control ───────────────────────────────────────────────────────────
+
+def netflix_control(action: str, parameter: str | None = None) -> dict:
+    """
+    Handle all Netflix player interactions using three dispatch patterns:
+    1. SIMPLE_ACTIONS: direct button clicks
+    2. MENU_ACTIONS: open overlay, then select item (requires parameter)
+    3. SLIDER_ACTIONS: set video property directly (requires parameter)
+    
+    Returns dict with 'success' (bool) and optional 'message' (str).
+    
+    WARNING: menu_actions selectors are UNVERIFIED PLACEHOLDERS pending live inspection.
+    The following need verification on actual Netflix UI:
+    - Episodes overlay trigger button aria-label
+    - Audio & Subtitles button aria-label
+    - data-uia or class structure of menu items inside overlays
+    """
+    browser = get_browser(_last_browser_name)
+    
+    # 0. Guard-rail: confirm current tab is Netflix before doing anything
+    try:
+        current_url = browser.current_url or ""
+    except Exception:
+        return {"success": False, "message": "Could not read current URL"}
+    
+    if "netflix.com" not in current_url:
+        return {"success": False, "message": "Not a Netflix tab. Switch to Netflix first."}
+
+    # 1. SIMPLE_ACTIONS: direct click, no menu needed
+    simple_actions = {
+        "play": 'button[aria-label="Play"]',
+        "pause": 'button[aria-label="Pause"]',
+        "fullscreen": 'button[aria-label="Full screen"]',
+        "exit fullscreen": 'button[aria-label="Exit full screen"]',
+        "next episode": 'button[aria-label="Next Episode"]',
+        "skip back": 'button[aria-label="Seek Back"]',
+        "skip forward": 'button[aria-label="Seek Forward"]',
+        "mute": 'button[aria-label="Volume"]',
+    }
+    
+    if action in simple_actions:
+        try:
+            browser.execute_script("""
+                var el = document.querySelector(arguments[0]);
+                if (el) { el.click(); return true; }
+                return false;
+            """, simple_actions[action])
+            return {"success": True, "message": f"Executed {action}."}
+        except Exception as e:
+            return {"success": False, "message": f"Failed to {action}: {e}"}
+
+    # 2. MENU_ACTIONS: click icon to open overlay, then click item inside it
+    # UNVERIFIED PLACEHOLDERS - these selectors need live inspection before shipping
+    menu_actions = {
+        "episodes": {
+            "open_selector": 'button[aria-label="More Episodes"]',  # PLACEHOLDER - verify exact label
+            "item_selector_template": '//div[contains(text(), "{parameter}")]',  # PLACEHOLDER xpath
+        },
+        "subtitle": {
+            "open_selector": 'button[aria-label="Audio & Subtitles"]',  # PLACEHOLDER - verify
+            "item_selector_template": '//div[@data-uia="subtitle-item" and contains(., "{parameter}")]',  # PLACEHOLDER
+        },
+        "audio": {
+            "open_selector": 'button[aria-label="Audio & Subtitles"]',  # PLACEHOLDER - verify
+            "item_selector_template": '//div[@data-uia="audio-item" and contains(., "{parameter}")]',  # PLACEHOLDER
+        },
+    }
+    
+    if action in menu_actions:
+        if not parameter:
+            return {"success": False, "message": f"{action} requires a parameter (item name to select)"}
+        
+        cfg = menu_actions[action]
+        try:
+            # Open the overlay menu
+            browser.execute_script("""
+                var el = document.querySelector(arguments[0]);
+                if (el) { el.click(); return true; }
+                return false;
+            """, cfg["open_selector"])
+            
+            time.sleep(0.4)  # Wait for overlay to render
+            
+            # Find and click the item (using XPath with parameter injected into Python string, NOT JS)
+            item_xpath = cfg["item_selector_template"].format(parameter=parameter)
+            items = browser.find_elements(By.XPATH, item_xpath)
+            
+            if items:
+                items[0].click()
+                return {"success": True, "message": f"Selected {parameter} in {action}."}
+            
+            return {"success": False, "message": f"Item '{parameter}' not found in {action} menu"}
+        
+        except Exception as e:
+            return {"success": False, "message": f"Failed to {action}: {e}"}
+
+    # 3. SLIDER_ACTIONS: set value directly via JS property, no click/drag simulation
+    if action == "volume":
+        if parameter is None:
+            return {"success": False, "message": "volume requires a parameter (0.0-1.0)"}
+        try:
+            val = max(0.0, min(1.0, float(parameter)))
+            browser.execute_script("""
+                var v = document.querySelector('video');
+                if (v) { v.volume = arguments[0]; return true; }
+                return false;
+            """, val)
+            return {"success": True, "message": f"Set volume to {val}."}
+        except (ValueError, Exception) as e:
+            return {"success": False, "message": f"Failed to set volume: {e}"}
+    
+    if action == "playback speed":
+        if parameter is None:
+            return {"success": False, "message": "playback speed requires a parameter (e.g. 1.5)"}
+        try:
+            val = float(parameter)
+            browser.execute_script("""
+                var v = document.querySelector('video');
+                if (v) { v.playbackRate = arguments[0]; return true; }
+                return false;
+            """, val)
+            return {"success": True, "message": f"Set playback speed to {val}x."}
+        except (ValueError, Exception) as e:
+            return {"success": False, "message": f"Failed to set playback speed: {e}"}
+
+    return {"success": False, "message": f"Unknown netflix_control action: {action}"}
+
+
 # ── System actions ────────────────────────────────────────────────────────────
 
 def _find_exe(name: str) -> str | None:
