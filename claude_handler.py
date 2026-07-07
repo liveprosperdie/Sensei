@@ -171,7 +171,7 @@ FILES & FOLDERS: search_file, open_file, write_file, edit_file[C], move_files[C]
 
 DOWNLOADS & INSTALL: download_file, download_application, install_application[C], uninstall_application[C]
 
-BROWSER & SEARCH: web_search, open_url, site_search, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control
+BROWSER & SEARCH: web_search, open_url, site_search, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control
 ACTION PARAMETER FORMATS:
 - web_search: general web searches. Parameter is the query, optionally with "|browser:name" suffix. Never use a website name as a browser.
 - site_search: searching ON a specific platform. Format: "site|query". Use for youtube, netflix, spotify, amazon, flipkart, reddit, twitter, instagram, pinterest, github, stackoverflow, wikipedia, makemytrip, ixigo, chatgpt, claude, gemini, perplexity.
@@ -183,6 +183,7 @@ ACTION PARAMETER FORMATS:
 - fill: "field description|text to type" or "field description|text to type|submit". Use submit only when the user clearly wants to submit.
 - scroll: "up", "down", "top", "bottom", or a pixel number like "300".
 - youtube_control: use ONLY when on YouTube. Parameter: "play", "pause", "skip ad", "like", "dislike", "subscribe", "unsubscribe", "share", "fullscreen", "theatre mode", "default view", "loop", "captions on", "captions off", "ambient mode", "sleep timer", "quality", "go back", "go forward", "history", "watch later", "liked videos", "playlists", "your channel", "mute video", "unmute video", "volume 80", "speed 1.5", "seek 30", "play next", "home", "music", "gaming", "live", "news", "switch account", "sign out", "go to channel [name]", "search [query]", "play video [description]", "open comments".
+- netflix_control: use ONLY when on Netflix. Format: "action" or "action|parameter". Actions: "play", "pause", "fullscreen", "exit fullscreen", "next episode", "skip back", "skip forward", "mute". Actions requiring parameter: "episodes|Episode 5", "subtitle|English", "audio|English - Audio Description", "volume|0.7", "playback speed|1.5".
 
 CODE: write_code, fix_code, read_clipboard, write_clipboard, dictate_text
 

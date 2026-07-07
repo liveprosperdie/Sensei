@@ -231,7 +231,6 @@ def _ensure_akira_tab(driver) -> None:
         new = [h for h in driver.window_handles if h not in existing]
         if new:
             driver._akira_tab = new[0]
-            print(f"[browser] Akira tab created: {driver._akira_tab}")
             return
         time.sleep(0.3)
 
@@ -881,7 +880,14 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     - Audio & Subtitles button aria-label
     - data-uia or class structure of menu items inside overlays
     """
+    print(f"[netflix_control] called with action={action!r}, parameter={parameter!r}")
     browser = get_browser(_last_browser_name)
+    
+    browser.switch_to.window(browser._akira_tab)
+    try:
+        WebDriverWait(browser, 8).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    except Exception:
+        pass
     
     # 0. Guard-rail: confirm current tab is Netflix before doing anything
     try:
@@ -905,15 +911,12 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     }
     
     if action in simple_actions:
-        try:
-            browser.execute_script("""
-                var el = document.querySelector(arguments[0]);
-                if (el) { el.click(); return true; }
-                return false;
-            """, simple_actions[action])
-            return {"success": True, "message": f"Executed {action}."}
-        except Exception as e:
-            return {"success": False, "message": f"Failed to {action}: {e}"}
+        clicked = browser.execute_script("""
+            var el = document.querySelector(arguments[0]);
+            if (el) { el.click(); return true; }
+            return false;
+        """, simple_actions[action])
+        return {"success": clicked, "message": f"Executed {action}." if clicked else f"Couldn't find {action} button — selector may be wrong or page not loaded."}
 
     # 2. MENU_ACTIONS: click icon to open overlay, then click item inside it
     # UNVERIFIED PLACEHOLDERS - these selectors need live inspection before shipping
@@ -1452,6 +1455,7 @@ _ACTION_MAP = {
     "close_tab":         close_tab,
     "click":             _handle_click,
     "youtube_control":   youtube_control,
+    "netflix_control":   lambda p: netflix_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
     "adjust_volume":     adjust_volume,
     "adjust_brightness": adjust_brightness,
     "screenshot":        lambda _: screenshot(),
