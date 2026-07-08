@@ -176,7 +176,7 @@ FILES & FOLDERS: search_file, open_file, write_file, edit_file[C], move_files[C]
 
 DOWNLOADS & INSTALL: download_file, download_application, install_application[C], uninstall_application[C]
 
-BROWSER & SEARCH: web_search, open_url, site_search, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control
+BROWSER & SEARCH: web_search, open_url, site_search, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control, amazon_control, flipkart_control
 ACTION PARAMETER FORMATS:
 - web_search: general web searches. Parameter is the query, optionally with "|browser:name" suffix. Never use a website name as a browser.
 - site_search: searching ON a specific platform. Format: "site|query". Use for youtube, netflix, spotify, amazon, flipkart, reddit, twitter, instagram, pinterest, github, stackoverflow, wikipedia, makemytrip, ixigo, chatgpt, claude, gemini, perplexity.
@@ -193,6 +193,13 @@ ACTION PARAMETER FORMATS:
   Playback: "play", "pause", "mute", "unmute", "volume|0.7" or "volume|70" or "volume|up" or "volume|down", "seek|1:02:03" (jump to ANY timestamp, also accepts "45 minutes" or "3600"), "skip forward|30", "skip back|30" (seconds, default 10), "playback speed|1.5", "now playing" (reports current title and timestamp).
   Player UI: "fullscreen", "exit fullscreen", "next episode", "skip intro", "back to browse", "episodes|Episode 5", "subtitle|English" or "subtitle|off", "audio|English".
   NEVER use click for Netflix search results, play buttons, subtitles, audio, or episodes — netflix_control handles all of those reliably. Only use click on Netflix for things netflix_control cannot do, like profile selection.
+- amazon_control: THE tool for shopping on Amazon — searching, opening products, cart, and checkout up to address confirmation. When shopping on Amazon, ALWAYS prefer this over click, fill, or site_search. Format: "action" or "action|parameter".
+  Actions: "search|iphone 15" (search results, reports top products), "select result|first" or "select result|iphone 15 pro" (opens a product by ordinal or name), "select variant|size medium" (size/color options), "quantity|2", "add to cart", "view cart", "proceed to checkout" (pauses for user confirmation before clicking), "confirm address" or "confirm address|2" (picks a saved delivery address).
+  HARD LIMIT: amazon_control stops at address confirmation. It has NO payment actions — never promise to select payment methods, enter cards, or place the final order.
+- flipkart_control: THE tool for shopping on Flipkart — same shape as amazon_control. Format: "action" or "action|parameter".
+  Actions: "search|running shoes", "select result|first" or "select result|nike", "select variant|size 9", "add to cart", "view cart", "proceed to checkout" (Flipkart labels this button Place Order — it only moves to address selection, and it pauses for user confirmation), "confirm address".
+  HARD LIMIT: flipkart_control stops at address confirmation. It has NO payment actions — never promise payment steps.
+  NEVER use click for Amazon or Flipkart search results, add-to-cart, cart, or checkout buttons — the control tools handle those reliably. Only use click on these sites for things the control tools cannot do.
 
 CODE: write_code, fix_code, read_clipboard, write_clipboard, dictate_text
 

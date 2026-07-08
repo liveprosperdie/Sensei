@@ -1492,6 +1492,501 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     return {"success": False, "message": f"Unknown netflix_control action: {action}"}
 
 
+# ── Amazon control ────────────────────────────────────────────────────────────
+# SCOPE: search → product → cart → checkout → address confirmation.
+# HARD STOP before payment-method selection. No payment actions exist here.
+
+def amazon_control(action: str, parameter: str | None = None) -> dict:
+    """
+    Amazon.in shopping automation up to (and not past) order-review/address.
+
+    Actions:
+      search|query           -> search results page, reports top products
+      select result|first    -> open a product from results by ordinal or name
+      select variant|desc    -> pick size/color via generic click (Category 2)
+      quantity|2             -> set quantity dropdown on product page
+      add to cart            -> #add-to-cart-button (CONFIRMED stable id)
+      view cart              -> cart page
+      proceed to checkout    -> risky-keyword recheck, needs_confirmation
+      confirm address        -> pick saved address (PLACEHOLDER-UNVERIFIED)
+
+    Returns {'success': bool, 'message': str} or the needs_click_confirmation
+    dict shape that _handle_click returns (so sensei.py's pause logic works).
+    """
+    print(f"[amazon_control] called with action={action!r}, parameter={parameter!r}")
+    browser = get_browser(_last_browser_name)
+    try:
+        browser.switch_to.window(browser._akira_tab)
+    except Exception:
+        return {"success": False, "message": "Lost track of my working tab."}
+    try:
+        WebDriverWait(browser, 8).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    except Exception:
+        pass
+    try:
+        current_url = browser.current_url or ""
+    except Exception:
+        return {"success": False, "message": "Could not read current URL"}
+
+    action = (action or "").strip().lower().replace("_", " ")
+
+    def _amz_collect_cards() -> list:
+        """CONFIRMED: search results use div[data-component-type='s-search-result']
+        with a data-asin attribute; title lives in the h2, link in h2 a / a[href*='/dp/']."""
+        try:
+            return browser.execute_script(r"""
+                var out = [], seen = {};
+                var cards = document.querySelectorAll(
+                    'div[data-component-type="s-search-result"][data-asin]');
+                for (var i = 0; i < cards.length; i++) {
+                    var asin = cards[i].getAttribute('data-asin');
+                    if (!asin || seen[asin]) continue;
+                    var link = cards[i].querySelector('h2 a, a.a-link-normal[href*="/dp/"]');
+                    if (!link) continue;
+                    var h2 = cards[i].querySelector('h2');
+                    var label = h2 ? h2.textContent.trim() : (link.textContent || '').trim();
+                    if (!label) continue;
+                    seen[asin] = true;
+                    out.push({ label: label.slice(0, 120), href: link.href, asin: asin });
+                }
+                return out;
+            """) or []
+        except Exception:
+            return []
+
+    def _amz_pick(cards: list, param: str | None):
+        if not cards:
+            return None
+        if not param:
+            return cards[0]
+        p = param.strip().lower()
+        ordinals = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2,
+                    "fourth": 3, "4th": 3, "fifth": 4, "5th": 4}
+        if p in ordinals:
+            i = ordinals[p]
+            return cards[i] if i < len(cards) else cards[0]
+        if p.isdigit():
+            i = int(p) - 1
+            return cards[i] if 0 <= i < len(cards) else cards[0]
+        for c in cards:
+            if p in c["label"].lower():
+                return c
+        p_tokens = set(p.split())
+        best, best_score = None, 0
+        for c in cards:
+            score = len(p_tokens & set(c["label"].lower().split()))
+            if score > best_score:
+                best, best_score = c, score
+        return best or cards[0]
+
+    def _amz_find_visible(selectors: list):
+        """Return the first visible Selenium element matching any CSS selector."""
+        for sel in selectors:
+            try:
+                for el in browser.find_elements(By.CSS_SELECTOR, sel):
+                    if el.is_displayed():
+                        return el
+            except Exception:
+                continue
+        return None
+
+    def _guarded_click(el, spoken_name: str, retry_param: str):
+        """Risky-keyword recheck before ANY direct click (existing safety net)."""
+        try:
+            text = (el.text or el.get_attribute("value") or
+                    el.get_attribute("aria-label") or spoken_name).strip()
+        except Exception:
+            text = spoken_name
+        if _risky_pattern.search(text):
+            def _do():
+                browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                el.click()
+            return {
+                "needs_click_confirmation": True,
+                "element_text": text[:80],
+                "_execute": _do,
+                "retry_parameter": retry_param,
+            }
+        try:
+            browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            el.click()
+            return {"success": True, "message": f"Clicked {spoken_name}."}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't click {spoken_name}: {e}"}
+
+    # ── search (reuses SEARCH_URL_MAP url, adds card reporting) ─────────────
+    if action == "search":
+        if not parameter:
+            return {"success": False, "message": "Search needs a query."}
+        browser.get("https://www.amazon.in/s?k=" + urllib.parse.quote(parameter))
+        try:
+            WebDriverWait(browser, 10).until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, 'div[data-component-type="s-search-result"]')))
+        except Exception:
+            pass
+        time.sleep(0.5)
+        cards = _amz_collect_cards()
+        if not cards:
+            return {"success": False, "message": f"No Amazon results found for {parameter}."}
+        top = "; ".join(c["label"][:60] for c in cards[:4])
+        return {"success": True, "message": f"Found {len(cards)} products for {parameter}. Top results: {top}. Say select first result, or name one."}
+
+    if "amazon" not in current_url:
+        return {"success": False, "message": "Not an Amazon tab. Search Amazon first."}
+
+    if action in ("select result", "open result", "select product", "open product"):
+        cards = _amz_collect_cards()
+        if not cards:
+            return {"success": False, "message": "I don't see any products on this page. Try searching first."}
+        pick = _amz_pick(cards, parameter)
+        browser.get(pick["href"])
+        try:
+            WebDriverWait(browser, 10).until(EC.presence_of_element_located((By.ID, "productTitle")))
+        except Exception:
+            pass
+        return {"success": True, "message": f"Opened {pick['label'][:60]}."}
+
+    if action in ("select variant", "variant", "select option"):
+        # Category 2: variant widgets (twister) vary too much per product —
+        # reuse the existing generic click pipeline (vision fallback included).
+        if not parameter:
+            return {"success": False, "message": "Tell me which option, like size medium or color black."}
+        result = _handle_click(parameter)
+        if isinstance(result, dict):
+            return result
+        ok = not str(result).lower().startswith("couldn't")
+        return {"success": ok, "message": str(result)}
+
+    if action == "quantity":
+        if not parameter:
+            return {"success": False, "message": "Tell me a quantity, like 2."}
+        qty = re.sub(r"\D", "", parameter) or "1"
+        try:
+            ok = browser.execute_script("""
+                var sel = document.querySelector('#quantity, select[name="quantity"]');
+                if (!sel) return false;
+                sel.value = arguments[0];
+                sel.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+            """, qty)
+            if ok:
+                return {"success": True, "message": f"Quantity set to {qty}."}
+            return {"success": False, "message": "No quantity selector on this page."}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't set quantity: {e}"}
+
+    if action == "add to cart":
+        # CONFIRMED: #add-to-cart-button has been Amazon's stable id for years
+        el = _amz_find_visible([
+            "#add-to-cart-button",
+            'input[name="submit.add-to-cart"]',
+            "#add-to-cart-button-ubb",
+        ])
+        if not el:
+            return {"success": False, "message": "Couldn't find the Add to Cart button — are you on a product page?"}
+        result = _guarded_click(el, "Add to Cart", "add to cart")
+        if result.get("success"):
+            time.sleep(1.0)
+            return {"success": True, "message": "Added to cart."}
+        return result
+
+    if action in ("view cart", "cart", "open cart", "go to cart"):
+        browser.get("https://www.amazon.in/gp/cart/view.html")
+        try:
+            WebDriverWait(browser, 8).until(EC.presence_of_element_located((By.ID, "sc-active-cart")))
+        except Exception:
+            pass
+        return {"success": True, "message": "Opened your Amazon cart."}
+
+    if action in ("proceed to checkout", "checkout"):
+        # CONFIRMED ids from cart page + post-add side sheet. Button text is
+        # "Proceed to Buy" on amazon.in — matches RISKY_KEYWORDS ("buy"), so
+        # _guarded_click will return needs_confirmation and pause for the user.
+        el = _amz_find_visible([
+            'input[name="proceedToRetailCheckout"]',
+            "#sc-buy-box-ptc-button input",
+            "#sc-buy-box-ptc-button",
+            "#hlb-ptc-btn-native",
+            'a[href*="proceedToCheckout"]',
+        ])
+        if not el:
+            return {"success": False, "message": "Couldn't find the checkout button — open the cart first."}
+        return _guarded_click(el, "Proceed to Checkout", "proceed to checkout")
+
+    if action in ("confirm address", "select address", "confirm delivery address"):
+        # PLACEHOLDER-UNVERIFIED: address book ids seen in research
+        # (#address-book-entry-0, ship-to-this-address) need a live capture of
+        # the amazon.in "Select a delivery address" page to confirm.
+        sel_list = [
+            "#address-book-entry-0 a, #address-book-entry-0 input",
+            ".ship-to-this-address a, .ship-to-this-address input",
+            'input[data-testid="Address_selectShipToAddress"]',
+        ]
+        if parameter and parameter.strip().isdigit():
+            n = int(parameter.strip()) - 1
+            sel_list.insert(0, f"#address-book-entry-{n} a, #address-book-entry-{n} input")
+        el = _amz_find_visible(sel_list)
+        if not el:
+            return {"success": False, "message": "Couldn't find a saved address to select — the address page may look different. This is where I stop before payment."}
+        result = _guarded_click(el, "delivery address", "confirm address")
+        if result.get("success"):
+            return {"success": True, "message": "Address confirmed. Stopping here — the next screen is payment selection, which I won't touch."}
+        return result
+
+    return {"success": False, "message": f"Unknown amazon_control action: {action}"}
+
+
+# ── Flipkart control ──────────────────────────────────────────────────────────
+# SCOPE: identical hard boundary — stop before payment-method selection.
+# Flipkart rotates its class names as anti-scraping, so all selectors here are
+# text/attribute-based, never class-based.
+
+def flipkart_control(action: str, parameter: str | None = None) -> dict:
+    """
+    Flipkart shopping automation up to (and not past) address confirmation.
+
+    Actions:
+      search|query           -> search results, closes login popup, reports top products
+      select result|first    -> open a product by ordinal or name (new-tab aware)
+      select variant|desc    -> size/color via generic click (Category 2)
+      add to cart            -> text-matched button (classes rotate; text doesn't)
+      view cart              -> /viewcart
+      proceed to checkout    -> Flipkart's cart button is literally "Place Order",
+                                which hits RISKY_KEYWORDS -> needs_confirmation
+      confirm address        -> "Deliver Here" button (PLACEHOLDER-UNVERIFIED)
+
+    Returns {'success': bool, 'message': str} or the needs_click_confirmation dict.
+    """
+    print(f"[flipkart_control] called with action={action!r}, parameter={parameter!r}")
+    browser = get_browser(_last_browser_name)
+    try:
+        browser.switch_to.window(browser._akira_tab)
+    except Exception:
+        return {"success": False, "message": "Lost track of my working tab."}
+    try:
+        WebDriverWait(browser, 8).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    except Exception:
+        pass
+    try:
+        current_url = browser.current_url or ""
+    except Exception:
+        return {"success": False, "message": "Could not read current URL"}
+
+    action = (action or "").strip().lower().replace("_", " ")
+
+    def _fk_close_login_popup():
+        """Flipkart throws a login modal over search results; its close button
+        is a bare '✕'. Class-independent: match by text."""
+        try:
+            browser.execute_script("""
+                var btns = document.querySelectorAll('button');
+                for (var i = 0; i < btns.length; i++) {
+                    var t = (btns[i].textContent || '').trim();
+                    if (t === '\\u2715' || t === '\\u2716' || t === 'X' || t === '\\u00d7') {
+                        btns[i].click(); return true;
+                    }
+                }
+                return false;
+            """)
+        except Exception:
+            pass
+
+    def _fk_collect_cards() -> list:
+        """div[data-id] wrappers are Flipkart's stable per-product attribute;
+        product links always contain /p/. Labels come from link title attr,
+        img alt, or text — never class names."""
+        try:
+            return browser.execute_script(r"""
+                var out = [], seen = {};
+                var wraps = document.querySelectorAll('div[data-id]');
+                for (var i = 0; i < wraps.length; i++) {
+                    var id = wraps[i].getAttribute('data-id');
+                    if (!id || seen[id]) continue;
+                    var link = wraps[i].querySelector('a[href*="/p/"]');
+                    if (!link) continue;
+                    var label = link.getAttribute('title') || '';
+                    if (!label) {
+                        var img = wraps[i].querySelector('img[alt]');
+                        if (img) label = img.getAttribute('alt') || '';
+                    }
+                    if (!label) label = (link.textContent || '').trim();
+                    if (!label) continue;
+                    seen[id] = true;
+                    out.push({ label: label.slice(0, 120), href: link.href, id: id });
+                }
+                // fallback: pages without data-id wrappers
+                if (out.length === 0) {
+                    var links = document.querySelectorAll('a[href*="/p/"]');
+                    for (var j = 0; j < links.length; j++) {
+                        var href = links[j].href;
+                        if (seen[href]) continue;
+                        var lb = links[j].getAttribute('title') ||
+                                 (links[j].querySelector('img[alt]') ?
+                                  links[j].querySelector('img[alt]').getAttribute('alt') : '') ||
+                                 (links[j].textContent || '').trim();
+                        if (!lb) continue;
+                        seen[href] = true;
+                        out.push({ label: lb.slice(0, 120), href: href, id: href });
+                    }
+                }
+                return out;
+            """) or []
+        except Exception:
+            return []
+
+    def _fk_pick(cards: list, param: str | None):
+        if not cards:
+            return None
+        if not param:
+            return cards[0]
+        p = param.strip().lower()
+        ordinals = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2,
+                    "fourth": 3, "4th": 3, "fifth": 4, "5th": 4}
+        if p in ordinals:
+            i = ordinals[p]
+            return cards[i] if i < len(cards) else cards[0]
+        if p.isdigit():
+            i = int(p) - 1
+            return cards[i] if 0 <= i < len(cards) else cards[0]
+        for c in cards:
+            if p in c["label"].lower():
+                return c
+        p_tokens = set(p.split())
+        best, best_score = None, 0
+        for c in cards:
+            score = len(p_tokens & set(c["label"].lower().split()))
+            if score > best_score:
+                best, best_score = c, score
+        return best or cards[0]
+
+    def _fk_find_button_by_text(phrases: list):
+        """Find a visible button/anchor whose text contains any phrase
+        (case-insensitive). Flipkart classes rotate; text is the stable handle."""
+        try:
+            xpath_parts = []
+            for ph in phrases:
+                ph_lower = ph.lower()
+                xpath_parts.append(
+                    f"contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), \"{ph_lower}\")")
+            xpath = ("//button[" + " or ".join(xpath_parts) + "]"
+                     " | //a[" + " or ".join(xpath_parts) + "]"
+                     " | //span[" + " or ".join(xpath_parts) + "]/ancestor::button")
+            for el in browser.find_elements(By.XPATH, xpath):
+                if el.is_displayed():
+                    return el
+        except Exception:
+            pass
+        return None
+
+    def _guarded_click(el, spoken_name: str, retry_param: str):
+        """Risky-keyword recheck before ANY direct click (existing safety net)."""
+        try:
+            text = (el.text or el.get_attribute("aria-label") or spoken_name).strip()
+        except Exception:
+            text = spoken_name
+        if _risky_pattern.search(text):
+            def _do():
+                browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                el.click()
+            return {
+                "needs_click_confirmation": True,
+                "element_text": text[:80],
+                "_execute": _do,
+                "retry_parameter": retry_param,
+            }
+        try:
+            browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            el.click()
+            return {"success": True, "message": f"Clicked {spoken_name}."}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't click {spoken_name}: {e}"}
+
+    if action == "search":
+        if not parameter:
+            return {"success": False, "message": "Search needs a query."}
+        browser.get("https://www.flipkart.com/search?q=" + urllib.parse.quote(parameter))
+        try:
+            WebDriverWait(browser, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'div[data-id], a[href*="/p/"]')))
+        except Exception:
+            pass
+        _fk_close_login_popup()
+        time.sleep(0.5)
+        cards = _fk_collect_cards()
+        if not cards:
+            return {"success": False, "message": f"No Flipkart results found for {parameter}."}
+        top = "; ".join(c["label"][:60] for c in cards[:4])
+        return {"success": True, "message": f"Found {len(cards)} products for {parameter}. Top results: {top}. Say select first result, or name one."}
+
+    if "flipkart" not in current_url:
+        return {"success": False, "message": "Not a Flipkart tab. Search Flipkart first."}
+
+    if action in ("select result", "open result", "select product", "open product"):
+        _fk_close_login_popup()
+        cards = _fk_collect_cards()
+        if not cards:
+            return {"success": False, "message": "I don't see any products on this page. Try searching first."}
+        pick = _fk_pick(cards, parameter)
+        # Flipkart product links open new tabs by default; navigating directly
+        # keeps everything in Akira's tab so _akira_tab stays valid.
+        browser.get(pick["href"])
+        time.sleep(1.0)
+        _fk_close_login_popup()
+        return {"success": True, "message": f"Opened {pick['label'][:60]}."}
+
+    if action in ("select variant", "variant", "select option"):
+        # Category 2: reuse the generic click pipeline (with vision fallback)
+        if not parameter:
+            return {"success": False, "message": "Tell me which option, like size large."}
+        result = _handle_click(parameter)
+        if isinstance(result, dict):
+            return result
+        ok = not str(result).lower().startswith("couldn't")
+        return {"success": ok, "message": str(result)}
+
+    if action == "add to cart":
+        _fk_close_login_popup()
+        el = _fk_find_button_by_text(["add to cart"])
+        if not el:
+            return {"success": False, "message": "Couldn't find the Add to Cart button — are you on a product page? You may need to be logged in to Flipkart."}
+        result = _guarded_click(el, "Add to Cart", "add to cart")
+        if result.get("success"):
+            time.sleep(1.5)
+            return {"success": True, "message": "Added to cart."}
+        return result
+
+    if action in ("view cart", "cart", "open cart", "go to cart"):
+        browser.get("https://www.flipkart.com/viewcart")
+        time.sleep(1.0)
+        _fk_close_login_popup()
+        return {"success": True, "message": "Opened your Flipkart cart."}
+
+    if action in ("proceed to checkout", "checkout", "place order"):
+        # Flipkart's cart-page progression button is literally "Place Order".
+        # "place order" is in RISKY_KEYWORDS, so _guarded_click WILL return
+        # needs_confirmation — that is intended, not a bug. After the user
+        # confirms, this lands on login/address selection, still pre-payment.
+        _fk_close_login_popup()
+        el = _fk_find_button_by_text(["place order"])
+        if not el:
+            return {"success": False, "message": "Couldn't find the Place Order button — open the cart first. You may need to be logged in."}
+        return _guarded_click(el, "Place Order (this only moves to address selection, not payment)", "proceed to checkout")
+
+    if action in ("confirm address", "select address", "confirm delivery address", "deliver here"):
+        # PLACEHOLDER-UNVERIFIED: 'Deliver Here' is the button text seen in
+        # research on the address-selection step; needs a live capture of the
+        # Flipkart address page to confirm exact structure.
+        el = _fk_find_button_by_text(["deliver here", "deliver to this address"])
+        if not el:
+            return {"success": False, "message": "Couldn't find a Deliver Here button — the address page may look different. This is where I stop before payment."}
+        result = _guarded_click(el, "Deliver Here", "confirm address")
+        if result.get("success"):
+            return {"success": True, "message": "Address confirmed. Stopping here — the next screen is payment, which I won't touch."}
+        return result
+
+    return {"success": False, "message": f"Unknown flipkart_control action: {action}"}
+
+
 # ── System actions ────────────────────────────────────────────────────────────
 
 def _find_exe(name: str) -> str | None:
@@ -1975,6 +2470,8 @@ _ACTION_MAP = {
     "click":             _handle_click,
     "youtube_control":   youtube_control,
     "netflix_control":   lambda p: netflix_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
+    "amazon_control":    lambda p: amazon_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
+    "flipkart_control":  lambda p: flipkart_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
     "adjust_volume":     adjust_volume,
     "adjust_brightness": adjust_brightness,
     "screenshot":        lambda _: screenshot(),
