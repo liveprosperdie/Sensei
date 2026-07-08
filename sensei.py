@@ -295,7 +295,9 @@ def handle_response(response: dict) -> bool:
                 pending_action    = response["action"]
                 pending_parameter = response.get("parameter")
 
+    print("[v0] speaking response...")
     speak_and_wait(response.get("response", ""))
+    print("[v0] done speaking")
 
     if response.get("end_session"):
         flush_stream()
@@ -384,12 +386,17 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
     inject_context: True on the first command of a new session.
     """
     if not text:
+        print("[v0] empty transcription, staying alive")
         return True
 
     if inject_context:
+        print("[v0] building session context (browser)...")
         text = _build_session_context() + text
+        print("[v0] session context done")
 
+    print("[v0] calling LLM...")
     response = get_akira_response(text)
+    print("[v0] LLM returned")
     if response is None:
         return True  # confirmation was handled inline, stay alive
 
@@ -439,11 +446,15 @@ while True:
                 winsound.Beep(1000, 200)
                 last_activation_time = current_time
 
+                print("[v0] recording command...")
                 audio = record_command()
                 if audio is None:
+                    print("[v0] record returned None (too quiet), back to idle")
                     continue
 
+                print("[v0] transcribing...")
                 text = transcribe_command(audio)
+                print(f"[v0] heard: {text!r}")
                 session_active = _process_command(text, inject_context=True)
 
                 if session_active:
