@@ -465,11 +465,14 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
         '1st': 0, '2nd': 1, '3rd': 2, '4th': 3, '5th': 4,
         'top': 0, 'next': 1
     }
+    # Scope ordinals to content-like elements only — excludes page chrome
+    # (address bar, nav links, account menu) that caused wrong-element clicks.
+    ordinal_candidates = [el for el in filtered if el.get('role') in {'link', 'video', 'button'}]
     for word, offset in ordinals.items():
         if word in instruction_lower:
-            # Use filtered list for ordinals
-            if offset < len(filtered):
-                match = filtered[offset]
+            # Use ordinal_candidates list for ordinals
+            if offset < len(ordinal_candidates):
+                match = ordinal_candidates[offset]
                 print(f"[MATCH] ORDINAL index={match['index']}")
                 return match['index']
     
