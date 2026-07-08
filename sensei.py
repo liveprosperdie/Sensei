@@ -278,6 +278,9 @@ def handle_response(response: dict) -> bool:
             if isinstance(r, str) and r.startswith(FAILURE_PREFIXES):
                 response["response"] = r
                 break
+            if isinstance(r, dict) and r.get("success") is False:
+                response["response"] = r.get("message", "That didn't work.")
+                break
 
         # click confirmation discovered at runtime
         if pending_action == "click_confirmed" and run_results:
