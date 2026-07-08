@@ -16,7 +16,12 @@ load_dotenv()
 
 # ── Client ────────────────────────────────────────────────────────────────────
 
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+# timeout prevents silent multi-minute hangs (SDK default is ~10 min)
+client = anthropic.Anthropic(
+    api_key=os.environ.get("ANTHROPIC_API_KEY"),
+    timeout=30.0,
+    max_retries=1,
+)
 
 # ── Voice setup ───────────────────────────────────────────────────────────────
 
