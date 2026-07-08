@@ -1243,10 +1243,32 @@ def new_tab(parameter: str | None = None) -> str:
 
 
 def open_site_tab(parameter: str) -> str:
-    """Always opens the requested site in a NEW tab, separate from Akira's 
-    working tab and the user's existing tabs."""
+    """Opens the requested site in Akira's tab if it's still blank/unused,
+    otherwise in a NEW tab, separate from the user's existing tabs."""
     browser = get_browser(_last_browser_name)
     url = resolve_site_url(parameter.strip())
+
+    # Reuse Akira's blank working tab instead of creating a duplicate.
+    # _ensure_akira_tab eagerly creates an about:blank tab; if it's still
+    # unused, navigate it directly rather than opening yet another tab.
+    akira_tab = getattr(browser, "_akira_tab", None)
+    if akira_tab and akira_tab in browser.window_handles:
+        try:
+            original_handle = browser.current_window_handle
+        except Exception:
+            original_handle = None
+        try:
+            browser.switch_to.window(akira_tab)
+            current = browser.current_url or ""
+            if current in ("", "about:blank") or not browser.title:
+                browser.get(url)
+                return f"Opened {parameter} in a new tab."
+            # Akira tab has real content — restore focus, fall through to new tab
+            if original_handle and original_handle in browser.window_handles:
+                browser.switch_to.window(original_handle)
+        except Exception:
+            pass  # fall through to creating a genuinely new tab
+
     existing = set(browser.window_handles)
     browser.execute_cdp_cmd("Target.createTarget", {"url": url})
     for _ in range(10):
