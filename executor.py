@@ -865,132 +865,629 @@ def youtube_control(parameter: str) -> str:
 
 # ── Netflix control ───────────────────────────────────────────────────────────
 
+# Netflix's internal player API (stable since ~2017, used by every Netflix
+# extension). Gives direct play/pause/seek/volume/track control — far more
+# reliable than clicking UI buttons that Netflix hides and re-renders.
+_NFX_PLAYER_JS = """
+function __nfxPlayer() {
+    try {
+        var vp = netflix.appContext.state.playerApp.getAPI().videoPlayer;
+        var ids = vp.getAllPlayerSessionIds() || [];
+        var sid = null;
+        for (var i = 0; i < ids.length; i++) {
+            if (String(ids[i]).indexOf('watch') === 0) { sid = ids[i]; break; }
+        }
+        if (sid === null && ids.length > 0) sid = ids[0];
+        if (sid === null) return null;
+        return vp.getVideoPlayerBySessionId(sid);
+    } catch (e) { return null; }
+}
+"""
+
+
+def _nfx_js(browser, body: str, *args):
+    """Run JS on the Netflix tab with the __nfxPlayer() helper prepended."""
+    return browser.execute_script(_NFX_PLAYER_JS + body, *args)
+
+
+def _nfx_reveal_controls(browser):
+    """Netflix hides player chrome after inactivity; synthesize mouse movement
+    so control buttons exist in the DOM before we try to click them."""
+    try:
+        browser.execute_script("""
+            var t = document.querySelector('.watch-video') || document.body;
+            ['mousemove', 'mouseover'].forEach(function (ev) {
+                t.dispatchEvent(new MouseEvent(ev, {
+                    bubbles: true, cancelable: true,
+                    clientX: Math.floor(window.innerWidth / 2),
+                    clientY: Math.floor(window.innerHeight / 2)
+                }));
+            });
+        """)
+        time.sleep(0.5)
+    except Exception:
+        pass
+
+
+def _nfx_click_first(browser, selectors: list) -> str | None:
+    """Click the first VISIBLE element matching any selector in order.
+    Returns the selector that matched, or None."""
+    try:
+        return browser.execute_script("""
+            var sels = arguments[0];
+            for (var i = 0; i < sels.length; i++) {
+                var els = document.querySelectorAll(sels[i]);
+                for (var j = 0; j < els.length; j++) {
+                    if (els[j].offsetParent !== null) { els[j].click(); return sels[i]; }
+                }
+            }
+            return null;
+        """, selectors)
+    except Exception:
+        return None
+
+
+def _nfx_press_key(browser, key: str) -> bool:
+    """Send a real keyboard shortcut to the page (Netflix player supports:
+    space=play/pause, f=fullscreen, esc=exit, m=mute, s=skip intro,
+    left/right arrows=seek 10s, up/down=volume)."""
+    try:
+        browser.find_element(By.TAG_NAME, "body").send_keys(key)
+        return True
+    except Exception:
+        return False
+
+
+def _nfx_parse_seconds(text: str) -> int | None:
+    """Parse '90', '1:30', '1:02:03', '45 minutes', '1 hour' into seconds."""
+    if not text:
+        return None
+    t = text.strip().lower()
+    if ":" in t:
+        try:
+            parts = [int(p) for p in t.split(":")]
+            secs = 0
+            for p in parts:
+                secs = secs * 60 + p
+            return secs
+        except ValueError:
+            return None
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*(hour|hr|h|minute|min|m|second|sec|s)?", t)
+    if not m:
+        return None
+    val = float(m.group(1))
+    unit = m.group(2) or "s"
+    if unit in ("hour", "hr", "h"):
+        return int(val * 3600)
+    if unit in ("minute", "min", "m"):
+        return int(val * 60)
+    return int(val)
+
+
+def _nfx_collect_cards(browser) -> list:
+    """Collect title cards from search/browse pages as [{label, id}].
+    Netflix wraps every result in .title-card with an <a> whose href
+    contains /watch/<id>, ?jbv=<id>, or /title/<id>."""
+    try:
+        return browser.execute_script(r"""
+            var seen = {};
+            var out = [];
+            var links = document.querySelectorAll(
+                '.title-card a[href], [data-uia*="title-card"] a[href]');
+            if (links.length === 0) {
+                links = document.querySelectorAll(
+                    'a[href*="/watch/"], a[href*="jbv="], a[href*="/title/"]');
+            }
+            for (var i = 0; i < links.length; i++) {
+                var href = links[i].getAttribute('href') || '';
+                var m = href.match(/\/watch\/(\d+)/) ||
+                        href.match(/[?&]jbv=(\d+)/) ||
+                        href.match(/\/title\/(\d+)/);
+                if (!m) continue;
+                if (seen[m[1]]) continue;
+                seen[m[1]] = true;
+                var label = links[i].getAttribute('aria-label') ||
+                            (links[i].textContent || '').trim();
+                if (!label) {
+                    var img = links[i].querySelector('img[alt]');
+                    if (img) label = img.getAttribute('alt');
+                }
+                out.push({ label: label || ('Title ' + m[1]), id: m[1] });
+            }
+            return out;
+        """) or []
+    except Exception:
+        return []
+
+
+def _nfx_pick_card(cards: list, parameter: str | None):
+    """Pick a card by ordinal ('first', '2') or fuzzy name match. Defaults to first."""
+    if not cards:
+        return None
+    if not parameter:
+        return cards[0]
+    p = parameter.strip().lower()
+    ordinals = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2,
+                "fourth": 3, "4th": 3, "fifth": 4, "5th": 4}
+    if p in ordinals:
+        idx = ordinals[p]
+        return cards[idx] if idx < len(cards) else cards[0]
+    if p.isdigit():
+        idx = int(p) - 1
+        return cards[idx] if 0 <= idx < len(cards) else cards[0]
+    # fuzzy name match: substring first, then token overlap
+    for c in cards:
+        if p in (c.get("label") or "").lower():
+            return c
+    p_tokens = set(p.split())
+    best, best_score = None, 0
+    for c in cards:
+        score = len(p_tokens & set((c.get("label") or "").lower().split()))
+        if score > best_score:
+            best, best_score = c, score
+    return best or cards[0]
+
+
+def _nfx_menu_select(browser, opener_selectors: list, item_prefixes: list, parameter: str) -> dict:
+    """Open a player overlay menu and click the item whose data-uia or text
+    matches `parameter`. Uses stable data-uia attributes (e.g.
+    subtitle-item-English, audio-item)."""
+    _nfx_reveal_controls(browser)
+    opened = _nfx_click_first(browser, opener_selectors)
+    if not opened:
+        return {"success": False, "message": "Couldn't open the menu — make sure a video is playing."}
+    time.sleep(0.8)  # overlay render
+    try:
+        result = browser.execute_script("""
+            var prefixes = arguments[0];
+            var want = String(arguments[1]).toLowerCase();
+            var available = [];
+            for (var k = 0; k < prefixes.length; k++) {
+                var items = document.querySelectorAll('[data-uia^="' + prefixes[k] + '"]');
+                for (var i = 0; i < items.length; i++) {
+                    var uia = (items[i].getAttribute('data-uia') || '').toLowerCase();
+                    var txt = (items[i].textContent || '').trim();
+                    available.push(txt);
+                    if (uia.indexOf(want) !== -1 || txt.toLowerCase().indexOf(want) !== -1) {
+                        items[i].click();
+                        return { ok: true, name: txt };
+                    }
+                }
+            }
+            return { ok: false, names: available };
+        """, item_prefixes, parameter)
+    except Exception as e:
+        result = {"ok": False, "err": str(e)}
+    # Close the overlay either way by nudging the mouse away
+    try:
+        browser.execute_script("""
+            document.body.dispatchEvent(new MouseEvent('mousemove',
+                { bubbles: true, clientX: 5, clientY: 5 }));
+        """)
+    except Exception:
+        pass
+    if result and result.get("ok"):
+        return {"success": True, "message": f"Selected {result.get('name') or parameter}."}
+    names = ", ".join((result or {}).get("names", [])[:8])
+    extra = f" Available options: {names}." if names else ""
+    return {"success": False, "message": f"Couldn't find '{parameter}' in the menu.{extra}"}
+
+
 def netflix_control(action: str, parameter: str | None = None) -> dict:
     """
-    Handle all Netflix player interactions using three dispatch patterns:
-    1. SIMPLE_ACTIONS: direct button clicks
-    2. MENU_ACTIONS: open overlay, then select item (requires parameter)
-    3. SLIDER_ACTIONS: set video property directly (requires parameter)
-    
-    Returns dict with 'success' (bool) and optional 'message' (str).
-    
-    WARNING: menu_actions selectors are UNVERIFIED PLACEHOLDERS pending live inspection.
-    The following need verification on actual Netflix UI:
-    - Episodes overlay trigger button aria-label
-    - Audio & Subtitles button aria-label
-    - data-uia or class structure of menu items inside overlays
+    Complete Netflix automation. Dispatch groups:
+
+    BROWSE/SEARCH (any Netflix page):
+      search|query            -> go to search results, report top titles
+      play_result|first/name  -> play a search/home result by ordinal or name
+      play_title|name         -> search a title and play the best match
+      open_title|name         -> open the title's detail page without playing
+
+    PLAYER (watch page, via Netflix's internal player API):
+      play, pause, mute, unmute
+      volume|0.7 / volume|up / volume|down
+      seek|1:02:03 (absolute) — also '45 minutes', '3600'
+      skip forward|30 / skip back|30 (default 10s)
+      playback speed|1.5
+      now playing              -> reports title + timestamp
+
+    PLAYER UI (stable data-uia selectors + keyboard fallbacks):
+      fullscreen, exit fullscreen, next episode, skip intro
+      subtitle|English / subtitle|off
+      audio|English
+      episodes|Episode 5
+      back to browse
+
+    Returns {'success': bool, 'message': str}.
     """
     print(f"[netflix_control] called with action={action!r}, parameter={parameter!r}")
     browser = get_browser(_last_browser_name)
-    
-    browser.switch_to.window(browser._akira_tab)
+
+    try:
+        browser.switch_to.window(browser._akira_tab)
+    except Exception:
+        return {"success": False, "message": "Lost track of my working tab."}
     try:
         WebDriverWait(browser, 8).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     except Exception:
         pass
-    
-    # 0. Guard-rail: confirm current tab is Netflix before doing anything
+
     try:
         current_url = browser.current_url or ""
     except Exception:
         return {"success": False, "message": "Could not read current URL"}
-    
+
+    action = (action or "").strip().lower().replace("_", " ")
+    on_watch_page = "/watch/" in current_url
+
+    # ── BROWSE / SEARCH actions (navigate, so they work from any page) ──────
+    if action == "search":
+        if not parameter:
+            return {"success": False, "message": "Search needs a query."}
+        browser.get("https://www.netflix.com/search?q=" + urllib.parse.quote(parameter))
+        try:
+            WebDriverWait(browser, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".title-card, [data-uia*='title-card']")))
+        except Exception:
+            pass
+        time.sleep(0.5)
+        cards = _nfx_collect_cards(browser)
+        if not cards:
+            return {"success": False, "message": f"No results found for {parameter}."}
+        top = ", ".join(c["label"] for c in cards[:5])
+        return {"success": True, "message": f"Found {len(cards)} results for {parameter}. Top results: {top}. Say play first result, or name one."}
+
+    if action in ("play result", "open result", "click result"):
+        if "netflix.com" not in current_url:
+            return {"success": False, "message": "Not a Netflix tab. Switch to Netflix first."}
+        cards = _nfx_collect_cards(browser)
+        if not cards:
+            return {"success": False, "message": "I don't see any titles on this page. Try searching first."}
+        pick = _nfx_pick_card(cards, parameter)
+        if action == "open result":
+            browser.get(f"https://www.netflix.com/title/{pick['id']}")
+            return {"success": True, "message": f"Opened {pick['label']}."}
+        browser.get(f"https://www.netflix.com/watch/{pick['id']}")
+        try:
+            WebDriverWait(browser, 12).until(
+                EC.presence_of_element_located((By.TAG_NAME, "video")))
+        except Exception:
+            pass
+        return {"success": True, "message": f"Playing {pick['label']}."}
+
+    if action in ("play title", "open title") or (action == "play" and parameter):
+        name = parameter
+        if not name:
+            return {"success": False, "message": "Tell me what title to play."}
+        browser.get("https://www.netflix.com/search?q=" + urllib.parse.quote(name))
+        try:
+            WebDriverWait(browser, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".title-card, [data-uia*='title-card']")))
+        except Exception:
+            pass
+        time.sleep(0.5)
+        cards = _nfx_collect_cards(browser)
+        if not cards:
+            return {"success": False, "message": f"Couldn't find {name} on Netflix."}
+        pick = _nfx_pick_card(cards, name)
+        if action == "open title":
+            browser.get(f"https://www.netflix.com/title/{pick['id']}")
+            return {"success": True, "message": f"Opened {pick['label']}."}
+        browser.get(f"https://www.netflix.com/watch/{pick['id']}")
+        try:
+            WebDriverWait(browser, 12).until(
+                EC.presence_of_element_located((By.TAG_NAME, "video")))
+        except Exception:
+            pass
+        return {"success": True, "message": f"Playing {pick['label']}."}
+
+    # Everything below requires an actual Netflix tab
     if "netflix.com" not in current_url:
         return {"success": False, "message": "Not a Netflix tab. Switch to Netflix first."}
 
-    # 1. SIMPLE_ACTIONS: direct click, no menu needed
-    simple_actions = {
-        "play": 'button[aria-label="Play"]',
-        "pause": 'button[aria-label="Pause"]',
-        "fullscreen": 'button[aria-label="Full screen"]',
-        "exit fullscreen": 'button[aria-label="Exit full screen"]',
-        "next episode": 'button[aria-label="Next Episode"]',
-        "skip back": 'button[aria-label="Seek Back"]',
-        "skip forward": 'button[aria-label="Seek Forward"]',
-        "mute": 'button[aria-label="Volume"]',
-    }
-    
-    if action in simple_actions:
-        clicked = browser.execute_script("""
-            var el = document.querySelector(arguments[0]);
-            if (el) { el.click(); return true; }
+    # ── PLAYER actions via internal API ─────────────────────────────────────
+    if action in ("play", "pause", "resume"):
+        op = "pause" if action == "pause" else "play"
+        ok = _nfx_js(browser, """
+            var p = __nfxPlayer();
+            if (!p) return false;
+            if (arguments[0] === 'pause') p.pause(); else p.play();
+            return true;
+        """, op)
+        if ok:
+            return {"success": True, "message": f"{'Paused' if op == 'pause' else 'Playing'}."}
+        # keyboard fallback (space toggles play/pause on the watch page)
+        if on_watch_page and _nfx_press_key(browser, " "):
+            return {"success": True, "message": f"Toggled playback."}
+        return {"success": False, "message": "No video is playing right now."}
+
+    if action in ("mute", "unmute"):
+        ok = _nfx_js(browser, """
+            var p = __nfxPlayer();
+            if (p && p.setMuted) { p.setMuted(arguments[0]); return true; }
+            var v = document.querySelector('video');
+            if (v) { v.muted = arguments[0]; return true; }
             return false;
-        """, simple_actions[action])
-        return {"success": clicked, "message": f"Executed {action}." if clicked else f"Couldn't find {action} button — selector may be wrong or page not loaded."}
+        """, action == "mute")
+        return {"success": bool(ok), "message": f"{'Muted' if action == 'mute' else 'Unmuted'}." if ok else "No video found to mute."}
 
-    # 2. MENU_ACTIONS: click icon to open overlay, then click item inside it
-    # UNVERIFIED PLACEHOLDERS - these selectors need live inspection before shipping
-    menu_actions = {
-        "episodes": {
-            "open_selector": 'button[aria-label="More Episodes"]',  # PLACEHOLDER - verify exact label
-            "item_selector_template": '//div[contains(text(), "{parameter}")]',  # PLACEHOLDER xpath
-        },
-        "subtitle": {
-            "open_selector": 'button[aria-label="Audio & Subtitles"]',  # PLACEHOLDER - verify
-            "item_selector_template": '//div[@data-uia="subtitle-item" and contains(., "{parameter}")]',  # PLACEHOLDER
-        },
-        "audio": {
-            "open_selector": 'button[aria-label="Audio & Subtitles"]',  # PLACEHOLDER - verify
-            "item_selector_template": '//div[@data-uia="audio-item" and contains(., "{parameter}")]',  # PLACEHOLDER
-        },
-    }
-    
-    if action in menu_actions:
-        if not parameter:
-            return {"success": False, "message": f"{action} requires a parameter (item name to select)"}
-        
-        cfg = menu_actions[action]
-        try:
-            # Open the overlay menu
-            browser.execute_script("""
-                var el = document.querySelector(arguments[0]);
-                if (el) { el.click(); return true; }
-                return false;
-            """, cfg["open_selector"])
-            
-            time.sleep(0.4)  # Wait for overlay to render
-            
-            # Find and click the item (using XPath with parameter injected into Python string, NOT JS)
-            item_xpath = cfg["item_selector_template"].format(parameter=parameter)
-            items = browser.find_elements(By.XPATH, item_xpath)
-            
-            if items:
-                items[0].click()
-                return {"success": True, "message": f"Selected {parameter} in {action}."}
-            
-            return {"success": False, "message": f"Item '{parameter}' not found in {action} menu"}
-        
-        except Exception as e:
-            return {"success": False, "message": f"Failed to {action}: {e}"}
-
-    # 3. SLIDER_ACTIONS: set value directly via JS property, no click/drag simulation
     if action == "volume":
         if parameter is None:
-            return {"success": False, "message": "volume requires a parameter (0.0-1.0)"}
+            return {"success": False, "message": "Volume needs a value (0-1, a percent, or up/down)."}
+        p = parameter.strip().lower().rstrip("%")
         try:
-            val = max(0.0, min(1.0, float(parameter)))
-            browser.execute_script("""
+            if p in ("up", "down"):
+                delta = 0.1 if p == "up" else -0.1
+                ok = _nfx_js(browser, """
+                    var p = __nfxPlayer();
+                    if (p && p.getVolume && p.setVolume) {
+                        var v = Math.max(0, Math.min(1, p.getVolume() + arguments[0]));
+                        p.setVolume(v); return v;
+                    }
+                    var vid = document.querySelector('video');
+                    if (vid) {
+                        vid.volume = Math.max(0, Math.min(1, vid.volume + arguments[0]));
+                        return vid.volume;
+                    }
+                    return null;
+                """, delta)
+                if ok is not None:
+                    return {"success": True, "message": f"Volume {p} to {int(float(ok) * 100)} percent."}
+                return {"success": False, "message": "No video found."}
+            val = float(p)
+            if val > 1:  # spoken as percent
+                val = val / 100.0
+            val = max(0.0, min(1.0, val))
+            ok = _nfx_js(browser, """
+                var p = __nfxPlayer();
+                if (p && p.setVolume) { p.setVolume(arguments[0]); return true; }
                 var v = document.querySelector('video');
                 if (v) { v.volume = arguments[0]; return true; }
                 return false;
             """, val)
-            return {"success": True, "message": f"Set volume to {val}."}
-        except (ValueError, Exception) as e:
-            return {"success": False, "message": f"Failed to set volume: {e}"}
-    
-    if action == "playback speed":
+            return {"success": bool(ok), "message": f"Volume set to {int(val * 100)} percent." if ok else "No video found."}
+        except ValueError:
+            return {"success": False, "message": f"Couldn't parse volume '{parameter}'."}
+
+    if action in ("seek", "seek to", "jump to", "go to"):
+        secs = _nfx_parse_seconds(parameter or "")
+        if secs is None:
+            return {"success": False, "message": "Tell me a time to jump to, like 45 minutes or 1:20:00."}
+        ok = _nfx_js(browser, """
+            var p = __nfxPlayer();
+            if (!p || !p.seek) return false;
+            var dur = p.getDuration ? p.getDuration() : null;
+            var ms = arguments[0] * 1000;
+            if (dur && ms > dur) ms = dur - 5000;
+            p.seek(ms);
+            return true;
+        """, secs)
+        mins, s = divmod(secs, 60)
+        h, m = divmod(mins, 60)
+        stamp = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+        return {"success": bool(ok), "message": f"Jumped to {stamp}." if ok else "No video is playing to seek in."}
+
+    if action in ("skip forward", "skip back", "skip backward", "rewind", "forward"):
+        n = _nfx_parse_seconds(parameter or "") or 10
+        back = action in ("skip back", "skip backward", "rewind")
+        ok = _nfx_js(browser, """
+            var p = __nfxPlayer();
+            if (!p || !p.seek || !p.getCurrentTime) return false;
+            var cur = p.getCurrentTime();
+            var dur = p.getDuration ? p.getDuration() : null;
+            var target = cur + (arguments[0] * 1000 * (arguments[1] ? -1 : 1));
+            if (target < 0) target = 0;
+            if (dur && target > dur) target = dur - 5000;
+            p.seek(target);
+            return true;
+        """, n, back)
+        return {"success": bool(ok), "message": f"Skipped {'back' if back else 'forward'} {n} seconds." if ok else "No video is playing."}
+
+    if action in ("playback speed", "speed"):
         if parameter is None:
-            return {"success": False, "message": "playback speed requires a parameter (e.g. 1.5)"}
+            return {"success": False, "message": "Playback speed needs a value like 1.5."}
         try:
-            val = float(parameter)
-            browser.execute_script("""
+            val = float(parameter.strip().lower().rstrip("x"))
+            ok = browser.execute_script("""
                 var v = document.querySelector('video');
                 if (v) { v.playbackRate = arguments[0]; return true; }
                 return false;
             """, val)
-            return {"success": True, "message": f"Set playback speed to {val}x."}
-        except (ValueError, Exception) as e:
-            return {"success": False, "message": f"Failed to set playback speed: {e}"}
+            return {"success": bool(ok), "message": f"Playback speed set to {val}x." if ok else "No video found."}
+        except ValueError:
+            return {"success": False, "message": f"Couldn't parse speed '{parameter}'."}
+
+    if action in ("now playing", "info", "status", "what's playing"):
+        info = _nfx_js(browser, """
+            var p = __nfxPlayer();
+            var titleEl = document.querySelector('[data-uia="video-title"]');
+            var title = titleEl ? titleEl.textContent.trim() : null;
+            if (!p) return { title: title };
+            return {
+                title: title,
+                cur: p.getCurrentTime ? Math.floor(p.getCurrentTime() / 1000) : null,
+                dur: p.getDuration ? Math.floor(p.getDuration() / 1000) : null,
+                paused: p.isPaused ? p.isPaused() : null
+            };
+        """)
+        if not info or (not info.get("title") and info.get("cur") is None):
+            return {"success": False, "message": "Nothing seems to be playing."}
+        parts = []
+        if info.get("title"):
+            parts.append(f"Playing {info['title']}")
+        if info.get("cur") is not None and info.get("dur"):
+            cm, cs = divmod(info["cur"], 60)
+            dm, ds = divmod(info["dur"], 60)
+            parts.append(f"at {cm}:{cs:02d} of {dm}:{ds:02d}")
+        if info.get("paused"):
+            parts.append("(paused)")
+        return {"success": True, "message": " ".join(parts) + "."}
+
+    # ── PLAYER UI actions (stable data-uia selectors + keyboard fallback) ───
+    if action == "fullscreen":
+        _nfx_reveal_controls(browser)
+        if _nfx_click_first(browser, [
+            '[data-uia="control-fullscreen-enter"]',
+            'button[aria-label="Full screen"]',
+            'button[aria-label="Fullscreen"]',
+        ]):
+            return {"success": True, "message": "Fullscreen on."}
+        # F key is Netflix's fullscreen shortcut and carries user activation
+        if _nfx_press_key(browser, "f"):
+            return {"success": True, "message": "Fullscreen on."}
+        return {"success": False, "message": "Couldn't enter fullscreen."}
+
+    if action == "exit fullscreen":
+        _nfx_reveal_controls(browser)
+        if _nfx_click_first(browser, [
+            '[data-uia="control-fullscreen-exit"]',
+            'button[aria-label="Exit full screen"]',
+        ]):
+            return {"success": True, "message": "Exited fullscreen."}
+        if _nfx_press_key(browser, "\ue00c"):  # ESC
+            return {"success": True, "message": "Exited fullscreen."}
+        return {"success": False, "message": "Couldn't exit fullscreen."}
+
+    if action == "next episode":
+        _nfx_reveal_controls(browser)
+        if _nfx_click_first(browser, [
+            '[data-uia="control-next"]',
+            '[data-uia="next-episode-seamless-button"]',
+            '[data-uia="next-episode-seamless-button-draining"]',
+            'button[aria-label="Next Episode"]',
+        ]):
+            return {"success": True, "message": "Next episode."}
+        return {"success": False, "message": "No next-episode button — this might be a movie."}
+
+    if action in ("skip intro", "skip recap", "skip credits"):
+        _nfx_reveal_controls(browser)
+        if _nfx_click_first(browser, [
+            '[data-uia="player-skip-intro"]',
+            '[data-uia="player-skip-recap"]',
+            '.watch-video--skip-content-button',
+            '.watch-video--skip-preplay-button',
+            'button[data-uia^="player-skip"]',
+        ]):
+            return {"success": True, "message": "Skipped."}
+        # S is Netflix's skip-intro shortcut
+        if _nfx_press_key(browser, "s"):
+            return {"success": True, "message": "Skipped."}
+        return {"success": False, "message": "Nothing to skip right now."}
+
+    if action == "back to browse":
+        if _nfx_click_first(browser, [
+            '[data-uia="control-nav-back"]',
+            'button[aria-label="Back to Browse"]',
+        ]):
+            return {"success": True, "message": "Back to browsing."}
+        browser.get("https://www.netflix.com/browse")
+        return {"success": True, "message": "Back to browsing."}
+
+    if action in ("subtitle", "subtitles", "captions"):
+        if not parameter:
+            return {"success": False, "message": "Tell me which subtitles, like English, or off."}
+        # Preferred: internal API — no menus, works even in fullscreen
+        result = _nfx_js(browser, """
+            var p = __nfxPlayer();
+            if (!p || !p.getTextTrackList) return { ok: false, err: 'noplayer' };
+            var want = String(arguments[0]).toLowerCase();
+            var list = p.getTextTrackList() || [];
+            var names = [];
+            for (var i = 0; i < list.length; i++) {
+                var n = String(list[i].displayName || '');
+                names.push(n);
+                if (n.toLowerCase().indexOf(want) !== -1) {
+                    p.setTextTrack(list[i]);
+                    return { ok: true, name: n };
+                }
+            }
+            return { ok: false, err: 'nomatch', names: names };
+        """, parameter)
+        if result and result.get("ok"):
+            return {"success": True, "message": f"Subtitles set to {result['name']}."}
+        if result and result.get("err") == "nomatch":
+            names = ", ".join(result.get("names", [])[:8])
+            return {"success": False, "message": f"No '{parameter}' subtitles. Available: {names}."}
+        # Fallback: overlay menu with stable data-uia items (subtitle-item-English etc.)
+        return _nfx_menu_select(
+            browser,
+            ['[data-uia="control-audio-subtitle"]', 'button[aria-label="Audio & Subtitles"]'],
+            ["subtitle-item"],
+            parameter,
+        )
+
+    if action == "audio":
+        if not parameter:
+            return {"success": False, "message": "Tell me which audio track, like English or Hindi."}
+        result = _nfx_js(browser, """
+            var p = __nfxPlayer();
+            if (!p || !p.getAudioTrackList) return { ok: false, err: 'noplayer' };
+            var want = String(arguments[0]).toLowerCase();
+            var list = p.getAudioTrackList() || [];
+            var names = [];
+            for (var i = 0; i < list.length; i++) {
+                var n = String(list[i].displayName || '');
+                names.push(n);
+                if (n.toLowerCase().indexOf(want) !== -1) {
+                    p.setAudioTrack(list[i]);
+                    return { ok: true, name: n };
+                }
+            }
+            return { ok: false, err: 'nomatch', names: names };
+        """, parameter)
+        if result and result.get("ok"):
+            return {"success": True, "message": f"Audio set to {result['name']}."}
+        if result and result.get("err") == "nomatch":
+            names = ", ".join(result.get("names", [])[:8])
+            return {"success": False, "message": f"No '{parameter}' audio. Available: {names}."}
+        return _nfx_menu_select(
+            browser,
+            ['[data-uia="control-audio-subtitle"]', 'button[aria-label="Audio & Subtitles"]'],
+            ["audio-item"],
+            parameter,
+        )
+
+    if action == "episodes":
+        if not parameter:
+            return {"success": False, "message": "Tell me which episode, like Episode 5."}
+        _nfx_reveal_controls(browser)
+        opened = _nfx_click_first(browser, [
+            '[data-uia="control-episodes"]',
+            'button[aria-label="Episodes"]',
+        ])
+        if not opened:
+            return {"success": False, "message": "Couldn't open the episodes menu — this might be a movie."}
+        time.sleep(0.9)
+        try:
+            result = browser.execute_script("""
+                var want = String(arguments[0]).toLowerCase();
+                // Episode entries live inside the episodes overlay; match by
+                // number ('episode 5' / '5.') or by title text.
+                var num = (want.match(/\\d+/) || [null])[0];
+                var candidates = document.querySelectorAll(
+                    '[data-uia^="episode"], .episode-item, [class*="episodeSelector"] li, [class*="episode"] [role="button"]');
+                var texts = [];
+                for (var i = 0; i < candidates.length; i++) {
+                    var el = candidates[i];
+                    if (el.offsetParent === null) continue;
+                    var txt = (el.textContent || '').trim();
+                    texts.push(txt.slice(0, 40));
+                    var low = txt.toLowerCase();
+                    if (low.indexOf(want) !== -1 ||
+                        (num && (low.indexOf('episode ' + num) !== -1 ||
+                                 low.indexOf(num + '.') === 0 ||
+                                 low.indexOf('e' + num) === 0))) {
+                        el.click();
+                        return { ok: true, name: txt.slice(0, 60) };
+                    }
+                }
+                return { ok: false, names: texts };
+            """, parameter)
+        except Exception as e:
+            result = {"ok": False, "err": str(e)}
+        if result and result.get("ok"):
+            return {"success": True, "message": f"Playing {result['name']}."}
+        return {"success": False, "message": f"Couldn't find '{parameter}' in the episodes list."}
 
     return {"success": False, "message": f"Unknown netflix_control action: {action}"}
 
