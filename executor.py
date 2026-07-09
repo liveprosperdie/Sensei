@@ -2107,16 +2107,53 @@ def github_control(action: str, parameter: str | None = None) -> dict:
             return {"success": False, "message": f"Couldn't fetch the readme: {e}"}
 
     if action == "clone repo":
-        # Interpreted as "give me the clone URL on the clipboard" — NOT a local
-        # git clone (no git operations in scope). Windows clip.exe, no deps.
+        # REAL git clone into Documents\GitHub Clones (default, spoken aloud).
+        # Optional parameter overrides the destination: "clone repo|D:\code".
+        # PAT auth for private repos goes through an env var + credential
+        # helper so the token NEVER lands in .git/config or process lists.
+        if not repo and parameter and "/" in (parameter or "") and "\\" not in parameter:
+            repo = parameter.strip()
+            parameter = None
         if not repo:
-            return {"success": False, "message": "Open a repo first."}
-        url = f"https://github.com/{repo}.git"
+            return {"success": False, "message": "Open a repo first, or say the full owner/name."}
+        if shutil.which("git") is None:
+            return {"success": False, "message": "Git isn't installed or isn't on your PATH, so I can't clone. Install Git for Windows first."}
+        base_dir = (parameter.strip() if parameter and parameter.strip()
+                    else os.path.join(os.path.expanduser("~"), "Documents", "GitHub Clones"))
+        dest = os.path.join(base_dir, repo.split("/")[1])
+        if os.path.isdir(dest) and os.listdir(dest):
+            return {"success": False, "message": f"{repo.split('/')[1]} already exists in {base_dir} — it looks like you've cloned it before."}
         try:
-            subprocess.run("clip", input=url.encode(), check=True, shell=True)
-            return {"success": True, "message": f"Clone URL for {repo} copied to your clipboard."}
-        except Exception:
-            return {"success": True, "message": f"The clone URL is {url}"}
+            os.makedirs(base_dir, exist_ok=True)
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't create the folder {base_dir}: {e}"}
+        url = f"https://github.com/{repo}.git"
+        env = os.environ.copy()
+        cmd = ["git", "clone", "--", url, dest]
+        if _gh_token():
+            # credential helper reads the PAT from env — keeps it out of the
+            # remote URL, .git/config, and the visible command line
+            env["GIT_ASKPASS_TOKEN"] = _gh_token()
+            cmd = ["git",
+                   "-c", 'credential.helper=!f() { echo "username=x-access-token"; echo "password=$GIT_ASKPASS_TOKEN"; }; f',
+                   "clone", "--", url, dest]
+        else:
+            env["GIT_TERMINAL_PROMPT"] = "0"  # fail fast instead of hanging on a prompt
+        try:
+            proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return {"success": False, "message": f"Cloning {repo} timed out after five minutes — it may be a huge repo or a slow connection."}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't run git: {e}"}
+        if proc.returncode == 0:
+            return {"success": True, "message": f"Cloned {repo} into {dest}."}
+        err = (proc.stderr or "").strip().splitlines()
+        err_line = err[-1] if err else "unknown git error"
+        if "Authentication failed" in str(proc.stderr) or "could not read" in str(proc.stderr):
+            return {"success": False, "message": f"Git couldn't authenticate for {repo} — if it's private, check that your GITHUB_TOKEN has repo scope."}
+        if "already exists" in str(proc.stderr):
+            return {"success": False, "message": f"{repo.split('/')[1]} already exists in {base_dir}."}
+        return {"success": False, "message": f"Clone failed: {err_line[:120]}"}
 
     # ── Tier A: writes via DOM (logged-in session) or PAT if available ──────
     if action in ("star repo", "unstar repo"):
