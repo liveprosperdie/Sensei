@@ -1000,8 +1000,9 @@ def _nfx_collect_cards(browser) -> list:
         return []
 
 
-def _nfx_pick_card(cards: list, parameter: str | None):
-    """Pick a card by ordinal ('first', '2') or fuzzy name match. Defaults to first."""
+def _pick_card(cards: list, parameter: str | None):
+    """Shared picker for Netflix/Amazon/Flipkart result cards.
+    Picks by ordinal ('first', '2') or fuzzy name match. Defaults to first."""
     if not cards:
         return None
     if not parameter:
@@ -1026,6 +1027,34 @@ def _nfx_pick_card(cards: list, parameter: str | None):
         if score > best_score:
             best, best_score = c, score
     return best or cards[0]
+
+
+def _shop_guarded_click(browser, el, spoken_name: str, retry_param: str,
+                        pre_confirmed: bool = False) -> dict:
+    """Shared risky-keyword recheck before any direct shopping click.
+    pre_confirmed=True skips the recheck — used ONLY by checkout/address
+    branches, which sensei.py's safety net ALWAYS gates behind a spoken yes."""
+    try:
+        text = (el.text or el.get_attribute("value") or
+                el.get_attribute("aria-label") or spoken_name).strip()
+    except Exception:
+        text = spoken_name
+    if not pre_confirmed and _risky_pattern.search(text):
+        def _do():
+            browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+            el.click()
+        return {
+            "needs_click_confirmation": True,
+            "element_text": text[:80],
+            "_execute": _do,
+            "retry_parameter": retry_param,
+        }
+    try:
+        browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        el.click()
+        return {"success": True, "message": f"Clicked {spoken_name}."}
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't click {spoken_name}: {e}"}
 
 
 def _nfx_menu_select(browser, opener_selectors: list, item_prefixes: list, parameter: str) -> dict:
@@ -1143,7 +1172,7 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
         cards = _nfx_collect_cards(browser)
         if not cards:
             return {"success": False, "message": "I don't see any titles on this page. Try searching first."}
-        pick = _nfx_pick_card(cards, parameter)
+        pick = _pick_card(cards, parameter)
         if action == "open result":
             browser.get(f"https://www.netflix.com/title/{pick['id']}")
             return {"success": True, "message": f"Opened {pick['label']}."}
@@ -1169,7 +1198,7 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
         cards = _nfx_collect_cards(browser)
         if not cards:
             return {"success": False, "message": f"Couldn't find {name} on Netflix."}
-        pick = _nfx_pick_card(cards, name)
+        pick = _pick_card(cards, name)
         if action == "open title":
             browser.get(f"https://www.netflix.com/title/{pick['id']}")
             return {"success": True, "message": f"Opened {pick['label']}."}
@@ -1554,31 +1583,6 @@ def amazon_control(action: str, parameter: str | None = None) -> dict:
         except Exception:
             return []
 
-    def _amz_pick(cards: list, param: str | None):
-        if not cards:
-            return None
-        if not param:
-            return cards[0]
-        p = param.strip().lower()
-        ordinals = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2,
-                    "fourth": 3, "4th": 3, "fifth": 4, "5th": 4}
-        if p in ordinals:
-            i = ordinals[p]
-            return cards[i] if i < len(cards) else cards[0]
-        if p.isdigit():
-            i = int(p) - 1
-            return cards[i] if 0 <= i < len(cards) else cards[0]
-        for c in cards:
-            if p in c["label"].lower():
-                return c
-        p_tokens = set(p.split())
-        best, best_score = None, 0
-        for c in cards:
-            score = len(p_tokens & set(c["label"].lower().split()))
-            if score > best_score:
-                best, best_score = c, score
-        return best or cards[0]
-
     def _amz_find_visible(selectors: list):
         """Return the first visible Selenium element matching any CSS selector."""
         for sel in selectors:
@@ -1591,31 +1595,7 @@ def amazon_control(action: str, parameter: str | None = None) -> dict:
         return None
 
     def _guarded_click(el, spoken_name: str, retry_param: str, pre_confirmed: bool = False):
-        """Risky-keyword recheck before ANY direct click (existing safety net).
-        pre_confirmed=True skips the recheck — used ONLY by checkout/address
-        branches, which sensei.py's safety net ALWAYS gates behind a spoken
-        yes before this code can run (avoids double confirmation)."""
-        try:
-            text = (el.text or el.get_attribute("value") or
-                    el.get_attribute("aria-label") or spoken_name).strip()
-        except Exception:
-            text = spoken_name
-        if not pre_confirmed and _risky_pattern.search(text):
-            def _do():
-                browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                el.click()
-            return {
-                "needs_click_confirmation": True,
-                "element_text": text[:80],
-                "_execute": _do,
-                "retry_parameter": retry_param,
-            }
-        try:
-            browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            el.click()
-            return {"success": True, "message": f"Clicked {spoken_name}."}
-        except Exception as e:
-            return {"success": False, "message": f"Couldn't click {spoken_name}: {e}"}
+        return _shop_guarded_click(browser, el, spoken_name, retry_param, pre_confirmed)
 
     # ── search (reuses SEARCH_URL_MAP url, adds card reporting) ─────────────
     if action == "search":
@@ -1641,7 +1621,7 @@ def amazon_control(action: str, parameter: str | None = None) -> dict:
         cards = _amz_collect_cards()
         if not cards:
             return {"success": False, "message": "I don't see any products on this page. Try searching first."}
-        pick = _amz_pick(cards, parameter)
+        pick = _pick_card(cards, parameter)
         browser.get(pick["href"])
         try:
             WebDriverWait(browser, 10).until(EC.presence_of_element_located((By.ID, "productTitle")))
@@ -1840,31 +1820,6 @@ def flipkart_control(action: str, parameter: str | None = None) -> dict:
         except Exception:
             return []
 
-    def _fk_pick(cards: list, param: str | None):
-        if not cards:
-            return None
-        if not param:
-            return cards[0]
-        p = param.strip().lower()
-        ordinals = {"first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2,
-                    "fourth": 3, "4th": 3, "fifth": 4, "5th": 4}
-        if p in ordinals:
-            i = ordinals[p]
-            return cards[i] if i < len(cards) else cards[0]
-        if p.isdigit():
-            i = int(p) - 1
-            return cards[i] if 0 <= i < len(cards) else cards[0]
-        for c in cards:
-            if p in c["label"].lower():
-                return c
-        p_tokens = set(p.split())
-        best, best_score = None, 0
-        for c in cards:
-            score = len(p_tokens & set(c["label"].lower().split()))
-            if score > best_score:
-                best, best_score = c, score
-        return best or cards[0]
-
     def _fk_find_button_by_text(phrases: list):
         """Find a visible button/anchor whose text contains any phrase
         (case-insensitive). Flipkart classes rotate; text is the stable handle."""
@@ -1885,30 +1840,7 @@ def flipkart_control(action: str, parameter: str | None = None) -> dict:
         return None
 
     def _guarded_click(el, spoken_name: str, retry_param: str, pre_confirmed: bool = False):
-        """Risky-keyword recheck before ANY direct click (existing safety net).
-        pre_confirmed=True skips the recheck — used ONLY by checkout/address
-        branches, which sensei.py's safety net ALWAYS gates behind a spoken
-        yes before this code can run (avoids double confirmation)."""
-        try:
-            text = (el.text or el.get_attribute("aria-label") or spoken_name).strip()
-        except Exception:
-            text = spoken_name
-        if not pre_confirmed and _risky_pattern.search(text):
-            def _do():
-                browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-                el.click()
-            return {
-                "needs_click_confirmation": True,
-                "element_text": text[:80],
-                "_execute": _do,
-                "retry_parameter": retry_param,
-            }
-        try:
-            browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-            el.click()
-            return {"success": True, "message": f"Clicked {spoken_name}."}
-        except Exception as e:
-            return {"success": False, "message": f"Couldn't click {spoken_name}: {e}"}
+        return _shop_guarded_click(browser, el, spoken_name, retry_param, pre_confirmed)
 
     if action == "search":
         if not parameter:
@@ -1935,7 +1867,7 @@ def flipkart_control(action: str, parameter: str | None = None) -> dict:
         cards = _fk_collect_cards()
         if not cards:
             return {"success": False, "message": "I don't see any products on this page. Try searching first."}
-        pick = _fk_pick(cards, parameter)
+        pick = _pick_card(cards, parameter)
         # Flipkart product links open new tabs by default; navigating directly
         # keeps everything in Akira's tab so _akira_tab stays valid.
         browser.get(pick["href"])

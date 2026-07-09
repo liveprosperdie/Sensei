@@ -352,7 +352,15 @@ def get_akira_response(text: str) -> dict | None:
 
     # handle pending confirmation
     if pending_action is not None:
-        confirmed = claude_handler.ask_confirmation(text)
+        if pending_action == "click_confirmed":
+            pending_desc = f"clicking '{pending_parameter}'"
+        elif isinstance(pending_action, list):
+            pending_desc = ", ".join(
+                f"{a.get('action')} {a.get('parameter') or ''}".strip()
+                for a in pending_action)
+        else:
+            pending_desc = f"{pending_action} {pending_parameter or ''}".strip()
+        confirmed = claude_handler.ask_confirmation(text, pending_desc)
         if confirmed:
             if pending_action == "click_confirmed" and pending_execute is not None:
                 try:

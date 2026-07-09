@@ -353,15 +353,42 @@ def clear_history() -> None:
         conversation_history.clear()
 
 
-def ask_confirmation(text: str) -> bool:
-    """Haiku yes/no check for confirmation prompts."""
-    message = client.messages.create(
-        model="claude-haiku-4-5",
-        max_tokens=10,
-        system="The user was asked to confirm an action. Reply only YES or NO. Nothing else.",
-        messages=[{"role": "user", "content": text}],
-    )
-    return message.content[0].text.strip().upper().startswith("YES")
+_NO_WORDS = re.compile(
+    r"\b(no|nope|nah|cancel|stop|don'?t|never ?mind|abort|wait|hold on|not now)\b",
+    re.IGNORECASE)
+_YES_WORDS = re.compile(
+    r"\b(yes|yeah|yep|yup|sure|ok(ay)?|confirm(ed)?|proceed|go ahead|do it|"
+    r"go for it|absolutely|definitely|please do)\b", re.IGNORECASE)
+
+
+def ask_confirmation(text: str, pending_description: str | None = None) -> bool:
+    """Yes/no check for confirmation prompts.
+    Fast-path on obvious words (no API round-trip, negatives win), then Haiku
+    with pending-action context so replies like 'yes take me to checkout'
+    resolve correctly instead of being treated as a brand new command."""
+    if _NO_WORDS.search(text):
+        print(f"[ask_confirmation] fast-path NO: {text!r}")
+        return False
+    if _YES_WORDS.search(text):
+        print(f"[ask_confirmation] fast-path YES: {text!r}")
+        return True
+    context = (f"The user was asked to confirm this action: {pending_description}. "
+               if pending_description else "The user was asked to confirm an action. ")
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=10,
+            system=context + "If their reply agrees, or restates or repeats the same "
+                             "action approvingly, reply YES. Otherwise reply NO. "
+                             "Reply only YES or NO. Nothing else.",
+            messages=[{"role": "user", "content": text}],
+        )
+        verdict = message.content[0].text.strip().upper().startswith("YES")
+        print(f"[ask_confirmation] haiku says {'YES' if verdict else 'NO'} for {text!r}")
+        return verdict
+    except Exception as e:
+        print(f"[ask_confirmation] API error, defaulting NO: {e!r}")
+        return False
 
 
 def vision_match(screenshot_path: str, instruction: str) -> tuple[int, int] | None:
