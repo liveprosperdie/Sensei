@@ -60,6 +60,23 @@ DANGEROUS_ACTIONS = frozenset({
     "delete_files", "move_files", "edit_file", "uninstall_application",
 })
 
+# Shopping sub-actions that must ALWAYS pause for confirmation, regardless of
+# what the LLM sets. Parameter-aware: "search"/"add to cart" stay free-flowing.
+RISKY_SHOPPING_PARAMS = frozenset({
+    "proceed to checkout", "checkout", "place order",
+    "confirm address", "select address", "confirm delivery address", "deliver here",
+})
+
+
+def _is_dangerous_step(step: dict) -> bool:
+    """True if this action step must be confirmation-gated by the safety net."""
+    if step.get("action") in DANGEROUS_ACTIONS:
+        return True
+    if step.get("action") in ("amazon_control", "flipkart_control"):
+        param = (step.get("parameter") or "").split("|")[0]
+        return param.strip().lower().replace("_", " ") in RISKY_SHOPPING_PARAMS
+    return False
+
 FAILURE_PREFIXES = (
     "I couldn't find", "Couldn't click", "Couldn't find",
     "Skipped", "Something went wrong", "Unknown action",
@@ -255,8 +272,9 @@ def handle_response(response: dict) -> bool:
             actions_to_run = [{"action": response["action"], "parameter": response.get("parameter")}]
 
         # safety net: catch dangerous actions Claude forgot to gate
-        unsafe = [a for a in actions_to_run if a["action"] in DANGEROUS_ACTIONS]
-        safe   = [a for a in actions_to_run if a["action"] not in DANGEROUS_ACTIONS]
+        # (includes risky shopping steps like checkout / place order / address)
+        unsafe = [a for a in actions_to_run if _is_dangerous_step(a)]
+        safe   = [a for a in actions_to_run if not _is_dangerous_step(a)]
 
         if unsafe and not response.get("confirmation_required"):
             print(f"[handle_response] safety net caught: {[a['action'] for a in unsafe]}")
@@ -266,12 +284,24 @@ def handle_response(response: dict) -> bool:
             response.pop("action", None)
             response.pop("parameter", None)
             response["confirmation_message"]  = "Just confirming before I do that."
+            # speak the question, not the LLM's premature "doing it now" text
+            response["response"] = response["confirmation_message"]
+        elif unsafe:
+            # LLM set confirmation_required itself — make sure the unsafe steps
+            # land in pending, NOT in the executed-now list.
+            response["pending_actions"] = unsafe
+            response["actions"]         = safe
+            response.pop("action", None)
+            response.pop("parameter", None)
 
         run_results = []
-        if safe and not response.get("confirmation_required"):
-            run_results = run_actions({"actions": safe})
-        elif not unsafe:
-            run_results = run_actions(response)
+        if response.get("confirmation_required"):
+            # NOTHING executes until the user confirms. Previously the
+            # `elif not unsafe` branch ran non-dangerous actions immediately
+            # even when confirmation_required was True (checkout bypass bug).
+            pass
+        else:
+            run_results = run_actions(response if not response.get("pending_actions") else {"actions": safe})
 
         # override spoken response on execution failure
         for r in reversed(run_results):
@@ -335,8 +365,18 @@ def get_akira_response(text: str) -> dict | None:
                     pending_action if isinstance(pending_action, list)
                     else [{"action": pending_action, "parameter": pending_parameter}]
                 )
-                run_actions({"actions": actions})
+                confirm_results = run_actions({"actions": actions})
                 speak_text = "Done."
+                for r in reversed(confirm_results):
+                    if isinstance(r, str) and r.startswith(FAILURE_PREFIXES):
+                        speak_text = r
+                        break
+                    if isinstance(r, dict) and r.get("success") is False:
+                        speak_text = r.get("message", "That didn't work.")
+                        break
+                    if isinstance(r, dict) and r.get("success") is True and r.get("message"):
+                        speak_text = r["message"]
+                        break
             pending_action = pending_parameter = pending_execute = None
             speak_and_wait(speak_text)
             return None

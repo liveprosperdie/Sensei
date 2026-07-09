@@ -1590,14 +1590,17 @@ def amazon_control(action: str, parameter: str | None = None) -> dict:
                 continue
         return None
 
-    def _guarded_click(el, spoken_name: str, retry_param: str):
-        """Risky-keyword recheck before ANY direct click (existing safety net)."""
+    def _guarded_click(el, spoken_name: str, retry_param: str, pre_confirmed: bool = False):
+        """Risky-keyword recheck before ANY direct click (existing safety net).
+        pre_confirmed=True skips the recheck — used ONLY by checkout/address
+        branches, which sensei.py's safety net ALWAYS gates behind a spoken
+        yes before this code can run (avoids double confirmation)."""
         try:
             text = (el.text or el.get_attribute("value") or
                     el.get_attribute("aria-label") or spoken_name).strip()
         except Exception:
             text = spoken_name
-        if _risky_pattern.search(text):
+        if not pre_confirmed and _risky_pattern.search(text):
             def _do():
                 browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
                 el.click()
@@ -1699,9 +1702,9 @@ def amazon_control(action: str, parameter: str | None = None) -> dict:
         return {"success": True, "message": "Opened your Amazon cart."}
 
     if action in ("proceed to checkout", "checkout"):
-        # CONFIRMED ids from cart page + post-add side sheet. Button text is
-        # "Proceed to Buy" on amazon.in — matches RISKY_KEYWORDS ("buy"), so
-        # _guarded_click will return needs_confirmation and pause for the user.
+        # CONFIRMED ids from cart page + post-add side sheet.
+        # This branch is ONLY reachable after sensei.py's safety net got a
+        # spoken yes (RISKY_SHOPPING_PARAMS gate), so pre_confirmed=True.
         el = _amz_find_visible([
             'input[name="proceedToRetailCheckout"]',
             "#sc-buy-box-ptc-button input",
@@ -1711,7 +1714,10 @@ def amazon_control(action: str, parameter: str | None = None) -> dict:
         ])
         if not el:
             return {"success": False, "message": "Couldn't find the checkout button — open the cart first."}
-        return _guarded_click(el, "Proceed to Checkout", "proceed to checkout")
+        result = _guarded_click(el, "Proceed to Checkout", "proceed to checkout", pre_confirmed=True)
+        if result.get("success"):
+            return {"success": True, "message": "Moved to checkout. Next step is address confirmation — I stop before payment."}
+        return result
 
     if action in ("confirm address", "select address", "confirm delivery address"):
         # PLACEHOLDER-UNVERIFIED: address book ids seen in research
@@ -1728,7 +1734,7 @@ def amazon_control(action: str, parameter: str | None = None) -> dict:
         el = _amz_find_visible(sel_list)
         if not el:
             return {"success": False, "message": "Couldn't find a saved address to select — the address page may look different. This is where I stop before payment."}
-        result = _guarded_click(el, "delivery address", "confirm address")
+        result = _guarded_click(el, "delivery address", "confirm address", pre_confirmed=True)
         if result.get("success"):
             return {"success": True, "message": "Address confirmed. Stopping here — the next screen is payment selection, which I won't touch."}
         return result
@@ -1878,13 +1884,16 @@ def flipkart_control(action: str, parameter: str | None = None) -> dict:
             pass
         return None
 
-    def _guarded_click(el, spoken_name: str, retry_param: str):
-        """Risky-keyword recheck before ANY direct click (existing safety net)."""
+    def _guarded_click(el, spoken_name: str, retry_param: str, pre_confirmed: bool = False):
+        """Risky-keyword recheck before ANY direct click (existing safety net).
+        pre_confirmed=True skips the recheck — used ONLY by checkout/address
+        branches, which sensei.py's safety net ALWAYS gates behind a spoken
+        yes before this code can run (avoids double confirmation)."""
         try:
             text = (el.text or el.get_attribute("aria-label") or spoken_name).strip()
         except Exception:
             text = spoken_name
-        if _risky_pattern.search(text):
+        if not pre_confirmed and _risky_pattern.search(text):
             def _do():
                 browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
                 el.click()
@@ -1963,14 +1972,17 @@ def flipkart_control(action: str, parameter: str | None = None) -> dict:
 
     if action in ("proceed to checkout", "checkout", "place order"):
         # Flipkart's cart-page progression button is literally "Place Order".
-        # "place order" is in RISKY_KEYWORDS, so _guarded_click WILL return
-        # needs_confirmation — that is intended, not a bug. After the user
-        # confirms, this lands on login/address selection, still pre-payment.
+        # This branch is ONLY reachable after sensei.py's safety net got a
+        # spoken yes (RISKY_SHOPPING_PARAMS gate), so pre_confirmed=True.
+        # It lands on login/address selection, still pre-payment.
         _fk_close_login_popup()
         el = _fk_find_button_by_text(["place order"])
         if not el:
             return {"success": False, "message": "Couldn't find the Place Order button — open the cart first. You may need to be logged in."}
-        return _guarded_click(el, "Place Order (this only moves to address selection, not payment)", "proceed to checkout")
+        result = _guarded_click(el, "Place Order", "proceed to checkout", pre_confirmed=True)
+        if result.get("success"):
+            return {"success": True, "message": "Moved to address selection — I stop before payment."}
+        return result
 
     if action in ("confirm address", "select address", "confirm delivery address", "deliver here"):
         # PLACEHOLDER-UNVERIFIED: 'Deliver Here' is the button text seen in
@@ -1979,7 +1991,7 @@ def flipkart_control(action: str, parameter: str | None = None) -> dict:
         el = _fk_find_button_by_text(["deliver here", "deliver to this address"])
         if not el:
             return {"success": False, "message": "Couldn't find a Deliver Here button — the address page may look different. This is where I stop before payment."}
-        result = _guarded_click(el, "Deliver Here", "confirm address")
+        result = _guarded_click(el, "Deliver Here", "confirm address", pre_confirmed=True)
         if result.get("success"):
             return {"success": True, "message": "Address confirmed. Stopping here — the next screen is payment, which I won't touch."}
         return result
