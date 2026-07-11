@@ -93,6 +93,12 @@ FAILURE_PREFIXES = (
     "Skipped", "Something went wrong", "Unknown action",
 )
 
+# Boot fingerprint — makes stale-process / wrong-file issues instantly visible
+print(f"[BOOT] sensei: {os.path.abspath(__file__)}")
+print(f"[BOOT] claude_handler: {claude_handler.__file__}")
+print(f"[BOOT] prompt has github_control: "
+      f"{'github_control' in getattr(claude_handler, 'AKIRA_PROMPT', '')}")
+
 print("Listening for 'Sensei'...")
 
 

@@ -482,12 +482,33 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
     if not filtered:
         filtered = elements  # Fallback to all if filter removed everything
     
-    # Phase 1: Exact substring match on filtered elements
+    # Phase 1: Substring match on filtered elements.
+    # Collect ALL matches, then prefer the LONGEST matched element text —
+    # most specific wins. First-match-wins caused 'Profile' (idx 1) to beat
+    # 'Repositories' (idx 2) for "click repositories in the top navigation
+    # or profile menu". Reverse containment also now requires word
+    # boundaries so short labels can't hitch a ride inside longer words.
+    phase1_matches = []
     for el in filtered:
-        text_lower = el['text'].lower()
-        if instruction_lower in text_lower or text_lower in instruction_lower:
-            print(f"[MATCH] FUZZY index={el['index']} text='{el['text'][:50]}'")
-            return el['index']
+        text_lower = el['text'].lower().strip()
+        if not text_lower:
+            continue
+        if instruction_lower in text_lower:
+            phase1_matches.append(el)
+        elif re.search(r'\b' + re.escape(text_lower) + r'\b', instruction_lower):
+            phase1_matches.append(el)
+    if phase1_matches:
+        phase1_matches.sort(key=lambda el: len(el['text'].strip()), reverse=True)
+        top = phase1_matches[0]
+        # Tie in matched-text length = genuine ambiguity -> fall through to
+        # later phases instead of a confident wrong click
+        if len(phase1_matches) > 1 and len(phase1_matches[1]['text'].strip()) == len(top['text'].strip()):
+            print(f"[MATCH] FUZZY ambiguous tie: "
+                  f"'{top['text'][:30]}' vs '{phase1_matches[1]['text'][:30]}' — deferring")
+        else:
+            print(f"[MATCH] FUZZY index={top['index']} text='{top['text'][:50]}' "
+                  f"(longest of {len(phase1_matches)} matches)")
+            return top['index']
     
     # Phase 2: Word overlap on filtered elements - prioritize early matches
     if instruction_words and len(instruction_words) >= 2:
