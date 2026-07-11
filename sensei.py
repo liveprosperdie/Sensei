@@ -67,20 +67,37 @@ RISKY_SHOPPING_PARAMS = frozenset({
     "confirm address", "select address", "confirm delivery address", "deliver here",
 })
 
+# GitHub sub-actions that change live repo state — always confirmation-gated.
+# delete repo carries the same severity as shutdown/delete_files.
+RISKY_GITHUB_PARAMS = frozenset({
+    "create pull request", "merge pull request",
+    "close issue", "close pull request",
+    "delete branch", "delete repo", "delete repository",
+    "push", "force push",
+})
+
 
 def _is_dangerous_step(step: dict) -> bool:
     """True if this action step must be confirmation-gated by the safety net."""
     if step.get("action") in DANGEROUS_ACTIONS:
         return True
+    param = (step.get("parameter") or "").split("|")[0].strip().lower().replace("_", " ")
     if step.get("action") in ("amazon_control", "flipkart_control"):
-        param = (step.get("parameter") or "").split("|")[0]
-        return param.strip().lower().replace("_", " ") in RISKY_SHOPPING_PARAMS
+        return param in RISKY_SHOPPING_PARAMS
+    if step.get("action") == "github_control":
+        return param in RISKY_GITHUB_PARAMS
     return False
 
 FAILURE_PREFIXES = (
     "I couldn't find", "Couldn't click", "Couldn't find",
     "Skipped", "Something went wrong", "Unknown action",
 )
+
+# Boot fingerprint — makes stale-process / wrong-file issues instantly visible
+print(f"[BOOT] sensei: {os.path.abspath(__file__)}")
+print(f"[BOOT] claude_handler: {claude_handler.__file__}")
+print(f"[BOOT] prompt has github_control: "
+      f"{'github_control' in getattr(claude_handler, 'AKIRA_PROMPT', '')}")
 
 print("Listening for 'Sensei'...")
 
