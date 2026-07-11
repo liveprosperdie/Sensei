@@ -207,12 +207,13 @@ ACTION PARAMETER FORMATS:
   State changes (these ALWAYS pause for user confirmation first): "create pull request|branch|title", "merge pull request|7", "close issue|12", "close pull request|7", "delete branch|old-feature", "delete repo" (needs a GITHUB_TOKEN; treat as seriously as deleting files).
   OUT OF SCOPE: pushing code, force push, or any local git operation — tell the user to use their terminal.
   NEVER use click for GitHub search results, star/fork buttons, or merge buttons — github_control handles those reliably. Only use click on GitHub for things github_control cannot do.
-- vscode_control: THE tool for anything involving VS Code or the user's code files — opening projects, opening/creating/reading files, and file edits. ALWAYS prefer this over open_application, click, fill, or any generic file-system command for VS Code-related requests. Format: "action" or "action|parameter" (extra fields also use |).
-  Open and read: "open folder|C:\\projects\\sensei", "open file|main.py" (relative names resolve against the folder we're working in this session), "create file|notes.txt|optional initial content" (refuses if the file already exists), "read file|main.py" (reads content for you to reference or read aloud).
-  File changes (these ALWAYS pause for user confirmation first): "write file|path|content" (overwrites the whole file), "edit file|path|find text|replace text" (targeted replacement — if the text isn't found or appears more than once, it stops and asks rather than guessing).
+- FILE ACTIONS (default route for any file request — no VS Code needed): create_file, read_file, write_file, edit_file, search_file. Parameter fields split with |. Relative names resolve against the folder we're working in this session; paths may use %USERNAME% or ~ styles and are expanded automatically.
+  "create_file|notes.txt|optional initial content" (refuses if the file already exists), "read_file|main.py" (reads content for you to reference or read aloud), "search_file|report.docx|C:\\Users\\me\\Documents" (finds files by full or partial name; the second field is optional — defaults to the session folder or home).
+  These ALWAYS pause for user confirmation first: "write_file|path|content" (overwrites the whole file), "edit_file|path|find text|replace text" (targeted replacement — if the text isn't found or appears more than once, it stops and asks rather than guessing).
+- vscode_control: ONLY when the user explicitly says VS Code ("open it in VS Code", "open my project in VS Code"). Same format. "open folder|C:\\projects\\sensei", "open file|main.py", plus the same file actions ("create file", "read file", "write file", "edit file", "search file") when the user wants the result inside VS Code — the same confirmation rules apply.
   OUT OF SCOPE: running code, managing extensions, or typing keystrokes into the editor — say those aren't available yet if asked.
 
-CODE: write_code, fix_code, read_clipboard, write_clipboard, dictate_text, vscode_control
+CODE: write_code, fix_code, read_clipboard, write_clipboard, dictate_text, vscode_control, create_file, read_file, write_file, edit_file, search_file
 
 GOOGLE WORKSPACE: send_email[C], read_emails, create_document, read_document, create_event, read_schedule
 

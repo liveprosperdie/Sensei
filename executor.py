@@ -2348,14 +2348,28 @@ def github_control(action: str, parameter: str | None = None) -> dict:
     return {"success": False, "message": f"Unknown github_control action: {action}"}
 
 
-# ── VS Code control ───────────────────────────────────────────────────────────
-# SCOPE: file-level operations ONLY. No code execution, no extension
-# management, no in-editor keystroke automation — explicitly deferred.
-# write file / edit file are gated by sensei.py's RISKY_VSCODE_PARAMS safety
-# net (same mechanism as checkout/delete repo) BEFORE this code ever runs.
+# ── File operations (standalone) + VS Code control ───────────────────────────
+# One function per capability. Standalone actions (create_file, read_file,
+# write_file, edit_file, search_file) are the default route; vscode_control
+# calls the SAME functions when the user explicitly says "in VS Code".
+# Gating travels with the capability: write_file / edit_file are gated by
+# sensei.py's safety net under BOTH entry points.
 
 _vsc_last_folder: str | None = None   # session memory for path resolution
 _vsc_last_file: str | None = None
+
+_WIN_VAR = re.compile(r"%([^%]+)%")
+
+
+def _normalize_path(path: str) -> str:
+    """Expand env vars (both $VAR and %VAR% styles) and ~, on ANY platform.
+    os.path.expandvars only handles %VAR% on Windows — the live-log bug was
+    a literal %USERNAME% surviving into a file operation, so we expand
+    %VAR% manually as a portable second pass."""
+    p = path.strip().strip('"').strip("'")
+    p = os.path.expandvars(p)
+    p = _WIN_VAR.sub(lambda m: os.environ.get(m.group(1), m.group(0)), p)
+    return os.path.expanduser(p)
 
 
 def _vsc_code_cli() -> str | None:
@@ -2364,14 +2378,13 @@ def _vsc_code_cli() -> str | None:
     return shutil.which("code") or shutil.which("code.cmd")
 
 
-def _vsc_resolve(path: str | None, want_dir: bool = False) -> tuple[str | None, str | None]:
-    """Deterministic path resolution, summarize_document precedence:
-    explicit absolute path > relative to last-used session folder >
-    relative to home. Returns (resolved_path, error_message)."""
+def _resolve_path(path: str | None, want_dir: bool = False) -> tuple[str | None, str | None]:
+    """Deterministic path resolution: explicit absolute path > relative to
+    last-used session folder > relative to home. Returns (path, error)."""
     if not path or not path.strip():
         return None, ("Which folder?" if want_dir else "Which file?") + \
             " Tell me the full path, or a name inside the folder we're working in."
-    p = os.path.expanduser(os.path.expandvars(path.strip().strip('"')))
+    p = _normalize_path(path)
     if os.path.isabs(p):
         return p, None
     # relative: try last session folder first, then home
@@ -2382,18 +2395,154 @@ def _vsc_resolve(path: str | None, want_dir: bool = False) -> tuple[str | None, 
     return os.path.join(os.path.expanduser("~"), p), None
 
 
+def _remember(fpath: str):
+    global _vsc_last_folder, _vsc_last_file
+    _vsc_last_file = fpath
+    _vsc_last_folder = os.path.dirname(fpath)
+
+
+def create_file(parameter: str | None = None) -> dict:
+    """create_file|path|optional content — refuses to clobber existing files."""
+    print(f"[create_file] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    fpath, err = _resolve_path(parts[0] if parts and parts[0] else None)
+    if err:
+        return {"success": False, "message": err}
+    if os.path.exists(fpath):
+        return {"success": False, "message": f"{os.path.basename(fpath)} already exists — say write file if you want to overwrite it."}
+    content = "|".join(parts[1:]) if len(parts) > 1 else ""
+    try:
+        os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't create the file: {e}"}
+    _remember(fpath)
+    return {"success": True, "message": f"Created {os.path.basename(fpath)} in {os.path.dirname(fpath)}."}
+
+
+def read_file(parameter: str | None = None) -> dict:
+    """read_file|path — reads up to 4000 chars, speaks a snippet."""
+    print(f"[read_file] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    fpath, err = _resolve_path(parts[0] if parts and parts[0] else None)
+    if err:
+        return {"success": False, "message": err}
+    if not os.path.isfile(fpath):
+        return {"success": False, "message": f"That file doesn't exist: {fpath}"}
+    try:
+        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read(4000)
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't read the file: {e}"}
+    _remember(fpath)
+    snippet = content[:600].strip()
+    return {"success": True, "message": f"{os.path.basename(fpath)} ({len(content)} chars read): {snippet}"}
+
+
+def write_file(parameter: str | None = None) -> dict:
+    """write_file|path|content — overwrites. GATED by sensei.py's safety net
+    (RISKY file actions) under EVERY entry point before this runs."""
+    print(f"[write_file] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    fpath, err = _resolve_path(parts[0] if parts and parts[0] else None)
+    if err:
+        return {"success": False, "message": err}
+    if len(parts) < 2:
+        return {"success": False, "message": "Tell me what to write, like write file|notes.txt|the content."}
+    content = "|".join(parts[1:])  # content may legitimately contain |
+    existed = os.path.isfile(fpath)
+    try:
+        os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't write the file: {e}"}
+    _remember(fpath)
+    return {"success": True, "message": f"{'Overwrote' if existed else 'Wrote'} {os.path.basename(fpath)} ({len(content)} chars)."}
+
+
+def edit_file(parameter: str | None = None) -> dict:
+    """edit_file|path|find|replace — single unique occurrence only; fails
+    loud on 0 or >1 matches. GATED like write_file."""
+    print(f"[edit_file] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    if len(parts) < 3:
+        return {"success": False, "message": "Edit needs a file, the text to find, and the replacement — edit file|path|find|replace."}
+    fpath, err = _resolve_path(parts[0] if parts[0] else None)
+    if err:
+        return {"success": False, "message": err}
+    if not os.path.isfile(fpath):
+        return {"success": False, "message": f"That file doesn't exist: {fpath}"}
+    find_text, replace_text = parts[1], parts[2]
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't read the file: {e}"}
+    count = content.count(find_text)
+    if count == 0:
+        return {"success": False, "message": f"I couldn't find '{find_text[:40]}' in {os.path.basename(fpath)} — nothing was changed."}
+    if count > 1:
+        # fail loud, never guess which occurrence
+        return {"success": False, "message": f"'{find_text[:40]}' appears {count} times in {os.path.basename(fpath)} — I won't guess which one. Give me more surrounding text to make it unique."}
+    try:
+        with open(fpath, "w", encoding="utf-8") as f:
+            f.write(content.replace(find_text, replace_text, 1))
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't write the edit: {e}"}
+    _remember(fpath)
+    return {"success": True, "message": f"Replaced it in {os.path.basename(fpath)}."}
+
+
+def search_file(parameter: str | None = None) -> dict:
+    """search_file|filename|optional search_root — recursive partial-name
+    search with a time budget. Read-only, never gated."""
+    print(f"[search_file] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    name = parts[0].strip() if parts and parts[0].strip() else None
+    if not name:
+        return {"success": False, "message": "What file should I look for?"}
+    if len(parts) > 1 and parts[1].strip():
+        root = _normalize_path(parts[1])
+    else:
+        root = _vsc_last_folder or os.path.expanduser("~")
+    if not os.path.isdir(root):
+        return {"success": False, "message": f"That search folder doesn't exist: {root}"}
+    name_lower = name.lower()
+    results: list = []
+    deadline = time.time() + 15  # hard time budget — never hang on huge drives
+    timed_out = False
+    SKIP_DIRS = {"node_modules", ".git", "__pycache__", "AppData", ".venv",
+                 "venv", "$RECYCLE.BIN", "System Volume Information"}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        for fn in filenames:
+            if name_lower in fn.lower():
+                results.append(os.path.join(dirpath, fn))
+                if len(results) >= 20:
+                    break
+        if len(results) >= 20 or time.time() > deadline:
+            timed_out = time.time() > deadline
+            break
+    if not results:
+        extra = " I stopped after 15 seconds — try a more specific folder." if timed_out else ""
+        return {"success": False, "message": f"No file matching '{name}' found under {root}.{extra}", "results": []}
+    shown = "; ".join(os.path.relpath(r, root) for r in results[:5])
+    extra = " (search timed out — there may be more)" if timed_out else ""
+    return {"success": True,
+            "message": f"Found {len(results)} match{'es' if len(results) != 1 else ''} under {root}: {shown}{extra}",
+            "results": results}
+
+
 def vscode_control(action: str, parameter: str | None = None) -> dict:
     """
-    VS Code file-level control. '|' splits parameter fields.
-
-    Ungated: open folder|path, open file|path, create file|path|content,
-             read file|path
-    Gated (sensei.py RISKY_VSCODE_PARAMS -> spoken confirmation first):
-             write file|path|content, edit file|path|find_text|replace_text
-    OUT OF SCOPE (not built): running code, extensions, editor keystrokes.
+    VS Code control — used when the user explicitly says 'in VS Code'.
+    File actions delegate to the standalone functions (no duplicated logic);
+    write file / edit file stay gated regardless of entry point.
+    OUT OF SCOPE: running code, extensions, editor keystrokes.
     """
     print(f"[vscode_control] called with action={action!r}, parameter={parameter!r}")
-    global _vsc_last_folder, _vsc_last_file
 
     action = (action or "").strip().lower().replace("_", " ")
     parts = (parameter or "").split("|")
@@ -2402,7 +2551,7 @@ def vscode_control(action: str, parameter: str | None = None) -> dict:
         cli = _vsc_code_cli()
         if not cli:
             return {"success": False, "message": "VS Code's 'code' command isn't on your PATH. In VS Code, run 'Shell Command: Install code command' or reinstall with the PATH option checked."}
-        folder, err = _vsc_resolve(parts[0] if parts[0] else None, want_dir=True)
+        folder, err = _resolve_path(parts[0] if parts[0] else None, want_dir=True)
         if err:
             return {"success": False, "message": err}
         if not os.path.isdir(folder):
@@ -2411,6 +2560,7 @@ def vscode_control(action: str, parameter: str | None = None) -> dict:
             subprocess.Popen([cli, folder], shell=False)
         except Exception as e:
             return {"success": False, "message": f"Couldn't launch VS Code: {e}"}
+        global _vsc_last_folder
         _vsc_last_folder = folder
         return {"success": True, "message": f"Opened {os.path.basename(folder)} in VS Code."}
 
@@ -2418,7 +2568,7 @@ def vscode_control(action: str, parameter: str | None = None) -> dict:
         cli = _vsc_code_cli()
         if not cli:
             return {"success": False, "message": "VS Code's 'code' command isn't on your PATH. In VS Code, run 'Shell Command: Install code command' or reinstall with the PATH option checked."}
-        fpath, err = _vsc_resolve(parts[0] if parts[0] else None)
+        fpath, err = _resolve_path(parts[0] if parts[0] else None)
         if err:
             return {"success": False, "message": err}
         if not os.path.isfile(fpath):
@@ -2427,98 +2577,34 @@ def vscode_control(action: str, parameter: str | None = None) -> dict:
             subprocess.Popen([cli, fpath], shell=False)
         except Exception as e:
             return {"success": False, "message": f"Couldn't launch VS Code: {e}"}
-        _vsc_last_file = fpath
-        _vsc_last_folder = os.path.dirname(fpath)
+        _remember(fpath)
         return {"success": True, "message": f"Opened {os.path.basename(fpath)} in VS Code."}
 
+    # File actions: delegate to the SAME standalone functions, then open the
+    # result in VS Code where it makes sense (create only — best-effort).
     if action == "create file":
-        fpath, err = _vsc_resolve(parts[0] if parts[0] else None)
-        if err:
-            return {"success": False, "message": err}
-        if os.path.exists(fpath):
-            return {"success": False, "message": f"{os.path.basename(fpath)} already exists — say write file if you want to overwrite it."}
-        content = parts[1] if len(parts) > 1 else ""
-        try:
-            os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
-            with open(fpath, "w", encoding="utf-8") as f:
-                f.write(content)
-        except Exception as e:
-            return {"success": False, "message": f"Couldn't create the file: {e}"}
-        _vsc_last_file = fpath
-        _vsc_last_folder = os.path.dirname(fpath)
-        cli = _vsc_code_cli()
-        if cli:
-            try:
-                subprocess.Popen([cli, fpath], shell=False)
-            except Exception:
-                pass  # file was created — opening it is best-effort
-        return {"success": True, "message": f"Created {os.path.basename(fpath)}" + (" and opened it in VS Code." if cli else ". VS Code's CLI isn't on PATH so I couldn't open it.")}
+        result = create_file(parameter)
+        if result.get("success"):
+            cli = _vsc_code_cli()
+            if cli and _vsc_last_file:
+                try:
+                    subprocess.Popen([cli, _vsc_last_file], shell=False)
+                    result["message"] = result["message"].rstrip(".") + " and opened it in VS Code."
+                except Exception:
+                    pass  # file was created — opening is best-effort
+        return result
 
     if action == "read file":
-        fpath, err = _vsc_resolve(parts[0] if parts[0] else None)
-        if err:
-            return {"success": False, "message": err}
-        if not os.path.isfile(fpath):
-            return {"success": False, "message": f"That file doesn't exist: {fpath}"}
-        try:
-            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read(4000)
-        except Exception as e:
-            return {"success": False, "message": f"Couldn't read the file: {e}"}
-        _vsc_last_file = fpath
-        _vsc_last_folder = os.path.dirname(fpath)
-        snippet = content[:600].strip()
-        return {"success": True, "message": f"{os.path.basename(fpath)} ({len(content)} chars read): {snippet}"}
+        return read_file(parameter)
 
     if action == "write file":
-        # GATED upstream by RISKY_VSCODE_PARAMS — only runs after spoken yes.
-        fpath, err = _vsc_resolve(parts[0] if parts[0] else None)
-        if err:
-            return {"success": False, "message": err}
-        if len(parts) < 2:
-            return {"success": False, "message": "Tell me what to write, like write file|notes.txt|the content."}
-        content = "|".join(parts[1:])  # content may legitimately contain |
-        existed = os.path.isfile(fpath)
-        try:
-            os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
-            with open(fpath, "w", encoding="utf-8") as f:
-                f.write(content)
-        except Exception as e:
-            return {"success": False, "message": f"Couldn't write the file: {e}"}
-        _vsc_last_file = fpath
-        _vsc_last_folder = os.path.dirname(fpath)
-        return {"success": True, "message": f"{'Overwrote' if existed else 'Wrote'} {os.path.basename(fpath)} ({len(content)} chars)."}
+        return write_file(parameter)   # gated upstream under both entry points
 
     if action == "edit file":
-        # GATED upstream by RISKY_VSCODE_PARAMS — only runs after spoken yes.
-        if len(parts) < 3:
-            return {"success": False, "message": "Edit needs a file, the text to find, and the replacement — edit file|path|find|replace."}
-        fpath, err = _vsc_resolve(parts[0] if parts[0] else None)
-        if err:
-            return {"success": False, "message": err}
-        if not os.path.isfile(fpath):
-            return {"success": False, "message": f"That file doesn't exist: {fpath}"}
-        find_text = parts[1]
-        replace_text = parts[2] if len(parts) > 2 else ""
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as e:
-            return {"success": False, "message": f"Couldn't read the file: {e}"}
-        count = content.count(find_text)
-        if count == 0:
-            return {"success": False, "message": f"I couldn't find '{find_text[:40]}' in {os.path.basename(fpath)} — nothing was changed."}
-        if count > 1:
-            # fail loud, never guess which occurrence
-            return {"success": False, "message": f"'{find_text[:40]}' appears {count} times in {os.path.basename(fpath)} — I won't guess which one. Give me more surrounding text to make it unique."}
-        try:
-            with open(fpath, "w", encoding="utf-8") as f:
-                f.write(content.replace(find_text, replace_text, 1))
-        except Exception as e:
-            return {"success": False, "message": f"Couldn't write the edit: {e}"}
-        _vsc_last_file = fpath
-        _vsc_last_folder = os.path.dirname(fpath)
-        return {"success": True, "message": f"Replaced it in {os.path.basename(fpath)}."}
+        return edit_file(parameter)    # gated upstream under both entry points
+
+    if action == "search file":
+        return search_file(parameter)
 
     if action in ("run", "run code", "execute", "install extension", "keystroke", "type"):
         return {"success": False, "message": "Running code, extensions, and typing into the editor are out of my scope for now — file operations only."}
@@ -3013,6 +3099,11 @@ _ACTION_MAP = {
     "flipkart_control":  lambda p: flipkart_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
     "github_control":    lambda p: github_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "vscode_control":    lambda p: vscode_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
+    "create_file":       create_file,
+    "read_file":         read_file,
+    "write_file":        write_file,
+    "edit_file":         edit_file,
+    "search_file":       search_file,
     "adjust_volume":     adjust_volume,
     "adjust_brightness": adjust_brightness,
     "screenshot":        lambda _: screenshot(),
