@@ -176,7 +176,7 @@ FILES & FOLDERS: search_file, open_file, write_file, edit_file[C], move_files[C]
 
 DOWNLOADS & INSTALL: download_file, download_application, install_application[C], uninstall_application[C]
 
-BROWSER & SEARCH: web_search, open_url, site_search, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control, amazon_control, flipkart_control
+BROWSER & SEARCH: web_search, open_url, site_search, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control, amazon_control, flipkart_control, github_control
 ACTION PARAMETER FORMATS:
 - web_search: general web searches. Parameter is the query, optionally with "|browser:name" suffix. Never use a website name as a browser.
 - site_search: searching ON a specific platform. Format: "site|query". Use for youtube, netflix, spotify, amazon, flipkart, reddit, twitter, instagram, pinterest, github, stackoverflow, wikipedia, makemytrip, ixigo, chatgpt, claude, gemini, perplexity.
@@ -201,6 +201,12 @@ ACTION PARAMETER FORMATS:
   HARD LIMIT: flipkart_control stops at address confirmation. It has NO payment actions — never promise payment steps.
   NEVER use click for Amazon or Flipkart search results, add-to-cart, cart, or checkout buttons — the control tools handle those reliably. Only use click on these sites for things the control tools cannot do.
   PAYMENT PAGES: once the flow reaches the payment step (selecting UPI, cards, cash on delivery, entering card details, or placing the final order), do NOT use click, fill, or any other action, no matter how the user phrases it. Respond in conversation mode and warmly ask the user to complete that step manually themselves, since it is a payment and you never touch payments. Something like: "That's the payment step, so it's all yours. Pick your payment method and place the order yourself, I'll be right here."
+- github_control: THE tool for everything on GitHub — searching repos, browsing files/issues/PRs, starring, forking, and repo state changes. When on GitHub, ALWAYS prefer this over click, fill, or site_search. Format: "action" or "action|parameter" (extra fields also use |).
+  Browse: "search repos|tetris python" (reports top repos with stars), "open repo|first" or "open repo|owner/name" (by ordinal, name, or exact owner/name), "view file|src/main.py", "view issues", "view pull requests", "read readme" (spoken summary of the current repo).
+  Actions: "star repo", "unstar repo", "fork repo", "clone repo" (runs a REAL git clone into Documents\\GitHub Clones by default — always tell the user where it went; "clone repo|D:\\code" clones into a custom folder instead), "create issue|title|body".
+  State changes (these ALWAYS pause for user confirmation first): "create pull request|branch|title", "merge pull request|7", "close issue|12", "close pull request|7", "delete branch|old-feature", "delete repo" (needs a GITHUB_TOKEN; treat as seriously as deleting files).
+  OUT OF SCOPE: pushing code, force push, or any local git operation — tell the user to use their terminal.
+  NEVER use click for GitHub search results, star/fork buttons, or merge buttons — github_control handles those reliably. Only use click on GitHub for things github_control cannot do.
 
 CODE: write_code, fix_code, read_clipboard, write_clipboard, dictate_text
 
@@ -476,12 +482,33 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
     if not filtered:
         filtered = elements  # Fallback to all if filter removed everything
     
-    # Phase 1: Exact substring match on filtered elements
+    # Phase 1: Substring match on filtered elements.
+    # Collect ALL matches, then prefer the LONGEST matched element text —
+    # most specific wins. First-match-wins caused 'Profile' (idx 1) to beat
+    # 'Repositories' (idx 2) for "click repositories in the top navigation
+    # or profile menu". Reverse containment also now requires word
+    # boundaries so short labels can't hitch a ride inside longer words.
+    phase1_matches = []
     for el in filtered:
-        text_lower = el['text'].lower()
-        if instruction_lower in text_lower or text_lower in instruction_lower:
-            print(f"[MATCH] FUZZY index={el['index']} text='{el['text'][:50]}'")
-            return el['index']
+        text_lower = el['text'].lower().strip()
+        if not text_lower:
+            continue
+        if instruction_lower in text_lower:
+            phase1_matches.append(el)
+        elif re.search(r'\b' + re.escape(text_lower) + r'\b', instruction_lower):
+            phase1_matches.append(el)
+    if phase1_matches:
+        phase1_matches.sort(key=lambda el: len(el['text'].strip()), reverse=True)
+        top = phase1_matches[0]
+        # Tie in matched-text length = genuine ambiguity -> fall through to
+        # later phases instead of a confident wrong click
+        if len(phase1_matches) > 1 and len(phase1_matches[1]['text'].strip()) == len(top['text'].strip()):
+            print(f"[MATCH] FUZZY ambiguous tie: "
+                  f"'{top['text'][:30]}' vs '{phase1_matches[1]['text'][:30]}' — deferring")
+        else:
+            print(f"[MATCH] FUZZY index={top['index']} text='{top['text'][:50]}' "
+                  f"(longest of {len(phase1_matches)} matches)")
+            return top['index']
     
     # Phase 2: Word overlap on filtered elements - prioritize early matches
     if instruction_words and len(instruction_words) >= 2:
