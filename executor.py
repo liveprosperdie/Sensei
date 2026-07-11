@@ -1931,6 +1931,423 @@ def flipkart_control(action: str, parameter: str | None = None) -> dict:
     return {"success": False, "message": f"Unknown flipkart_control action: {action}"}
 
 
+# ── GitHub control ────────────────────────────────────────────────────────────
+# HYBRID STRATEGY (researched, not assumed):
+#   READS  -> unauthenticated GitHub REST API (stable, official; 60 req/hr,
+#             search 10/min — plenty for voice usage). Browser navigates too,
+#             so the user SEES the page while the API supplies reliable data.
+#   WRITES -> DOM via the logged-in browser session (api.github.com does NOT
+#             accept browser cookies; writes need a PAT). If GITHUB_TOKEN env
+#             var is set, the API is preferred for writes too.
+#   GATED  -> merge/delete/close/create-PR go through sensei.py's safety net
+#             (RISKY_GITHUB_PARAMS), the SAME fixed mechanism as checkout.
+#   OUT OF SCOPE (flagged, not built): push / force_push — no git operations.
+
+_gh_last_repos: list = []  # cards from the last "search repos" call
+
+
+def _gh_token() -> str | None:
+    return os.environ.get("GITHUB_TOKEN") or None
+
+
+def _gh_api(path: str, method: str = "GET", body: dict | None = None):
+    """Call the GitHub REST API. Returns (ok, json_or_error_message)."""
+    headers = {"Accept": "application/vnd.github+json",
+               "X-GitHub-Api-Version": "2022-11-28"}
+    tok = _gh_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    try:
+        resp = requests.request(method, "https://api.github.com" + path,
+                                headers=headers, json=body, timeout=10)
+        if resp.status_code in (200, 201, 204):
+            return True, (resp.json() if resp.content else {})
+        if resp.status_code == 401:
+            return False, "GitHub API auth failed — GITHUB_TOKEN is invalid."
+        if resp.status_code == 403:
+            return False, "GitHub API rate limit hit — try again in a minute."
+        if resp.status_code == 404:
+            return False, "Not found — repo may be private or the name is wrong."
+        return False, f"GitHub API error {resp.status_code}."
+    except Exception as e:
+        return False, f"GitHub API unreachable: {e}"
+
+
+def _gh_repo_from_url(url: str) -> str | None:
+    """Extract 'owner/repo' from a github.com URL."""
+    m = re.search(r"github\.com/([\w.-]+)/([\w.-]+)", url or "")
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+    if owner in ("search", "settings", "notifications", "topics", "orgs",
+                 "marketplace", "explore", "login", "features"):
+        return None
+    return f"{owner}/{repo}"
+
+
+def _gh_click_text_button(browser, phrases: list):
+    """Visible button/summary/anchor by case-insensitive text — GitHub's React
+    migration rotates classes, but button labels are stable."""
+    try:
+        parts = [f"contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', "
+                 f"'abcdefghijklmnopqrstuvwxyz'), \"{p.lower()}\")" for p in phrases]
+        cond = " or ".join(parts)
+        xpath = f"//button[{cond}] | //summary[{cond}] | //a[{cond}]"
+        for el in browser.find_elements(By.XPATH, xpath):
+            if el.is_displayed():
+                return el
+    except Exception:
+        pass
+    return None
+
+
+def github_control(action: str, parameter: str | None = None) -> dict:
+    """
+    GitHub automation. '|' splits parameter fields (e.g. create issue|title|body).
+
+    Tier A (no confirmation): search repos, open repo, view file, view issues,
+      view pull requests, read readme, star repo, unstar repo, fork repo,
+      clone repo, create issue.
+    Gated by sensei.py safety net: create pull request, merge pull request,
+      close issue, close pull request, delete branch, delete repo.
+    NOT built: push / force push (out of scope — no git operations).
+    """
+    print(f"[github_control] called with action={action!r}, parameter={parameter!r}")
+    browser = get_browser(_last_browser_name)
+    try:
+        browser.switch_to.window(browser._akira_tab)
+    except Exception:
+        return {"success": False, "message": "Lost track of my working tab."}
+    try:
+        current_url = browser.current_url or ""
+    except Exception:
+        current_url = ""
+
+    action = (action or "").strip().lower().replace("_", " ")
+    global _gh_last_repos
+
+    def _current_repo() -> str | None:
+        return _gh_repo_from_url(current_url)
+
+    # ── Tier A: reads via unauthenticated REST API ───────────────────────────
+    if action in ("search repos", "search repo", "search"):
+        if not parameter:
+            return {"success": False, "message": "Search needs a query."}
+        ok, data = _gh_api("/search/repositories?per_page=10&q=" + urllib.parse.quote(parameter))
+        if not ok:
+            return {"success": False, "message": data}
+        items = data.get("items", [])
+        if not items:
+            return {"success": False, "message": f"No repos found for {parameter}."}
+        _gh_last_repos = [{"label": it["full_name"], "href": it["html_url"],
+                           "desc": (it.get("description") or "")[:80],
+                           "stars": it.get("stargazers_count", 0)} for it in items]
+        browser.get("https://github.com/search?type=repositories&q=" + urllib.parse.quote(parameter))
+        top = "; ".join(f"{c['label']} ({c['stars']} stars)" for c in _gh_last_repos[:4])
+        return {"success": True, "message": f"Found {len(_gh_last_repos)} repos. Top: {top}. Say open first repo, or name one."}
+
+    if action in ("open repo", "open repository", "open result"):
+        if parameter and "/" in parameter and " " not in parameter.strip():
+            full = parameter.strip().strip("/")
+            ok, data = _gh_api(f"/repos/{full}")
+            if not ok:
+                return {"success": False, "message": data}
+            browser.get(data["html_url"])
+            return {"success": True, "message": f"Opened {data['full_name']}."}
+        if not _gh_last_repos:
+            return {"success": False, "message": "No repo results yet — search repos first, or say the owner/name."}
+        pick = _pick_card(_gh_last_repos, parameter)
+        browser.get(pick["href"])
+        return {"success": True, "message": f"Opened {pick['label']}."}
+
+    # everything below needs a repo context or a github tab
+    repo = _current_repo()
+
+    if action == "view file":
+        if not repo:
+            return {"success": False, "message": "Open a repo first."}
+        if not parameter:
+            return {"success": False, "message": "Tell me the file path, like src/main.py."}
+        path = parameter.strip().lstrip("/")
+        ok, _ = _gh_api(f"/repos/{repo}/contents/{urllib.parse.quote(path)}")
+        if not ok:
+            return {"success": False, "message": f"Couldn't find {path} in {repo}."}
+        browser.get(f"https://github.com/{repo}/blob/HEAD/{path}")
+        return {"success": True, "message": f"Opened {path}."}
+
+    if action in ("view issues", "view pull requests", "view prs"):
+        if not repo:
+            return {"success": False, "message": "Open a repo first."}
+        kind = "issues" if "issue" in action else "pulls"
+        ok, data = _gh_api(f"/repos/{repo}/{kind}?state=open&per_page=5")
+        if not ok:
+            return {"success": False, "message": data}
+        # /issues also returns PRs — filter them out
+        if kind == "issues":
+            data = [d for d in data if "pull_request" not in d]
+        browser.get(f"https://github.com/{repo}/{'issues' if kind == 'issues' else 'pulls'}")
+        if not data:
+            return {"success": True, "message": f"No open {'issues' if kind == 'issues' else 'pull requests'} in {repo}."}
+        top = "; ".join(f"#{d['number']} {d['title'][:50]}" for d in data[:4])
+        return {"success": True, "message": f"Open {'issues' if kind == 'issues' else 'pull requests'} in {repo}: {top}."}
+
+    if action in ("read readme", "summarize repo", "summarise repo"):
+        if not repo:
+            return {"success": False, "message": "Open a repo first."}
+        try:
+            resp = requests.get(f"https://api.github.com/repos/{repo}/readme",
+                                headers={"Accept": "application/vnd.github.raw+json"},
+                                timeout=10)
+            if resp.status_code != 200:
+                return {"success": False, "message": f"No readme found in {repo}."}
+            text = re.sub(r"[#*`\[\]()>|-]", " ", resp.text)
+            text = re.sub(r"\s+", " ", text).strip()[:400]
+            return {"success": True, "message": f"Readme of {repo}: {text}"}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't fetch the readme: {e}"}
+
+    if action == "clone repo":
+        # REAL git clone into Documents\GitHub Clones (default, spoken aloud).
+        # Optional parameter overrides the destination: "clone repo|D:\code".
+        # PAT auth for private repos goes through an env var + credential
+        # helper so the token NEVER lands in .git/config or process lists.
+        if not repo and parameter and "/" in (parameter or "") and "\\" not in parameter:
+            repo = parameter.strip()
+            parameter = None
+        if not repo:
+            return {"success": False, "message": "Open a repo first, or say the full owner/name."}
+        if shutil.which("git") is None:
+            return {"success": False, "message": "Git isn't installed or isn't on your PATH, so I can't clone. Install Git for Windows first."}
+        base_dir = (parameter.strip() if parameter and parameter.strip()
+                    else os.path.join(os.path.expanduser("~"), "Documents", "GitHub Clones"))
+        dest = os.path.join(base_dir, repo.split("/")[1])
+        if os.path.isdir(dest) and os.listdir(dest):
+            return {"success": False, "message": f"{repo.split('/')[1]} already exists in {base_dir} — it looks like you've cloned it before."}
+        try:
+            os.makedirs(base_dir, exist_ok=True)
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't create the folder {base_dir}: {e}"}
+        url = f"https://github.com/{repo}.git"
+        env = os.environ.copy()
+        cmd = ["git", "clone", "--", url, dest]
+        if _gh_token():
+            # credential helper reads the PAT from env — keeps it out of the
+            # remote URL, .git/config, and the visible command line
+            env["GIT_ASKPASS_TOKEN"] = _gh_token()
+            cmd = ["git",
+                   "-c", 'credential.helper=!f() { echo "username=x-access-token"; echo "password=$GIT_ASKPASS_TOKEN"; }; f',
+                   "clone", "--", url, dest]
+        else:
+            env["GIT_TERMINAL_PROMPT"] = "0"  # fail fast instead of hanging on a prompt
+        try:
+            proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            return {"success": False, "message": f"Cloning {repo} timed out after five minutes — it may be a huge repo or a slow connection."}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't run git: {e}"}
+        if proc.returncode == 0:
+            return {"success": True, "message": f"Cloned {repo} into {dest}."}
+        err = (proc.stderr or "").strip().splitlines()
+        err_line = err[-1] if err else "unknown git error"
+        if "Authentication failed" in str(proc.stderr) or "could not read" in str(proc.stderr):
+            return {"success": False, "message": f"Git couldn't authenticate for {repo} — if it's private, check that your GITHUB_TOKEN has repo scope."}
+        if "already exists" in str(proc.stderr):
+            return {"success": False, "message": f"{repo.split('/')[1]} already exists in {base_dir}."}
+        return {"success": False, "message": f"Clone failed: {err_line[:120]}"}
+
+    # ── Tier A: writes via DOM (logged-in session) or PAT if available ──────
+    if action in ("star repo", "unstar repo"):
+        if not repo:
+            return {"success": False, "message": "Open a repo first."}
+        starring = action == "star repo"
+        if _gh_token():
+            ok, err = _gh_api(f"/user/starred/{repo}", "PUT" if starring else "DELETE")
+            if ok:
+                return {"success": True, "message": f"{'Starred' if starring else 'Unstarred'} {repo}."}
+        # DOM: .starring-container holds both forms; the visible one is current state
+        clicked = _nfx_click_first(browser, [
+            f'.starring-container .{"unstarred" if starring else "starred"} button',
+            f'button[aria-label*="{"Star this repository" if starring else "Unstar this repository"}"]',
+        ])
+        if clicked:
+            return {"success": True, "message": f"{'Starred' if starring else 'Unstarred'} {repo}."}
+        return {"success": False, "message": "Couldn't find the star button — are you logged into GitHub?"}
+
+    if action == "fork repo":
+        if not repo:
+            return {"success": False, "message": "Open a repo first."}
+        if _gh_token():
+            ok, data = _gh_api(f"/repos/{repo}/forks", "POST")
+            if ok:
+                return {"success": True, "message": f"Forked {repo} to {data.get('full_name', 'your account')}."}
+        browser.get(f"https://github.com/{repo}/fork")
+        time.sleep(1.5)
+        el = _gh_click_text_button(browser, ["create fork"])
+        if el:
+            el.click()
+            return {"success": True, "message": f"Forking {repo}."}
+        return {"success": False, "message": "Couldn't find the Create Fork button — are you logged in? You may already have a fork."}
+
+    if action == "create issue":
+        if not repo:
+            return {"success": False, "message": "Open a repo first."}
+        parts = (parameter or "").split("|")
+        title = parts[0].strip() if parts and parts[0].strip() else None
+        issue_body = parts[1].strip() if len(parts) > 1 else ""
+        if not title:
+            return {"success": False, "message": "Give me a title for the issue."}
+        if _gh_token():
+            ok, data = _gh_api(f"/repos/{repo}/issues", "POST",
+                               {"title": title, "body": issue_body})
+            if ok:
+                return {"success": True, "message": f"Created issue #{data['number']}: {title}."}
+            return {"success": False, "message": data}
+        # PLACEHOLDER-UNVERIFIED: GitHub's new React issue form. Navigates and
+        # fills by aria-label/placeholder; needs a live capture to confirm.
+        browser.get(f"https://github.com/{repo}/issues/new")
+        time.sleep(1.5)
+        try:
+            filled = browser.execute_script("""
+                var t = document.querySelector(
+                    'input[aria-label="Add a title"], input[placeholder="Title"], #issue_title');
+                var b = document.querySelector(
+                    'textarea[aria-label*="description" i], textarea[placeholder*="description" i], #issue_body');
+                if (!t) return false;
+                var setV = function (el, v) {
+                    var proto = el.tagName === 'TEXTAREA' ?
+                        HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    Object.getOwnPropertyDescriptor(proto, 'value').set.call(el, v);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                };
+                setV(t, arguments[0]);
+                if (b) setV(b, arguments[1]);
+                return true;
+            """, title, issue_body)
+        except Exception:
+            filled = False
+        if not filled:
+            return {"success": False, "message": "Couldn't fill the issue form — the page may have changed, or you need to log in. With a GITHUB_TOKEN set I can do this reliably."}
+        el = _gh_click_text_button(browser, ["submit new issue", "create"])
+        if el:
+            el.click()
+            return {"success": True, "message": f"Created issue: {title}."}
+        return {"success": False, "message": "Filled the form but couldn't find the submit button."}
+
+    # ── GATED actions (only reachable after sensei.py's confirmation gate) ──
+    if action in ("close issue", "close pull request"):
+        if not repo:
+            return {"success": False, "message": "Open a repo first."}
+        num = re.sub(r"\D", "", parameter or "")
+        if not num:
+            return {"success": False, "message": "Which number? Say close issue 12."}
+        if _gh_token():
+            path = f"/repos/{repo}/issues/{num}" if action == "close issue" else f"/repos/{repo}/pulls/{num}"
+            ok, data = _gh_api(path, "PATCH", {"state": "closed"})
+            if ok:
+                return {"success": True, "message": f"Closed #{num}."}
+            return {"success": False, "message": data}
+        kind = "issues" if action == "close issue" else "pull"
+        browser.get(f"https://github.com/{repo}/{kind}/{num}")
+        time.sleep(1.5)
+        el = _gh_click_text_button(browser, ["close issue", "close pull request", "close with comment"])
+        if el:
+            el.click()
+            return {"success": True, "message": f"Closed #{num}."}
+        return {"success": False, "message": f"Couldn't find the close button on #{num} — you may not have permission."}
+
+    if action == "merge pull request":
+        if not repo:
+            return {"success": False, "message": "Open a repo first."}
+        num = re.sub(r"\D", "", parameter or "")
+        if not num:
+            return {"success": False, "message": "Which PR number? Say merge pull request 7."}
+        if _gh_token():
+            ok, data = _gh_api(f"/repos/{repo}/pulls/{num}/merge", "PUT", {})
+            if ok:
+                return {"success": True, "message": f"Merged pull request #{num}."}
+            return {"success": False, "message": data}
+        # CONFIRMED current selector via refined-github's maintained list:
+        # merge box lives in [data-testid="mergebox-partial"]
+        browser.get(f"https://github.com/{repo}/pull/{num}")
+        time.sleep(2.0)
+        clicked = _nfx_click_first(browser, ['[data-testid="mergebox-partial"] button'])
+        if not clicked:
+            el = _gh_click_text_button(browser, ["merge pull request"])
+            if el:
+                el.click()
+                clicked = True
+        if not clicked:
+            return {"success": False, "message": f"Couldn't find the merge button on #{num} — it may have conflicts or need reviews."}
+        time.sleep(1.0)
+        el = _gh_click_text_button(browser, ["confirm merge"])
+        if el:
+            el.click()
+            return {"success": True, "message": f"Merged pull request #{num}."}
+        return {"success": False, "message": "Opened the merge menu but couldn't confirm — please check the page."}
+
+    if action == "create pull request":
+        if not repo:
+            return {"success": False, "message": "Open a repo first."}
+        if not parameter:
+            return {"success": False, "message": "Tell me the branch, like create pull request feature-x."}
+        if _gh_token():
+            parts = parameter.split("|")
+            head = parts[0].strip()
+            title = parts[1].strip() if len(parts) > 1 else f"Merge {head}"
+            ok, repo_data = _gh_api(f"/repos/{repo}")
+            base = repo_data.get("default_branch", "main") if ok else "main"
+            ok, data = _gh_api(f"/repos/{repo}/pulls", "POST",
+                               {"title": title, "head": head, "base": base})
+            if ok:
+                return {"success": True, "message": f"Created pull request #{data['number']}: {title}."}
+            return {"success": False, "message": data}
+        # PLACEHOLDER-UNVERIFIED: compare page flow needs a live capture
+        head = parameter.split("|")[0].strip()
+        browser.get(f"https://github.com/{repo}/compare/{urllib.parse.quote(head)}?expand=1")
+        time.sleep(1.5)
+        el = _gh_click_text_button(browser, ["create pull request"])
+        if el:
+            el.click()
+            time.sleep(1.5)
+            el2 = _gh_click_text_button(browser, ["create pull request"])
+            if el2:
+                el2.click()
+                return {"success": True, "message": f"Created pull request from {head}."}
+        return {"success": False, "message": "Couldn't complete the PR form — with a GITHUB_TOKEN set I can do this reliably."}
+
+    if action == "delete branch":
+        if not repo:
+            return {"success": False, "message": "Open a repo first."}
+        if not parameter:
+            return {"success": False, "message": "Which branch? Say delete branch old-feature."}
+        if _gh_token():
+            ok, data = _gh_api(f"/repos/{repo}/git/refs/heads/{urllib.parse.quote(parameter.strip())}", "DELETE")
+            if ok:
+                return {"success": True, "message": f"Deleted branch {parameter}."}
+            return {"success": False, "message": data}
+        return {"success": False, "message": "Deleting branches needs a GITHUB_TOKEN — I won't do this through fragile page clicks."}
+
+    if action in ("delete repo", "delete repository"):
+        # Same severity as shutdown/delete_files. PAT-ONLY by design: the DOM
+        # flow (settings -> danger zone -> retype repo name) is too fragile to
+        # trust for something this destructive.
+        if not repo and parameter and "/" in parameter:
+            repo = parameter.strip()
+        if not repo:
+            return {"success": False, "message": "Open the repo first or say the full owner/name."}
+        if not _gh_token():
+            return {"success": False, "message": f"Deleting {repo} needs a GITHUB_TOKEN with delete permissions. I won't attempt this through page clicks — it's irreversible."}
+        ok, data = _gh_api(f"/repos/{repo}", "DELETE")
+        if ok:
+            return {"success": True, "message": f"Deleted {repo}. That's permanent."}
+        return {"success": False, "message": data}
+
+    if action in ("push", "force push"):
+        return {"success": False, "message": "Pushing code is out of my scope — I don't run git operations. Do that from your terminal."}
+
+    return {"success": False, "message": f"Unknown github_control action: {action}"}
+
+
 # ── System actions ────────────────────────────────────────────────────────────
 
 def _find_exe(name: str) -> str | None:
@@ -2416,6 +2833,7 @@ _ACTION_MAP = {
     "netflix_control":   lambda p: netflix_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
     "amazon_control":    lambda p: amazon_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
     "flipkart_control":  lambda p: flipkart_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
+    "github_control":    lambda p: github_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "adjust_volume":     adjust_volume,
     "adjust_brightness": adjust_brightness,
     "screenshot":        lambda _: screenshot(),
