@@ -172,7 +172,22 @@ ACTION PARAMETER FORMATS:
 - switch_window: triggered when user says "switch to", "show me", "bring up", "go to", or "focus on" an already-open app.
 - maximize_window / minimize_window: always specify the app name. Never send null.
 
-FILES & FOLDERS: search_file, open_file, write_file, edit_file[C], move_files[C], copy_files, delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C], compress_files, extract_files
+FILES & FOLDERS: create_file, read_file, search_file, open_file, copy_files, compress_files, extract_files, write_file[C], edit_file[C], move_files[C], delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C]
+ACTION PARAMETER FORMATS (fields split with |; relative names resolve against the folder we're working in this session; %USERNAME% and ~ style paths are expanded automatically):
+- create_file: "path|optional initial content" — refuses if the file already exists.
+- read_file: "path" — reads content for you to reference or read aloud.
+- search_file: "name or partial name|optional folder" — defaults to the session folder or home.
+- open_file: "path" — opens with the default app for that file type.
+- copy_files: "files or pattern|destination folder" — e.g. "copy_files|*.png|D:\\backup". Non-destructive.
+- compress_files: "files or pattern|optional archive name" — creates a new zip, originals untouched.
+- extract_files: "archive|optional destination" — extracts into a new folder named after the archive.
+- write_file[C]: "path|content" — overwrites the whole file, always pauses for confirmation.
+- edit_file[C]: "path|find text|replace text" — if the text isn't found or appears more than once, it stops and asks rather than guessing.
+- move_files[C] / organize_files[C]: "files or pattern|destination folder" — the confirmation enumerates exactly which files move where.
+- delete_files[C]: "files or pattern|optional folder" — STRICTEST action: never send vague targets like "everything"; the confirmation enumerates every file by name before anything is deleted.
+- organize_folder[C]: "folder" — sorts loose files into category subfolders; the confirmation enumerates the plan.
+- bulk_rename_files[C]: "files or pattern|new base name" — renames to name-001, name-002...; the confirmation enumerates old-to-new.
+For all [C] file actions the executor builds the spoken enumeration itself — send the action directly, do NOT set confirmation_required for them, the pause happens automatically with the exact file list.
 
 DOWNLOADS & INSTALL: download_file, download_application, install_application[C], uninstall_application[C]
 
@@ -207,13 +222,9 @@ ACTION PARAMETER FORMATS:
   State changes (these ALWAYS pause for user confirmation first): "create pull request|branch|title", "merge pull request|7", "close issue|12", "close pull request|7", "delete branch|old-feature", "delete repo" (needs a GITHUB_TOKEN; treat as seriously as deleting files).
   OUT OF SCOPE: pushing code, force push, or any local git operation — tell the user to use their terminal.
   NEVER use click for GitHub search results, star/fork buttons, or merge buttons — github_control handles those reliably. Only use click on GitHub for things github_control cannot do.
-- FILE ACTIONS (default route for any file request — no VS Code needed): create_file, read_file, write_file, edit_file, search_file. Parameter fields split with |. Relative names resolve against the folder we're working in this session; paths may use %USERNAME% or ~ styles and are expanded automatically.
-  "create_file|notes.txt|optional initial content" (refuses if the file already exists), "read_file|main.py" (reads content for you to reference or read aloud), "search_file|report.docx|C:\\Users\\me\\Documents" (finds files by full or partial name; the second field is optional — defaults to the session folder or home).
-  These ALWAYS pause for user confirmation first: "write_file|path|content" (overwrites the whole file), "edit_file|path|find text|replace text" (targeted replacement — if the text isn't found or appears more than once, it stops and asks rather than guessing).
-- vscode_control: ONLY when the user explicitly says VS Code ("open it in VS Code", "open my project in VS Code"). Same format. "open folder|C:\\projects\\sensei", "open file|main.py", plus the same file actions ("create file", "read file", "write file", "edit file", "search file") when the user wants the result inside VS Code — the same confirmation rules apply.
+VS CODE: vscode_control
+- vscode_control: ONLY when the user explicitly says VS Code ("open it in VS Code", "open my project in VS Code"). Format: "action" or "action|parameter". "open folder|C:\\projects\\sensei", "open file|main.py", plus the same file actions ("create file", "read file", "write file", "edit file", "search file") when the user wants the result inside VS Code — the same confirmation rules apply. For any file request that does NOT mention VS Code, use the FILES & FOLDERS actions instead.
   OUT OF SCOPE: running code, managing extensions, or typing keystrokes into the editor — say those aren't available yet if asked.
-
-CODE: write_code, fix_code, read_clipboard, write_clipboard, dictate_text, vscode_control, create_file, read_file, write_file, edit_file, search_file
 
 GOOGLE WORKSPACE: send_email[C], read_emails, create_document, read_document, create_event, read_schedule
 
