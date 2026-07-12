@@ -58,6 +58,7 @@ vad_audio_buffer: list[np.ndarray] = []
 DANGEROUS_ACTIONS = frozenset({
     "close_application", "shutdown", "restart", "hibernate",
     "delete_files", "move_files", "edit_file", "uninstall_application",
+    "write_file",  # overwrites file content — gated same as edit_file
 })
 
 # Shopping sub-actions that must ALWAYS pause for confirmation, regardless of
