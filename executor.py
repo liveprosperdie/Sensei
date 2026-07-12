@@ -623,7 +623,7 @@ def vision_click(browser, instruction: str) -> bool:
     return True
 
 
-# ── Click element (CDP path) ───────────────────────���──────��───────────────────
+# ── Click element (CDP path) ───────────────────────�����──────��───────────────────
 
 def click_element(driver, index: int, expected_text: str | None = None,
                   expected_href: str | None = None, instruction: str | None = None) -> dict:
@@ -2439,7 +2439,8 @@ def read_file(parameter: str | None = None) -> dict:
         return {"success": False, "message": f"Couldn't read the file: {e}"}
     _remember(fpath)
     snippet = content[:600].strip()
-    return {"success": True, "message": f"{os.path.basename(fpath)} ({len(content)} chars read): {snippet}"}
+    return {"success": True, "speak": True,
+            "message": f"{os.path.basename(fpath)} ({len(content)} chars read): {snippet}"}
 
 
 def write_file(parameter: str | None = None) -> dict:
@@ -2532,7 +2533,7 @@ def search_file(parameter: str | None = None) -> dict:
         return {"success": False, "message": f"No file matching '{name}' found under {root}.{extra}", "results": []}
     shown = "; ".join(os.path.relpath(r, root) for r in results[:5])
     extra = " (search timed out — there may be more)" if timed_out else ""
-    return {"success": True,
+    return {"success": True, "speak": True,
             "message": f"Found {len(results)} match{'es' if len(results) != 1 else ''} under {root}: {shown}{extra}",
             "results": results}
 
@@ -2848,7 +2849,9 @@ def read_clipboard(parameter: str | None = None) -> dict:
     try:
         content = _ps_read_clipboard()
         if content is not None:
-            return {"success": True, "message": content.rstrip("\r\n") or "(clipboard is empty)"}
+            text = content.rstrip("\r\n")
+            return {"success": True, "speak": True,
+                    "message": f"Your clipboard says: {text}" if text else "Your clipboard is empty."}
     except Exception as e:
         print(f"[read_clipboard] powershell route failed: {e}")
     # LAST RESORT: tkinter (known-flaky on Windows — see header note)
@@ -2857,7 +2860,8 @@ def read_clipboard(parameter: str | None = None) -> dict:
         root.withdraw()
         content = root.clipboard_get()
         root.destroy()
-        return {"success": True, "message": content or "(clipboard is empty)"}
+        return {"success": True, "speak": True,
+                "message": f"Your clipboard says: {content}" if content else "Your clipboard is empty."}
     except Exception as e:
         return {"success": False, "message": f"Couldn't read clipboard: {e}"}
 
