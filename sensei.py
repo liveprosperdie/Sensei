@@ -364,6 +364,15 @@ def handle_response(response: dict) -> bool:
                 response["response"] = r["message"]
                 break
 
+        # feed execution outcomes back into LLM history — without this the
+        # next turn can't see what list_folder/read_clipboard/delete_files
+        # actually returned and it asks the user for data it already has
+        if run_results:
+            try:
+                claude_handler.record_action_results(run_results)
+            except Exception as e:
+                print(f"[v0] record_action_results failed: {e}")
+
         # click confirmation discovered at runtime
         if pending_action == "click_confirmed" and run_results:
             response["response"] = run_results[-1]
@@ -423,6 +432,10 @@ def get_akira_response(text: str) -> dict | None:
                         speak_text = exec_result["message"]
                     else:
                         speak_text = "Done."
+                    try:
+                        claude_handler.record_action_results([exec_result if isinstance(exec_result, dict) else speak_text])
+                    except Exception as e:
+                        print(f"[v0] record_action_results failed: {e}")
                 except Exception as e:
                     speak_text = f"Couldn't do that: {e}"
             else:

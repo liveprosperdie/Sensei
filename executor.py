@@ -1218,7 +1218,7 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     if "netflix.com" not in current_url:
         return {"success": False, "message": "Not a Netflix tab. Switch to Netflix first."}
 
-    # ── PLAYER actions via internal API ─────────────────────────────────────
+    # ── PLAYER actions via internal API ────────────────────────────────��────
     if action in ("play", "pause", "resume"):
         op = "pause" if action == "pause" else "play"
         ok = _nfx_js(browser, """
@@ -2434,9 +2434,21 @@ def read_file(parameter: str | None = None) -> dict:
         return {"success": False, "message": err}
     if not os.path.isfile(fpath):
         return {"success": False, "message": f"That file doesn't exist: {fpath}"}
+    # binary guard — reading a PDF/image/exe as text produces spoken garbage
+    ext = os.path.splitext(fpath)[1].lower()
+    if ext in {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+               ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic",
+               ".mp3", ".mp4", ".wav", ".mkv", ".avi", ".mov", ".zip", ".rar",
+               ".7z", ".exe", ".msi", ".dll", ".bin", ".iso"}:
+        return {"success": False,
+                "message": f"{os.path.basename(fpath)} is a {ext[1:]} file — I can't read it as text. Say 'open it' and I'll launch it in the default app instead."}
     try:
-        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read(4000)
+        with open(fpath, "rb") as f:
+            raw = f.read(4000)
+        if b"\x00" in raw:  # unknown binary format
+            return {"success": False,
+                    "message": f"{os.path.basename(fpath)} looks like a binary file — I can't read it as text. Want me to open it instead?"}
+        content = raw.decode("utf-8", errors="replace")
     except Exception as e:
         return {"success": False, "message": f"Couldn't read the file: {e}"}
     _remember(fpath)
