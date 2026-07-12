@@ -100,6 +100,8 @@ A CONVERSATION is anything where the user wants to TALK — ask for advice, get 
 
 When the intent is ambiguous — lean toward conversation. Only use command mode when the action is clear.
 
+ACTION RESULTS: after your actions run, the outcome appears in the conversation as a message starting with "[ACTION RESULT — not the user speaking]". That IS the real result — trust it and act on it. If it lists files, you HAVE the file list; use those exact names in your next action. Never say "I don't have the result" or ask the user to repeat data that appears in an ACTION RESULT. Never treat an ACTION RESULT as the user talking.
+
 COMMAND MODE RESPONSE FORMAT:
 Respond only in this exact JSON format, no markdown, no code fences, nothing else:
 {
@@ -381,6 +383,28 @@ def ask_akira(text: str) -> str:
         conversation_history.append({"role": "assistant", "content": response_text})
 
     return response_text
+
+
+def record_action_results(results: list) -> None:
+    """Feed action execution outcomes back into conversation history so the
+    NEXT LLM turn can see them. Without this the LLM says things like 'I
+    don't have the list result yet' right after a successful list_folder.
+    Appended as a user-role system note (API allows only user/assistant),
+    paired with a stub assistant ack to keep the history alternating."""
+    lines = []
+    for r in results:
+        if isinstance(r, dict):
+            status = "ok" if r.get("success") else "FAILED"
+            lines.append(f"{status}: {r.get('message', '')}")
+        elif isinstance(r, str) and r.strip():
+            lines.append(r)
+    if not lines:
+        return
+    note = "[ACTION RESULT — not the user speaking] " + " | ".join(lines)
+    print(f"[record_action_results] {note[:120]!r}")
+    with _history_lock:
+        conversation_history.append({"role": "user", "content": note})
+        conversation_history.append({"role": "assistant", "content": "(noted)"})
 
 
 def clear_history() -> None:
