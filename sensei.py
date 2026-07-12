@@ -348,13 +348,20 @@ def handle_response(response: dict) -> bool:
         else:
             run_results = run_actions(response if not response.get("pending_actions") else {"actions": safe})
 
-        # override spoken response on execution failure
+        # override spoken response on execution failure, OR when the action's
+        # entire point is the returned data (read_clipboard, read_file,
+        # search_file mark results "speak": True) — otherwise the LLM's
+        # pre-baked "let me check..." gets spoken and the data is discarded
         for r in reversed(run_results):
             if isinstance(r, str) and r.startswith(FAILURE_PREFIXES):
                 response["response"] = r
                 break
             if isinstance(r, dict) and r.get("success") is False:
                 response["response"] = r.get("message", "That didn't work.")
+                break
+            if isinstance(r, dict) and r.get("speak") and r.get("message"):
+                print(f"[run_actions] speaking informational result: {r['message'][:80]!r}")
+                response["response"] = r["message"]
                 break
 
         # click confirmation discovered at runtime
