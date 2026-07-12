@@ -76,6 +76,12 @@ RISKY_GITHUB_PARAMS = frozenset({
     "push", "force push",
 })
 
+# VS Code sub-actions that can destroy existing file content — always gated.
+# open/create/read stay free-flowing (create refuses to clobber by design).
+RISKY_VSCODE_PARAMS = frozenset({
+    "write file", "edit file",
+})
+
 
 def _is_dangerous_step(step: dict) -> bool:
     """True if this action step must be confirmation-gated by the safety net."""
@@ -86,6 +92,8 @@ def _is_dangerous_step(step: dict) -> bool:
         return param in RISKY_SHOPPING_PARAMS
     if step.get("action") == "github_control":
         return param in RISKY_GITHUB_PARAMS
+    if step.get("action") == "vscode_control":
+        return param in RISKY_VSCODE_PARAMS
     return False
 
 FAILURE_PREFIXES = (
