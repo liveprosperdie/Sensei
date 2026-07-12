@@ -8,6 +8,7 @@ import re
 import time
 import glob
 import shutil
+import zipfile
 import psutil
 import winreg
 import datetime
@@ -18,6 +19,7 @@ import win32process
 import win32gui
 import requests
 import pygetwindow as gw
+import tkinter as tk
 from PIL import ImageGrab
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -621,7 +623,7 @@ def vision_click(browser, instruction: str) -> bool:
     return True
 
 
-# ── Click element (CDP path) ──────────────────────────────────────────────────
+# ── Click element (CDP path) ──────────────────────────────��───────────────────
 
 def click_element(driver, index: int, expected_text: str | None = None,
                   expected_href: str | None = None, instruction: str | None = None) -> dict:
@@ -2535,6 +2537,339 @@ def search_file(parameter: str | None = None) -> dict:
             "results": results}
 
 
+# ── Bulk file operations ──────────────────────────────────────────────────────
+# MCP NOTE (bible §7.1): no MCP client is wired into this app yet, so these
+# are custom implementations. move_files and file search map cleanly onto the
+# official MCP filesystem server (move_file / search_files) and should migrate
+# once an MCP client exists; copy/delete/compress/extract/organize/bulk-rename
+# have NO official MCP filesystem equivalents and stay custom regardless.
+#
+# GATING PATTERN: destructive bulk ops do a DRY-RUN RESOLVE first and return
+# {"needs_confirmation", "confirm_message" (spoken enumeration), "_execute"}.
+# sensei.py speaks the enumeration and only runs _execute after a spoken yes —
+# the same pause machinery as click confirmation. Gating lives HERE, with the
+# implementation, so no entry point can bypass it.
+
+_VAGUE_SPECS = frozenset({"*", "*.*", "everything", "all", "all files", "files"})
+
+
+def _resolve_targets(spec: str | None, root: str | None = None) -> tuple[list, str | None, str | None]:
+    """Resolve a comma-list / glob / partial name to an EXACT file list.
+    Returns (files, root_used, error). Never guesses broadly."""
+    if not spec or not spec.strip():
+        return [], None, "Which files? Give me names or a pattern like *.png."
+    if spec.strip().lower() in _VAGUE_SPECS:
+        return [], None, "That's too broad — tell me which files specifically, like *.png or the file names."
+    base = _normalize_path(root) if root else (_vsc_last_folder or os.path.expanduser("~"))
+    if not os.path.isdir(base):
+        return [], None, f"That folder doesn't exist: {base}"
+    files: list = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        p = _normalize_path(part)
+        if os.path.isabs(p) and os.path.isfile(p):
+            files.append(p)
+        elif any(ch in part for ch in "*?["):
+            files.extend(f for f in glob.glob(os.path.join(base, part)) if os.path.isfile(f))
+        elif os.path.isfile(os.path.join(base, part)):
+            files.append(os.path.join(base, part))
+        else:  # partial name — must resolve unambiguously, never guess
+            hits = [os.path.join(base, fn) for fn in os.listdir(base)
+                    if part.lower() in fn.lower() and os.path.isfile(os.path.join(base, fn))]
+            if len(hits) == 1:
+                files.append(hits[0])
+            elif len(hits) > 1:
+                names = ", ".join(os.path.basename(h) for h in hits[:6])
+                return [], base, f"'{part}' matches {len(hits)} files: {names}. Which ones?"
+            else:
+                return [], base, f"I couldn't find '{part}' in {base}."
+    files = sorted(set(files))
+    if not files:
+        return [], base, f"Nothing matched '{spec}' in {base}."
+    return files, base, None
+
+
+def _enumerate_files(files: list, limit: int = 8) -> str:
+    """Spoken enumeration of exact file names — the confirmation payload."""
+    names = [os.path.basename(f) for f in files[:limit]]
+    extra = f", and {len(files) - limit} more" if len(files) > limit else ""
+    return ", ".join(names) + extra
+
+
+def _move_batch(pairs: list) -> dict:
+    """Shared executor for move/organize/rename: [(src, dest_path), ...]."""
+    moved, failed = 0, []
+    for src, dest in pairs:
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            shutil.move(src, dest)
+            moved += 1
+        except Exception as e:
+            failed.append(f"{os.path.basename(src)} ({e})")
+    if failed:
+        return {"success": moved > 0,
+                "message": f"Moved {moved}, but {len(failed)} failed: {'; '.join(failed[:3])}"}
+    return {"success": True, "message": f"Done — {moved} file{'s' if moved != 1 else ''} moved."}
+
+
+def _gated(confirm_message: str, execute_fn) -> dict:
+    """Standard gated-plan result — sensei.py speaks confirm_message and runs
+    execute_fn only after a spoken yes."""
+    return {"needs_confirmation": True, "confirm_message": confirm_message,
+            "_execute": execute_fn}
+
+
+def open_file(parameter: str | None = None) -> dict:
+    """open_file|path — opens with the OS default application. Ungated."""
+    print(f"[open_file] called with parameter={parameter!r}")
+    fpath, err = _resolve_path(parameter)
+    if err:
+        return {"success": False, "message": err}
+    if not os.path.isfile(fpath):
+        return {"success": False, "message": f"That file doesn't exist: {fpath}"}
+    try:
+        if hasattr(os, "startfile"):        # Windows
+            os.startfile(fpath)
+        else:                               # dev sandbox fallback
+            subprocess.Popen(["xdg-open", fpath])
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't open it: {e}"}
+    _remember(fpath)
+    return {"success": True, "message": f"Opened {os.path.basename(fpath)}."}
+
+
+def copy_files(parameter: str | None = None) -> dict:
+    """copy_files|spec|dest_folder — non-destructive, ungated."""
+    print(f"[copy_files] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    if len(parts) < 2 or not parts[1].strip():
+        return {"success": False, "message": "Copy needs files and a destination — copy files|*.png|D:\\backup."}
+    files, _, err = _resolve_targets(parts[0])
+    if err:
+        return {"success": False, "message": err}
+    dest = _normalize_path(parts[1])
+    try:
+        os.makedirs(dest, exist_ok=True)
+        for f in files:
+            shutil.copy2(f, os.path.join(dest, os.path.basename(f)))
+    except Exception as e:
+        return {"success": False, "message": f"Copy failed: {e}"}
+    return {"success": True, "message": f"Copied {len(files)} file{'s' if len(files) != 1 else ''} to {dest}."}
+
+
+def move_files(parameter: str | None = None) -> dict:
+    """move_files|spec|dest_folder — GATED: enumerates exactly what moves
+    where, then waits for a spoken yes."""
+    print(f"[move_files] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    if len(parts) < 2 or not parts[1].strip():
+        return {"success": False, "message": "Move needs files and a destination — move files|*.pdf|D:\\archive."}
+    files, _, err = _resolve_targets(parts[0])
+    if err:
+        return {"success": False, "message": err}
+    dest = _normalize_path(parts[1])
+    pairs = [(f, os.path.join(dest, os.path.basename(f))) for f in files]
+    msg = (f"I'll move {len(files)} file{'s' if len(files) != 1 else ''} to {dest}: "
+           f"{_enumerate_files(files)}. Should I go ahead?")
+    return _gated(msg, lambda: _move_batch(pairs))
+
+
+def organize_files(parameter: str | None = None) -> dict:
+    """organize_files|spec|dest_folder — same operation as move_files
+    (resolve, enumerate, gate); alias kept for natural phrasing."""
+    print(f"[organize_files] called with parameter={parameter!r}")
+    return move_files(parameter)
+
+
+def delete_files(parameter: str | None = None) -> dict:
+    """delete_files|spec|root? — STRICTEST gate in the batch: exact list
+    resolution first, ambiguity refused, hard cap, full enumeration spoken."""
+    print(f"[delete_files] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    files, _, err = _resolve_targets(parts[0] if parts and parts[0] else None,
+                                     parts[1] if len(parts) > 1 else None)
+    if err:
+        return {"success": False, "message": err}   # vague/ambiguous → ask, never guess
+    if len(files) > 15:
+        return {"success": False, "message": f"That would delete {len(files)} files — too many to do safely in one go. Narrow it down and I'll enumerate them."}
+    def _do():
+        failed = []
+        for f in files:
+            try:
+                os.remove(f)
+            except Exception as e:
+                failed.append(f"{os.path.basename(f)} ({e})")
+        if failed:
+            return {"success": len(failed) < len(files),
+                    "message": f"Deleted {len(files) - len(failed)}, but couldn't delete: {'; '.join(failed[:3])}"}
+        return {"success": True, "message": f"Deleted {len(files)} file{'s' if len(files) != 1 else ''}. That's permanent."}
+    msg = (f"This will permanently delete {len(files)} file{'s' if len(files) != 1 else ''}: "
+           f"{_enumerate_files(files, limit=15)}. Are you sure?")
+    return _gated(msg, _do)
+
+
+_ORGANIZE_CATEGORIES = {
+    "Images":     {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp", ".heic"},
+    "Documents":  {".pdf", ".doc", ".docx", ".txt", ".rtf", ".odt", ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".md"},
+    "Videos":     {".mp4", ".mkv", ".avi", ".mov", ".webm"},
+    "Audio":      {".mp3", ".wav", ".flac", ".m4a", ".ogg"},
+    "Archives":   {".zip", ".rar", ".7z", ".tar", ".gz"},
+    "Installers": {".exe", ".msi", ".dmg"},
+    "Code":       {".py", ".js", ".ts", ".html", ".css", ".json", ".java", ".c", ".cpp", ".sh"},
+}
+
+
+def organize_folder(parameter: str | None = None) -> dict:
+    """organize_folder|folder — plans category subfolders by extension,
+    GATED with a spoken per-category enumeration."""
+    print(f"[organize_folder] called with parameter={parameter!r}")
+    folder, err = _resolve_path(parameter, want_dir=True)
+    if err:
+        return {"success": False, "message": err}
+    if not os.path.isdir(folder):
+        return {"success": False, "message": f"That folder doesn't exist: {folder}"}
+    pairs, counts = [], {}
+    for fn in os.listdir(folder):
+        src = os.path.join(folder, fn)
+        if not os.path.isfile(src):
+            continue
+        ext = os.path.splitext(fn)[1].lower()
+        cat = next((c for c, exts in _ORGANIZE_CATEGORIES.items() if ext in exts), "Other")
+        pairs.append((src, os.path.join(folder, cat, fn)))
+        counts[cat] = counts.get(cat, 0) + 1
+    if not pairs:
+        return {"success": False, "message": f"There are no loose files to organize in {folder}."}
+    summary = ", ".join(f"{n} to {cat}" for cat, n in sorted(counts.items()))
+    msg = (f"I'll organize {len(pairs)} files in {os.path.basename(folder)} into subfolders: "
+           f"{summary}. Should I go ahead?")
+    return _gated(msg, lambda: _move_batch(pairs))
+
+
+def bulk_rename_files(parameter: str | None = None) -> dict:
+    """bulk_rename_files|spec|new_base — renames to new_base-001.ext etc.,
+    GATED with old-to-new enumeration."""
+    print(f"[bulk_rename_files] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    if len(parts) < 2 or not parts[1].strip():
+        return {"success": False, "message": "Rename needs files and a new base name — bulk rename files|*.jpg|vacation."}
+    files, _, err = _resolve_targets(parts[0])
+    if err:
+        return {"success": False, "message": err}
+    new_base = re.sub(r'[<>:"/\\|?*]', "", parts[1].strip())
+    pairs = [(f, os.path.join(os.path.dirname(f), f"{new_base}-{i:03d}{os.path.splitext(f)[1]}"))
+             for i, f in enumerate(files, 1)]
+    preview = "; ".join(f"{os.path.basename(s)} to {os.path.basename(d)}" for s, d in pairs[:4])
+    extra = f", and {len(pairs) - 4} more the same way" if len(pairs) > 4 else ""
+    msg = f"I'll rename {len(pairs)} files: {preview}{extra}. Should I go ahead?"
+    return _gated(msg, lambda: _move_batch(pairs))
+
+
+def compress_files(parameter: str | None = None) -> dict:
+    """compress_files|spec|archive_name? — creates a NEW zip, never touches
+    the source files (zipfile.write only reads). Ungated by design."""
+    print(f"[compress_files] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    files, base, err = _resolve_targets(parts[0] if parts and parts[0] else None)
+    if err:
+        return {"success": False, "message": err}
+    name = (parts[1].strip() if len(parts) > 1 and parts[1].strip() else "archive")
+    if not name.lower().endswith(".zip"):
+        name += ".zip"
+    archive = os.path.join(base, name)
+    if os.path.exists(archive):
+        return {"success": False, "message": f"{name} already exists in {base} — give me a different name."}
+    try:
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in files:
+                zf.write(f, os.path.basename(f))
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't create the archive: {e}"}
+    return {"success": True, "message": f"Zipped {len(files)} file{'s' if len(files) != 1 else ''} into {name}. The originals are untouched."}
+
+
+def extract_files(parameter: str | None = None) -> dict:
+    """extract_files|archive|dest? — extracts into a NEW folder named after
+    the archive; refuses to spill into a non-empty folder. Ungated."""
+    print(f"[extract_files] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    fpath, err = _resolve_path(parts[0] if parts and parts[0] else None)
+    if err:
+        return {"success": False, "message": err}
+    if not os.path.isfile(fpath):
+        return {"success": False, "message": f"That archive doesn't exist: {fpath}"}
+    if not zipfile.is_zipfile(fpath):
+        return {"success": False, "message": f"{os.path.basename(fpath)} isn't a zip file — I can only extract zips for now."}
+    dest = (_normalize_path(parts[1]) if len(parts) > 1 and parts[1].strip()
+            else os.path.join(os.path.dirname(fpath), os.path.splitext(os.path.basename(fpath))[0]))
+    if os.path.isdir(dest) and os.listdir(dest):
+        return {"success": False, "message": f"{dest} already exists and isn't empty — give me a different destination."}
+    try:
+        with zipfile.ZipFile(fpath) as zf:
+            names = zf.namelist()
+            zf.extractall(dest)
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't extract it: {e}"}
+    return {"success": True, "message": f"Extracted {len(names)} item{'s' if len(names) != 1 else ''} into {dest}."}
+
+
+# ── Clipboard operations ──────────────────────────────────────────────────────
+# Cross-platform using tkinter (already in the dependency chain via PIL).
+# Fallback to subprocess on Windows (clip.exe) for robustness.
+
+def read_clipboard() -> dict:
+    """read_clipboard — reads current clipboard content (text), returns it for
+    Akira to speak or use in chained actions. No confirmation needed."""
+    print(f"[read_clipboard] called")
+    try:
+        root = tk.Tk()
+        root.withdraw()  # don't show window
+        content = root.clipboard_get()
+        root.destroy()
+        return {"success": True, "message": content or "(clipboard is empty)"}
+    except tk.TclError:
+        # tkinter failed — try subprocess fallback on Windows
+        try:
+            result = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                     "Get-Clipboard"], capture_output=True, text=True, timeout=2)
+            content = result.stdout.rstrip("\n\r")
+            return {"success": True, "message": content or "(clipboard is empty)"}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't read clipboard: {e}"}
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't read clipboard: {e}"}
+
+
+def write_clipboard(parameter: str | None = None) -> dict:
+    """write_clipboard|exact content — writes exact user-dictated content
+    verbatim to clipboard, no paraphrasing or reformatting per bible §6.4.
+    No confirmation needed, pure write."""
+    print(f"[write_clipboard] called with parameter={parameter!r}")
+    if not parameter:
+        return {"success": False, "message": "Tell me what to write to the clipboard."}
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.clipboard_clear()
+        root.clipboard_append(parameter)
+        root.update()  # required to ensure clipboard contents are propagated
+        root.destroy()
+        return {"success": True, "message": f"Copied to clipboard ({len(parameter)} chars)."}
+    except tk.TclError:
+        # tkinter failed — try subprocess fallback on Windows
+        try:
+            # PowerShell Set-Clipboard requires the content via stdin or -Value flag
+            subprocess.run(["powershell", "-NoProfile", "-Command",
+                           f"Set-Clipboard -Value {repr(parameter)}"],
+                          timeout=2, check=True)
+            return {"success": True, "message": f"Copied to clipboard ({len(parameter)} chars)."}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't write clipboard: {e}"}
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't write clipboard: {e}"}
+
+
 def vscode_control(action: str, parameter: str | None = None) -> dict:
     """
     VS Code control — used when the user explicitly says 'in VS Code'.
@@ -3104,6 +3439,17 @@ _ACTION_MAP = {
     "write_file":        write_file,
     "edit_file":         edit_file,
     "search_file":       search_file,
+    "open_file":         open_file,
+    "copy_files":        copy_files,
+    "move_files":        move_files,
+    "organize_files":    organize_files,
+    "delete_files":      delete_files,
+    "organize_folder":   organize_folder,
+    "bulk_rename_files": bulk_rename_files,
+    "compress_files":    compress_files,
+    "extract_files":     extract_files,
+    "read_clipboard":    read_clipboard,
+    "write_clipboard":   write_clipboard,
     "adjust_volume":     adjust_volume,
     "adjust_brightness": adjust_brightness,
     "screenshot":        lambda _: screenshot(),
