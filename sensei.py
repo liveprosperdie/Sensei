@@ -247,11 +247,14 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
         # {{stepX.result}} substitution
         parameter = step.get("parameter")
         if parameter and isinstance(parameter, str) and "{{" in parameter:
-            parameter = re.sub(
-                r"\{\{(\w+)\.result\}\}",
-                lambda m: str(step_results.get(m.group(1), m.group(0))),
-                parameter,
-            )
+            def _sub(m):
+                r = step_results.get(m.group(1), m.group(0))
+                # dict results must inject their message, never the repr —
+                # str(dict) produced garbage params like "{'success': True...}"
+                if isinstance(r, dict):
+                    return str(r.get("message", ""))
+                return str(r)
+            parameter = re.sub(r"\{\{(\w+)\.result\}\}", _sub, parameter)
             print(f"[run_actions] substituted parameter={parameter!r}")
 
         print(f"[run_actions] {step['action']} | {parameter!r} | id={step_id}")
