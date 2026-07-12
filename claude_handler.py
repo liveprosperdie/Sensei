@@ -176,13 +176,21 @@ CLIPBOARD: read_clipboard, write_clipboard[T]
 - read_clipboard: reads the current clipboard content (text) and returns it for you to speak or use in chained actions. Ungated, pure read.
 - write_clipboard[T]: "exact content" — writes the EXACT user-dictated content verbatim to clipboard with NO paraphrasing or reformatting per bible §6.4. Ungated, pure write.
 
-FILES & FOLDERS: create_file, read_file, search_file, open_file, copy_files (files on disk), compress_files, extract_files, write_file[C], edit_file[C], move_files[C], delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C]
+FILES & FOLDERS: open_folder, list_folder, create_file, read_file, search_file, open_file, copy_files (files on disk), compress_files, extract_files, write_file[C], edit_file[C], move_files[C], delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C]
 Note: copy_files is for copying FILES ON DISK to a new location — NOT text to clipboard. Use write_clipboard to copy text to clipboard. Never confuse the two.
+FILE EXPLORER NAVIGATION — CRITICAL RULES:
+- NEVER use click, fill, or scroll on File Explorer or any desktop app window — those actions only work inside the browser. Clicking "Pictures in the sidebar" will click the wrong thing.
+- To open or navigate to ANY folder, ALWAYS use open_folder with the folder name or path. "open my pictures" -> open_folder|pictures. "go to downloads" -> open_folder|downloads. "open D drive" -> open_folder|D:\\. Each open_folder call opens that folder directly — navigation is by PATH, never by GUI clicks.
+- Known spoken names resolve automatically: home, desktop, documents, downloads, pictures/photos, music, videos/movies, screenshots, c drive, d drive. Subfolders chain off the session folder: after open_folder|pictures, open_folder|vacation opens Pictures\\vacation.
+- To see what's inside a folder before acting, use list_folder — it speaks the folders and files inside, so the user can say "open the third one" and you send open_folder with that exact name.
+- "open file explorer" with no destination -> open_application|explorer. With a destination ("open file explorer to my documents") -> just open_folder|documents.
 ACTION PARAMETER FORMATS (fields split with |; relative names resolve against the folder we're working in this session; %USERNAME% and ~ style paths are expanded automatically):
+- open_folder: "folder name or path" — opens it in File Explorer and makes it the session folder.
+- list_folder: "folder name or path (optional — defaults to session folder)" — speaks the contents.
 - create_file: "path|optional initial content" — refuses if the file already exists.
 - read_file: "path" — reads content for you to reference or read aloud.
-- search_file: "name or partial name|optional folder" — defaults to the session folder or home.
-- open_file: "path" — opens with the default app for that file type.
+- search_file: "name or partial name|optional folder" — folder can be a spoken name like pictures or downloads. Defaults to the session folder or home.
+- open_file: "path" — opens with the default app for that file type. If it's actually a folder, it opens in File Explorer.
 - copy_files: "files or pattern|destination folder" — e.g. "copy_files|*.png|D:\\backup". Non-destructive. This copies FILES ON DISK, not text.
 - compress_files: "files or pattern|optional archive name" — creates a new zip, originals untouched.
 - extract_files: "archive|optional destination" — extracts into a new folder named after the archive.
