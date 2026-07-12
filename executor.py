@@ -176,6 +176,8 @@ APP_ALIASES = {
     "mozilla firefox": "firefox", "github desktop": "githubapp",
     "github": "github", "proton vpn": "protonvpn",
     "adobe acrobat": "acrobat", "adobe reader": "acrobat", "git bash": "gitbash",
+    "file explorer": "explorer", "windows explorer": "explorer",
+    "my computer": "explorer", "this pc": "explorer", "file manager": "explorer",
 }
 
 # RISKY_KEYWORDS — word-boundary matched, not substring
@@ -623,7 +625,7 @@ def vision_click(browser, instruction: str) -> bool:
     return True
 
 
-# ── Click element (CDP path) ───────────────────────�����──────��───────────────────
+# ── Click element (CDP path) ───────────────────────�������──────��───────────────────
 
 def click_element(driver, index: int, expected_text: str | None = None,
                   expected_href: str | None = None, instruction: str | None = None) -> dict:
@@ -2507,7 +2509,9 @@ def search_file(parameter: str | None = None) -> dict:
     if not name:
         return {"success": False, "message": "What file should I look for?"}
     if len(parts) > 1 and parts[1].strip():
-        root = _normalize_path(parts[1])
+        root, rerr = _resolve_folder(parts[1])   # accepts "pictures", "downloads", paths
+        if rerr:
+            return {"success": False, "message": rerr}
     else:
         root = _vsc_last_folder or os.path.expanduser("~")
     if not os.path.isdir(root):
@@ -2622,13 +2626,102 @@ def _gated(confirm_message: str, execute_fn) -> dict:
             "_execute": execute_fn}
 
 
+# Spoken names for standard user folders — the LLM sends what the user SAYS
+# ("pictures", "downloads"), not a path. Resolved before any disk lookup.
+_KNOWN_FOLDERS = {
+    "home": "~", "user folder": "~",
+    "desktop": "~/Desktop", "documents": "~/Documents", "docs": "~/Documents",
+    "downloads": "~/Downloads", "download": "~/Downloads",
+    "pictures": "~/Pictures", "photos": "~/Pictures", "images": "~/Pictures",
+    "music": "~/Music", "videos": "~/Videos", "movies": "~/Videos",
+    "screenshots": "~/Pictures/Screenshots",
+    "c drive": "C:\\", "c": "C:\\", "d drive": "D:\\", "e drive": "E:\\",
+}
+
+
+def _resolve_folder(name: str | None) -> tuple[str | None, str | None]:
+    """Resolve a spoken folder reference: known name > absolute path >
+    relative to session folder > relative to home. Returns (path, error)."""
+    if not name or not name.strip():
+        return None, "Which folder? Say a name like downloads, or a full path."
+    key = name.strip().strip('"').lower().rstrip("\\/") or name.strip()
+    if key in _KNOWN_FOLDERS:
+        return os.path.expanduser(_KNOWN_FOLDERS[key].replace("/", os.sep)), None
+    p = _normalize_path(name)
+    if os.path.isabs(p):
+        return p, None
+    for base in filter(None, [_vsc_last_folder, os.path.expanduser("~")]):
+        candidate = os.path.join(base, p)
+        if os.path.isdir(candidate):
+            return candidate, None
+    return None, f"I couldn't find a folder called '{name}'. Give me the full path or say one of your main folders like documents or downloads."
+
+
+def open_folder(parameter: str | None = None) -> dict:
+    """open_folder|name or path — opens it in File Explorer. This is THE way
+    to navigate File Explorer: by path, never by clicking the Explorer GUI."""
+    print(f"[open_folder] called with parameter={parameter!r}")
+    folder, err = _resolve_folder(parameter)
+    if err:
+        return {"success": False, "message": err}
+    if not os.path.isdir(folder):
+        return {"success": False, "message": f"That folder doesn't exist: {folder}"}
+    try:
+        if os.name == "nt":
+            subprocess.Popen(["explorer", folder])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't open it: {e}"}
+    global _vsc_last_folder
+    _vsc_last_folder = folder
+    return {"success": True, "message": f"Opened {os.path.basename(folder) or folder} in File Explorer."}
+
+
+def list_folder(parameter: str | None = None) -> dict:
+    """list_folder|name or path — speaks what's inside a folder so the user
+    can navigate by voice without looking. Ungated, read-only."""
+    print(f"[list_folder] called with parameter={parameter!r}")
+    global _vsc_last_folder
+    folder, err = _resolve_folder(parameter or _vsc_last_folder or "~")
+    if err:
+        return {"success": False, "message": err}
+    if not os.path.isdir(folder):
+        return {"success": False, "message": f"That folder doesn't exist: {folder}"}
+    try:
+        entries = sorted(os.listdir(folder), key=str.lower)
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't read that folder: {e}"}
+    dirs = [e for e in entries if os.path.isdir(os.path.join(folder, e)) and not e.startswith((".", "$"))]
+    files = [e for e in entries if os.path.isfile(os.path.join(folder, e)) and not e.startswith((".", "$"))]
+    _vsc_last_folder = folder
+    if not dirs and not files:
+        return {"success": True, "speak": True, "message": f"{os.path.basename(folder) or folder} is empty."}
+    parts = []
+    if dirs:
+        shown = ", ".join(dirs[:10]) + (f", and {len(dirs) - 10} more" if len(dirs) > 10 else "")
+        parts.append(f"{len(dirs)} folder{'s' if len(dirs) != 1 else ''}: {shown}")
+    if files:
+        shown = ", ".join(files[:10]) + (f", and {len(files) - 10} more" if len(files) > 10 else "")
+        parts.append(f"{len(files)} file{'s' if len(files) != 1 else ''}: {shown}")
+    return {"success": True, "speak": True,
+            "message": f"In {os.path.basename(folder) or folder}: " + ". ".join(parts) + "."}
+
+
 def open_file(parameter: str | None = None) -> dict:
-    """open_file|path — opens with the OS default application. Ungated."""
+    """open_file|path — opens with the OS default application. If the path is
+    actually a folder, delegates to open_folder instead of failing. Ungated."""
     print(f"[open_file] called with parameter={parameter!r}")
     fpath, err = _resolve_path(parameter)
     if err:
         return {"success": False, "message": err}
+    if os.path.isdir(fpath):
+        return open_folder(parameter)   # user said "open X" and X is a folder
     if not os.path.isfile(fpath):
+        # not on disk at the exact path — maybe it's a spoken folder name
+        folder, ferr = _resolve_folder(parameter)
+        if not ferr and os.path.isdir(folder):
+            return open_folder(parameter)
         return {"success": False, "message": f"That file doesn't exist: {fpath}"}
     try:
         if hasattr(os, "startfile"):        # Windows
@@ -3482,6 +3575,8 @@ _ACTION_MAP = {
     "edit_file":         edit_file,
     "search_file":       search_file,
     "open_file":         open_file,
+    "open_folder":       open_folder,
+    "list_folder":       list_folder,
     "copy_files":        copy_files,
     "move_files":        move_files,
     "organize_files":    organize_files,
