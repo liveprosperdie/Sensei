@@ -19,6 +19,7 @@ import win32process
 import win32gui
 import requests
 import pygetwindow as gw
+import tkinter as tk
 from PIL import ImageGrab
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -622,7 +623,7 @@ def vision_click(browser, instruction: str) -> bool:
     return True
 
 
-# ── Click element (CDP path) ──────────────────────────────────────────────────
+# ── Click element (CDP path) ──────────────────────────────��───────────────────
 
 def click_element(driver, index: int, expected_text: str | None = None,
                   expected_href: str | None = None, instruction: str | None = None) -> dict:
@@ -2813,6 +2814,62 @@ def extract_files(parameter: str | None = None) -> dict:
     return {"success": True, "message": f"Extracted {len(names)} item{'s' if len(names) != 1 else ''} into {dest}."}
 
 
+# ── Clipboard operations ──────────────────────────────────────────────────────
+# Cross-platform using tkinter (already in the dependency chain via PIL).
+# Fallback to subprocess on Windows (clip.exe) for robustness.
+
+def read_clipboard() -> dict:
+    """read_clipboard — reads current clipboard content (text), returns it for
+    Akira to speak or use in chained actions. No confirmation needed."""
+    print(f"[read_clipboard] called")
+    try:
+        root = tk.Tk()
+        root.withdraw()  # don't show window
+        content = root.clipboard_get()
+        root.destroy()
+        return {"success": True, "message": content or "(clipboard is empty)"}
+    except tk.TclError:
+        # tkinter failed — try subprocess fallback on Windows
+        try:
+            result = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                     "Get-Clipboard"], capture_output=True, text=True, timeout=2)
+            content = result.stdout.rstrip("\n\r")
+            return {"success": True, "message": content or "(clipboard is empty)"}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't read clipboard: {e}"}
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't read clipboard: {e}"}
+
+
+def write_clipboard(parameter: str | None = None) -> dict:
+    """write_clipboard|exact content — writes exact user-dictated content
+    verbatim to clipboard, no paraphrasing or reformatting per bible §6.4.
+    No confirmation needed, pure write."""
+    print(f"[write_clipboard] called with parameter={parameter!r}")
+    if not parameter:
+        return {"success": False, "message": "Tell me what to write to the clipboard."}
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.clipboard_clear()
+        root.clipboard_append(parameter)
+        root.update()  # required to ensure clipboard contents are propagated
+        root.destroy()
+        return {"success": True, "message": f"Copied to clipboard ({len(parameter)} chars)."}
+    except tk.TclError:
+        # tkinter failed — try subprocess fallback on Windows
+        try:
+            # PowerShell Set-Clipboard requires the content via stdin or -Value flag
+            subprocess.run(["powershell", "-NoProfile", "-Command",
+                           f"Set-Clipboard -Value {repr(parameter)}"],
+                          timeout=2, check=True)
+            return {"success": True, "message": f"Copied to clipboard ({len(parameter)} chars)."}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't write clipboard: {e}"}
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't write clipboard: {e}"}
+
+
 def vscode_control(action: str, parameter: str | None = None) -> dict:
     """
     VS Code control — used when the user explicitly says 'in VS Code'.
@@ -3391,6 +3448,8 @@ _ACTION_MAP = {
     "bulk_rename_files": bulk_rename_files,
     "compress_files":    compress_files,
     "extract_files":     extract_files,
+    "read_clipboard":    read_clipboard,
+    "write_clipboard":   write_clipboard,
     "adjust_volume":     adjust_volume,
     "adjust_brightness": adjust_brightness,
     "screenshot":        lambda _: screenshot(),

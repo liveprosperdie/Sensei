@@ -172,13 +172,18 @@ ACTION PARAMETER FORMATS:
 - switch_window: triggered when user says "switch to", "show me", "bring up", "go to", or "focus on" an already-open app.
 - maximize_window / minimize_window: always specify the app name. Never send null.
 
-FILES & FOLDERS: create_file, read_file, search_file, open_file, copy_files, compress_files, extract_files, write_file[C], edit_file[C], move_files[C], delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C]
+CLIPBOARD: read_clipboard, write_clipboard[T]
+- read_clipboard: reads the current clipboard content (text) and returns it for you to speak or use in chained actions. Ungated, pure read.
+- write_clipboard[T]: "exact content" — writes the EXACT user-dictated content verbatim to clipboard with NO paraphrasing or reformatting per bible §6.4. Ungated, pure write.
+
+FILES & FOLDERS: create_file, read_file, search_file, open_file, copy_files (files on disk), compress_files, extract_files, write_file[C], edit_file[C], move_files[C], delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C]
+Note: copy_files is for copying FILES ON DISK to a new location — NOT text to clipboard. Use write_clipboard to copy text to clipboard. Never confuse the two.
 ACTION PARAMETER FORMATS (fields split with |; relative names resolve against the folder we're working in this session; %USERNAME% and ~ style paths are expanded automatically):
 - create_file: "path|optional initial content" — refuses if the file already exists.
 - read_file: "path" — reads content for you to reference or read aloud.
 - search_file: "name or partial name|optional folder" — defaults to the session folder or home.
 - open_file: "path" — opens with the default app for that file type.
-- copy_files: "files or pattern|destination folder" — e.g. "copy_files|*.png|D:\\backup". Non-destructive.
+- copy_files: "files or pattern|destination folder" — e.g. "copy_files|*.png|D:\\backup". Non-destructive. This copies FILES ON DISK, not text.
 - compress_files: "files or pattern|optional archive name" — creates a new zip, originals untouched.
 - extract_files: "archive|optional destination" — extracts into a new folder named after the archive.
 - write_file[C]: "path|content" — overwrites the whole file, always pauses for confirmation.
