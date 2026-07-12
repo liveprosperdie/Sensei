@@ -227,7 +227,6 @@ ACTION PARAMETER FORMATS:
   State changes (these ALWAYS pause for user confirmation first): "create pull request|branch|title", "merge pull request|7", "close issue|12", "close pull request|7", "delete branch|old-feature", "delete repo" (needs a GITHUB_TOKEN; treat as seriously as deleting files).
   OUT OF SCOPE: pushing code, force push, or any local git operation — tell the user to use their terminal.
   NEVER use click for GitHub search results, star/fork buttons, or merge buttons — github_control handles those reliably. Only use click on GitHub for things github_control cannot do.
-
 VS CODE: vscode_control
 - vscode_control: ONLY when the user explicitly says VS Code ("open it in VS Code", "open my project in VS Code"). Format: "action" or "action|parameter". "open folder|C:\\projects\\sensei", "open file|main.py", plus the same file actions ("create file", "read file", "write file", "edit file", "search file") when the user wants the result inside VS Code — the same confirmation rules apply. For any file request that does NOT mention VS Code, use the FILES & FOLDERS actions instead.
   OUT OF SCOPE: running code, managing extensions, or typing keystrokes into the editor — say those aren't available yet if asked.

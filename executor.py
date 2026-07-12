@@ -623,7 +623,7 @@ def vision_click(browser, instruction: str) -> bool:
     return True
 
 
-# ── Click element (CDP path) ──────────────────────────────��───────────────────
+# ── Click element (CDP path) ───────────────────────���──────��───────────────────
 
 def click_element(driver, index: int, expected_text: str | None = None,
                   expected_href: str | None = None, instruction: str | None = None) -> dict:
@@ -2815,59 +2815,97 @@ def extract_files(parameter: str | None = None) -> dict:
 
 
 # ── Clipboard operations ──────────────────────────────────────────────────────
-# Cross-platform using tkinter (already in the dependency chain via PIL).
-# Fallback to subprocess on Windows (clip.exe) for robustness.
+# PRIMARY route: PowerShell Get-Clipboard / Set-Clipboard via subprocess, with
+# content passed as BASE64 to sidestep quoting and console-codepage encoding
+# issues entirely. tkinter is LAST RESORT only — on live Windows it lost the
+# clipboard content when the Tk root was destroyed (no owner process persists
+# the data) while still reporting success. write_clipboard VERIFIES by reading
+# the clipboard back and comparing — success is never reported unchecked again.
 
-def read_clipboard() -> dict:
-    """read_clipboard — reads current clipboard content (text), returns it for
-    Akira to speak or use in chained actions. No confirmation needed."""
+import base64 as _b64
+
+
+def _ps_read_clipboard() -> str | None:
+    """Get-Clipboard via PowerShell, base64-encoded on the PS side so the
+    content survives the console codepage untouched. None on failure."""
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string](Get-Clipboard -Raw)))"],
+        capture_output=True, text=True, timeout=5)
+    if result.returncode != 0:
+        return None
+    payload = result.stdout.strip()
+    if not payload:
+        return ""
+    return _b64.b64decode(payload).decode("utf-8")
+
+
+def read_clipboard(parameter: str | None = None) -> dict:
+    """read_clipboard — reads current clipboard text for Akira to speak or
+    use in chained actions. Ungated. (parameter accepted and ignored — every
+    action is dispatched with one positional argument.)"""
     print(f"[read_clipboard] called")
     try:
+        content = _ps_read_clipboard()
+        if content is not None:
+            return {"success": True, "message": content.rstrip("\r\n") or "(clipboard is empty)"}
+    except Exception as e:
+        print(f"[read_clipboard] powershell route failed: {e}")
+    # LAST RESORT: tkinter (known-flaky on Windows — see header note)
+    try:
         root = tk.Tk()
-        root.withdraw()  # don't show window
+        root.withdraw()
         content = root.clipboard_get()
         root.destroy()
         return {"success": True, "message": content or "(clipboard is empty)"}
-    except tk.TclError:
-        # tkinter failed — try subprocess fallback on Windows
-        try:
-            result = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                     "Get-Clipboard"], capture_output=True, text=True, timeout=2)
-            content = result.stdout.rstrip("\n\r")
-            return {"success": True, "message": content or "(clipboard is empty)"}
-        except Exception as e:
-            return {"success": False, "message": f"Couldn't read clipboard: {e}"}
     except Exception as e:
         return {"success": False, "message": f"Couldn't read clipboard: {e}"}
 
 
 def write_clipboard(parameter: str | None = None) -> dict:
     """write_clipboard|exact content — writes exact user-dictated content
-    verbatim to clipboard, no paraphrasing or reformatting per bible §6.4.
-    No confirmation needed, pure write."""
+    verbatim, no paraphrasing or reformatting per bible §6.4. Ungated, but
+    VERIFIED: reads the clipboard back and only reports success on a match."""
     print(f"[write_clipboard] called with parameter={parameter!r}")
     if not parameter:
         return {"success": False, "message": "Tell me what to write to the clipboard."}
+    wrote = False
     try:
-        root = tk.Tk()
-        root.withdraw()
-        root.clipboard_clear()
-        root.clipboard_append(parameter)
-        root.update()  # required to ensure clipboard contents are propagated
-        root.destroy()
-        return {"success": True, "message": f"Copied to clipboard ({len(parameter)} chars)."}
-    except tk.TclError:
-        # tkinter failed — try subprocess fallback on Windows
+        # base64 the content INTO the PowerShell command — no quoting, no
+        # stdin codepage mangling, handles any characters including newlines
+        payload = _b64.b64encode(parameter.encode("utf-8")).decode("ascii")
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}')))"],
+            capture_output=True, text=True, timeout=5)
+        wrote = result.returncode == 0
+        if not wrote:
+            print(f"[write_clipboard] powershell route failed: {result.stderr.strip()[:120]}")
+    except Exception as e:
+        print(f"[write_clipboard] powershell route failed: {e}")
+    if not wrote:
+        # LAST RESORT: tkinter — kept alive briefly so the content propagates
         try:
-            # PowerShell Set-Clipboard requires the content via stdin or -Value flag
-            subprocess.run(["powershell", "-NoProfile", "-Command",
-                           f"Set-Clipboard -Value {repr(parameter)}"],
-                          timeout=2, check=True)
-            return {"success": True, "message": f"Copied to clipboard ({len(parameter)} chars)."}
+            root = tk.Tk()
+            root.withdraw()
+            root.clipboard_clear()
+            root.clipboard_append(parameter)
+            root.update()
+            time.sleep(0.2)  # give the clipboard owner handoff a moment
+            root.destroy()
+            wrote = True
         except Exception as e:
             return {"success": False, "message": f"Couldn't write clipboard: {e}"}
+    # VERIFY — never report unchecked success
+    try:
+        readback = _ps_read_clipboard()
+        if readback is not None and readback.rstrip("\r\n") == parameter.rstrip("\r\n"):
+            return {"success": True, "message": f"Copied to clipboard and verified ({len(parameter)} chars)."}
+        print(f"[write_clipboard] VERIFY FAILED: readback={readback!r:.120}")
+        return {"success": False, "message": "I wrote to the clipboard but the read-back doesn't match — the copy didn't stick."}
     except Exception as e:
-        return {"success": False, "message": f"Couldn't write clipboard: {e}"}
+        # write appeared to succeed but verification wasn't possible — say so
+        return {"success": True, "message": f"Copied to clipboard ({len(parameter)} chars), but I couldn't verify it: {e}"}
 
 
 def vscode_control(action: str, parameter: str | None = None) -> dict:
