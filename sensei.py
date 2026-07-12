@@ -57,8 +57,13 @@ vad_audio_buffer: list[np.ndarray] = []
 # Dangerous actions — safety net catches these if Claude forgets to gate them
 DANGEROUS_ACTIONS = frozenset({
     "close_application", "shutdown", "restart", "hibernate",
-    "delete_files", "move_files", "edit_file", "uninstall_application",
+    "edit_file", "uninstall_application",
     "write_file",  # overwrites file content — gated same as edit_file
+    # NOTE: delete_files / move_files / organize_files / organize_folder /
+    # bulk_rename_files are NOT pre-gated here. They gate themselves in
+    # executor.py with a dry-run + spoken enumeration of the exact files
+    # (needs_confirmation plan) — stronger than a bare "are you sure?",
+    # and impossible to bypass since the gate lives with the implementation.
 })
 
 # Shopping sub-actions that must ALWAYS pause for confirmation, regardless of
@@ -205,7 +210,7 @@ def speak_and_wait(text: str) -> None:
     user_speaking.clear()
 
 
-# ── Action execution ──────────────────────────────────────────────────────────
+# ── Action execution ───────────────────────────────────────────────────────��──
 
 def run_actions(response: dict, step_results: dict | None = None) -> list:
     """
@@ -264,6 +269,20 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
             pending_execute   = result["_execute"]
             msg = f"Are you sure you want to click '{result['element_text']}'?"
             results.append(msg)
+            if step_id:
+                step_results[step_id] = None
+                failed_ids.add(step_id)
+            break
+
+        # generic gated plan (file ops etc.) — executor already resolved the
+        # exact targets and built the spoken enumeration; pause the chain and
+        # run its _execute only after a spoken yes (same machinery as click)
+        if isinstance(result, dict) and result.get("needs_confirmation") and result.get("_execute"):
+            pending_action    = "click_confirmed"
+            pending_parameter = result["confirm_message"]
+            pending_execute   = result["_execute"]
+            print(f"[run_actions] gated plan from {step['action']}: {result['confirm_message'][:80]!r}")
+            results.append(result["confirm_message"])
             if step_id:
                 step_results[step_id] = None
                 failed_ids.add(step_id)
@@ -390,8 +409,13 @@ def get_akira_response(text: str) -> dict | None:
         if confirmed:
             if pending_action == "click_confirmed" and pending_execute is not None:
                 try:
-                    pending_execute()
-                    speak_text = "Done."
+                    exec_result = pending_execute()
+                    # gated file-op closures return {"success", "message"} —
+                    # speak the real outcome instead of a generic "Done."
+                    if isinstance(exec_result, dict) and exec_result.get("message"):
+                        speak_text = exec_result["message"]
+                    else:
+                        speak_text = "Done."
                 except Exception as e:
                     speak_text = f"Couldn't do that: {e}"
             else:
