@@ -247,11 +247,14 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
         # {{stepX.result}} substitution
         parameter = step.get("parameter")
         if parameter and isinstance(parameter, str) and "{{" in parameter:
-            parameter = re.sub(
-                r"\{\{(\w+)\.result\}\}",
-                lambda m: str(step_results.get(m.group(1), m.group(0))),
-                parameter,
-            )
+            def _sub(m):
+                r = step_results.get(m.group(1), m.group(0))
+                # dict results must inject their message, never the repr —
+                # str(dict) produced garbage params like "{'success': True...}"
+                if isinstance(r, dict):
+                    return str(r.get("message", ""))
+                return str(r)
+            parameter = re.sub(r"\{\{(\w+)\.result\}\}", _sub, parameter)
             print(f"[run_actions] substituted parameter={parameter!r}")
 
         print(f"[run_actions] {step['action']} | {parameter!r} | id={step_id}")
@@ -364,6 +367,15 @@ def handle_response(response: dict) -> bool:
                 response["response"] = r["message"]
                 break
 
+        # feed execution outcomes back into LLM history — without this the
+        # next turn can't see what list_folder/read_clipboard/delete_files
+        # actually returned and it asks the user for data it already has
+        if run_results:
+            try:
+                claude_handler.record_action_results(run_results)
+            except Exception as e:
+                print(f"[v0] record_action_results failed: {e}")
+
         # click confirmation discovered at runtime
         if pending_action == "click_confirmed" and run_results:
             response["response"] = run_results[-1]
@@ -423,6 +435,10 @@ def get_akira_response(text: str) -> dict | None:
                         speak_text = exec_result["message"]
                     else:
                         speak_text = "Done."
+                    try:
+                        claude_handler.record_action_results([exec_result if isinstance(exec_result, dict) else speak_text])
+                    except Exception as e:
+                        print(f"[v0] record_action_results failed: {e}")
                 except Exception as e:
                     speak_text = f"Couldn't do that: {e}"
             else:
