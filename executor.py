@@ -1218,7 +1218,7 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     if "netflix.com" not in current_url:
         return {"success": False, "message": "Not a Netflix tab. Switch to Netflix first."}
 
-    # ── PLAYER actions via internal API ────────────────────────────────��────
+    # ── PLAYER actions via internal API ────────────────────────────────���────
     if action in ("play", "pause", "resume"):
         op = "pause" if action == "pause" else "play"
         ok = _nfx_js(browser, """
@@ -2352,7 +2352,7 @@ def github_control(action: str, parameter: str | None = None) -> dict:
     return {"success": False, "message": f"Unknown github_control action: {action}"}
 
 
-# ── File operations (standalone) + VS Code control ───────────────────────────
+# ─��� File operations (standalone) + VS Code control ───────────────────────────
 # One function per capability. Standalone actions (create_file, read_file,
 # write_file, edit_file, search_file) are the default route; vscode_control
 # calls the SAME functions when the user explicitly says "in VS Code".
@@ -2570,9 +2570,11 @@ def search_file(parameter: str | None = None) -> dict:
 _VAGUE_SPECS = frozenset({"*", "*.*", "everything", "all", "all files", "files"})
 
 
-def _resolve_targets(spec: str | None, root: str | None = None) -> tuple[list, str | None, str | None]:
-    """Resolve a comma-list / glob / partial name to an EXACT file list.
-    Returns (files, root_used, error). Never guesses broadly."""
+def _resolve_targets(spec: str | None, root: str | None = None,
+                     include_dirs: bool = False) -> tuple[list, str | None, str | None]:
+    """Resolve a comma-list / glob / partial name to an EXACT target list.
+    include_dirs=True lets delete/move/copy/compress operate on FOLDERS too.
+    Returns (targets, root_used, error). Never guesses broadly."""
     if not spec or not spec.strip():
         return [], None, "Which files? Give me names or a pattern like *.png."
     if spec.strip().lower() in _VAGUE_SPECS:
@@ -2580,32 +2582,48 @@ def _resolve_targets(spec: str | None, root: str | None = None) -> tuple[list, s
     base = _normalize_path(root) if root else (_vsc_last_folder or os.path.expanduser("~"))
     if not os.path.isdir(base):
         return [], None, f"That folder doesn't exist: {base}"
+
+    def _ok(p: str) -> bool:
+        return os.path.isfile(p) or (include_dirs and os.path.isdir(p))
+
     files: list = []
     for part in spec.split(","):
         part = part.strip()
         if not part:
             continue
         p = _normalize_path(part)
-        if os.path.isabs(p) and os.path.isfile(p):
+        if os.path.isabs(p) and _ok(p):
             files.append(p)
         elif any(ch in part for ch in "*?["):
-            files.extend(f for f in glob.glob(os.path.join(base, part)) if os.path.isfile(f))
-        elif os.path.isfile(os.path.join(base, part)):
+            files.extend(f for f in glob.glob(os.path.join(base, part)) if _ok(f))
+        elif _ok(os.path.join(base, part)):
             files.append(os.path.join(base, part))
         else:  # partial name — must resolve unambiguously, never guess
             hits = [os.path.join(base, fn) for fn in os.listdir(base)
-                    if part.lower() in fn.lower() and os.path.isfile(os.path.join(base, fn))]
+                    if part.lower() in fn.lower() and _ok(os.path.join(base, fn))]
             if len(hits) == 1:
                 files.append(hits[0])
             elif len(hits) > 1:
                 names = ", ".join(os.path.basename(h) for h in hits[:6])
-                return [], base, f"'{part}' matches {len(hits)} files: {names}. Which ones?"
+                return [], base, f"'{part}' matches {len(hits)} items: {names}. Which ones?"
             else:
                 return [], base, f"I couldn't find '{part}' in {base}."
     files = sorted(set(files))
     if not files:
         return [], base, f"Nothing matched '{spec}' in {base}."
     return files, base, None
+
+
+def _count_kinds(targets: list) -> str:
+    """'3 files' / '2 folders' / '2 folders and 3 files' — for spoken plans."""
+    d = sum(1 for t in targets if os.path.isdir(t))
+    f = len(targets) - d
+    parts = []
+    if d:
+        parts.append(f"{d} folder{'s' if d != 1 else ''}")
+    if f:
+        parts.append(f"{f} file{'s' if f != 1 else ''}")
+    return " and ".join(parts)
 
 
 def _enumerate_files(files: list, limit: int = 8) -> str:
@@ -2662,22 +2680,71 @@ def _resolve_folder(name: str | None) -> tuple[str | None, str | None]:
     p = _normalize_path(name)
     if os.path.isabs(p):
         return p, None
-    for base in filter(None, [_vsc_last_folder, os.path.expanduser("~")]):
+    # the session folder ITSELF ("list New Folder" right after opening it)
+    if _vsc_last_folder and os.path.basename(_vsc_last_folder).lower() == p.lower():
+        return _vsc_last_folder, None
+    # subfolder of session folder, sibling (parent's child), or under home
+    bases = [_vsc_last_folder,
+             os.path.dirname(_vsc_last_folder) if _vsc_last_folder else None,
+             os.path.expanduser("~")]
+    for base in filter(None, bases):
         candidate = os.path.join(base, p)
         if os.path.isdir(candidate):
             return candidate, None
+    # last chance: case-insensitive partial match inside session folder
+    if _vsc_last_folder and os.path.isdir(_vsc_last_folder):
+        hits = [d for d in os.listdir(_vsc_last_folder)
+                if p.lower() in d.lower() and os.path.isdir(os.path.join(_vsc_last_folder, d))]
+        if len(hits) == 1:
+            return os.path.join(_vsc_last_folder, hits[0]), None
     return None, f"I couldn't find a folder called '{name}'. Give me the full path or say one of your main folders like documents or downloads."
 
 
+def _navigate_existing_explorer(folder: str) -> bool:
+    """Navigate an already-open File Explorer window to `folder` instead of
+    spawning a new window every time. Uses the Shell.Application COM API.
+    Returns True if an existing window was reused."""
+    try:
+        import win32com.client
+        import pythoncom
+        pythoncom.CoInitialize()
+        try:
+            shell = win32com.client.Dispatch("Shell.Application")
+            for w in shell.Windows():
+                try:
+                    # Explorer windows report explorer.exe as FullName;
+                    # skip Internet Explorer/Edge shell windows
+                    if not w or "explorer" not in os.path.basename(str(w.FullName)).lower():
+                        continue
+                    w.Navigate2(folder)
+                    try:  # bring it to the front
+                        win32gui.SetForegroundWindow(w.HWND)
+                    except Exception:
+                        pass
+                    return True
+                except Exception:
+                    continue
+        finally:
+            pythoncom.CoUninitialize()
+    except Exception as e:
+        print(f"[open_folder] COM navigate unavailable: {e}")
+    return False
+
+
 def open_folder(parameter: str | None = None) -> dict:
-    """open_folder|name or path — opens it in File Explorer. This is THE way
-    to navigate File Explorer: by path, never by clicking the Explorer GUI."""
+    """open_folder|name or path — navigates the EXISTING File Explorer window
+    when one is open (no window spam), otherwise opens a new one. This is THE
+    way to navigate File Explorer: by path, never by clicking the GUI."""
     print(f"[open_folder] called with parameter={parameter!r}")
     folder, err = _resolve_folder(parameter)
     if err:
         return {"success": False, "message": err}
     if not os.path.isdir(folder):
         return {"success": False, "message": f"That folder doesn't exist: {folder}"}
+    global _vsc_last_folder
+    if os.name == "nt" and _navigate_existing_explorer(folder):
+        _vsc_last_folder = folder
+        return {"success": True, "message": f"Opened {os.path.basename(folder) or folder}."}
     try:
         if os.name == "nt":
             subprocess.Popen(["explorer", folder])
@@ -2685,7 +2752,6 @@ def open_folder(parameter: str | None = None) -> dict:
             subprocess.Popen(["xdg-open", folder])
     except Exception as e:
         return {"success": False, "message": f"Couldn't open it: {e}"}
-    global _vsc_last_folder
     _vsc_last_folder = folder
     return {"success": True, "message": f"Opened {os.path.basename(folder) or folder} in File Explorer."}
 
@@ -2746,39 +2812,61 @@ def open_file(parameter: str | None = None) -> dict:
     return {"success": True, "message": f"Opened {os.path.basename(fpath)}."}
 
 
+def _resolve_dest(raw: str) -> tuple[str | None, str | None]:
+    """Destination folder: spoken name ('desktop') > absolute > relative to
+    session folder. Creating a NEW folder is fine if the parent exists."""
+    known, err = _resolve_folder(raw)
+    if not err and known:
+        return known, None
+    p = _normalize_path(raw)
+    if os.path.isabs(p):
+        return p, None
+    if _vsc_last_folder:
+        return os.path.join(_vsc_last_folder, p), None
+    return None, f"Where exactly? I couldn't resolve '{raw}' — give me a folder name like desktop or a full path."
+
+
 def copy_files(parameter: str | None = None) -> dict:
-    """copy_files|spec|dest_folder — non-destructive, ungated."""
+    """copy_files|spec|dest_folder — files AND folders, non-destructive, ungated."""
     print(f"[copy_files] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
     if len(parts) < 2 or not parts[1].strip():
         return {"success": False, "message": "Copy needs files and a destination — copy files|*.png|D:\\backup."}
-    files, _, err = _resolve_targets(parts[0])
+    targets, _, err = _resolve_targets(parts[0], include_dirs=True)
     if err:
         return {"success": False, "message": err}
-    dest = _normalize_path(parts[1])
+    dest, derr = _resolve_dest(parts[1])
+    if derr:
+        return {"success": False, "message": derr}
     try:
         os.makedirs(dest, exist_ok=True)
-        for f in files:
-            shutil.copy2(f, os.path.join(dest, os.path.basename(f)))
+        for t in targets:
+            target_path = os.path.join(dest, os.path.basename(t))
+            if os.path.isdir(t):
+                shutil.copytree(t, target_path, dirs_exist_ok=True)
+            else:
+                shutil.copy2(t, target_path)
     except Exception as e:
         return {"success": False, "message": f"Copy failed: {e}"}
-    return {"success": True, "message": f"Copied {len(files)} file{'s' if len(files) != 1 else ''} to {dest}."}
+    return {"success": True, "message": f"Copied {_count_kinds(targets)} to {os.path.basename(dest) or dest}."}
 
 
 def move_files(parameter: str | None = None) -> dict:
-    """move_files|spec|dest_folder — GATED: enumerates exactly what moves
-    where, then waits for a spoken yes."""
+    """move_files|spec|dest_folder — files AND folders. GATED: enumerates
+    exactly what moves where, then waits for a spoken yes."""
     print(f"[move_files] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
     if len(parts) < 2 or not parts[1].strip():
         return {"success": False, "message": "Move needs files and a destination — move files|*.pdf|D:\\archive."}
-    files, _, err = _resolve_targets(parts[0])
+    targets, _, err = _resolve_targets(parts[0], include_dirs=True)
     if err:
         return {"success": False, "message": err}
-    dest = _normalize_path(parts[1])
-    pairs = [(f, os.path.join(dest, os.path.basename(f))) for f in files]
-    msg = (f"I'll move {len(files)} file{'s' if len(files) != 1 else ''} to {dest}: "
-           f"{_enumerate_files(files)}. Should I go ahead?")
+    dest, derr = _resolve_dest(parts[1])
+    if derr:
+        return {"success": False, "message": derr}
+    pairs = [(t, os.path.join(dest, os.path.basename(t))) for t in targets]
+    msg = (f"I'll move {_count_kinds(targets)} to {os.path.basename(dest) or dest}: "
+           f"{_enumerate_files(targets)}. Should I go ahead?")
     return _gated(msg, lambda: _move_batch(pairs))
 
 
@@ -2790,29 +2878,37 @@ def organize_files(parameter: str | None = None) -> dict:
 
 
 def delete_files(parameter: str | None = None) -> dict:
-    """delete_files|spec|root? — STRICTEST gate in the batch: exact list
-    resolution first, ambiguity refused, hard cap, full enumeration spoken."""
+    """delete_files|spec|root? — files AND folders. STRICTEST gate: exact
+    resolution first, ambiguity refused, hard cap, full enumeration spoken.
+    Folders are deleted recursively — the confirmation says so explicitly."""
     print(f"[delete_files] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
-    files, _, err = _resolve_targets(parts[0] if parts and parts[0] else None,
-                                     parts[1] if len(parts) > 1 else None)
+    targets, _, err = _resolve_targets(parts[0] if parts and parts[0] else None,
+                                       parts[1] if len(parts) > 1 else None,
+                                       include_dirs=True)
     if err:
         return {"success": False, "message": err}   # vague/ambiguous → ask, never guess
-    if len(files) > 15:
-        return {"success": False, "message": f"That would delete {len(files)} files — too many to do safely in one go. Narrow it down and I'll enumerate them."}
+    if len(targets) > 15:
+        return {"success": False, "message": f"That would delete {len(targets)} items — too many to do safely in one go. Narrow it down and I'll enumerate them."}
+    n_dirs = sum(1 for t in targets if os.path.isdir(t))
+    kinds = _count_kinds(targets)  # BEFORE deletion — isdir() is False after
     def _do():
         failed = []
-        for f in files:
+        for t in targets:
             try:
-                os.remove(f)
+                if os.path.isdir(t):
+                    shutil.rmtree(t)
+                else:
+                    os.remove(t)
             except Exception as e:
-                failed.append(f"{os.path.basename(f)} ({e})")
+                failed.append(f"{os.path.basename(t)} ({e})")
         if failed:
-            return {"success": len(failed) < len(files),
-                    "message": f"Deleted {len(files) - len(failed)}, but couldn't delete: {'; '.join(failed[:3])}"}
-        return {"success": True, "message": f"Deleted {len(files)} file{'s' if len(files) != 1 else ''}. That's permanent."}
-    msg = (f"This will permanently delete {len(files)} file{'s' if len(files) != 1 else ''}: "
-           f"{_enumerate_files(files, limit=15)}. Are you sure?")
+            return {"success": len(failed) < len(targets),
+                    "message": f"Deleted {len(targets) - len(failed)}, but couldn't delete: {'; '.join(failed[:3])}"}
+        return {"success": True, "message": f"Deleted {kinds}. That's permanent."}
+    warning = " Folders go with everything inside them." if n_dirs else ""
+    msg = (f"This will permanently delete {kinds}: "
+           f"{_enumerate_files(targets, limit=15)}.{warning} Are you sure?")
     return _gated(msg, _do)
 
 
@@ -2873,38 +2969,63 @@ def bulk_rename_files(parameter: str | None = None) -> dict:
 
 
 def compress_files(parameter: str | None = None) -> dict:
-    """compress_files|spec|archive_name? — creates a NEW zip, never touches
-    the source files (zipfile.write only reads). Ungated by design."""
+    """compress_files|spec|folder-or-name? — files AND folders into a NEW zip;
+    never touches the sources. Second field is smart: if it's an existing
+    FOLDER it's the search root (the LLM often sends 'file|folder'), otherwise
+    it's the archive name. Ungated by design."""
     print(f"[compress_files] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
-    files, base, err = _resolve_targets(parts[0] if parts and parts[0] else None)
+    spec = parts[0].strip() if parts and parts[0] else None
+    root, name = None, None
+    for extra in (p.strip() for p in parts[1:] if p.strip()):
+        maybe_dir, ferr = _resolve_folder(extra)
+        if not ferr and maybe_dir and os.path.isdir(maybe_dir) and not extra.lower().endswith(".zip"):
+            root = maybe_dir          # "spec|folder" pattern
+        else:
+            name = extra              # "spec|archive-name" pattern
+    targets, base, err = _resolve_targets(spec, root, include_dirs=True)
     if err:
         return {"success": False, "message": err}
-    name = (parts[1].strip() if len(parts) > 1 and parts[1].strip() else "archive")
+    if not name:
+        name = (os.path.splitext(os.path.basename(targets[0]))[0] if len(targets) == 1 else "archive")
     if not name.lower().endswith(".zip"):
         name += ".zip"
     archive = os.path.join(base, name)
     if os.path.exists(archive):
-        return {"success": False, "message": f"{name} already exists in {base} — give me a different name."}
+        n = 2
+        while os.path.exists(os.path.join(base, f"{name[:-4]}-{n}.zip")):
+            n += 1
+        archive = os.path.join(base, f"{name[:-4]}-{n}.zip")
     try:
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in files:
-                zf.write(f, os.path.basename(f))
+            for t in targets:
+                if os.path.isdir(t):
+                    for dirpath, _dirs, fnames in os.walk(t):
+                        for fn in fnames:
+                            full = os.path.join(dirpath, fn)
+                            zf.write(full, os.path.relpath(full, os.path.dirname(t)))
+                else:
+                    zf.write(t, os.path.basename(t))
     except Exception as e:
         return {"success": False, "message": f"Couldn't create the archive: {e}"}
-    return {"success": True, "message": f"Zipped {len(files)} file{'s' if len(files) != 1 else ''} into {name}. The originals are untouched."}
+    return {"success": True, "message": f"Zipped {_count_kinds(targets)} into {os.path.basename(archive)}. The originals are untouched."}
 
 
 def extract_files(parameter: str | None = None) -> dict:
     """extract_files|archive|dest? — extracts into a NEW folder named after
-    the archive; refuses to spill into a non-empty folder. Ungated."""
+    the archive; refuses to spill into a non-empty folder. Archive resolves
+    like other targets: full path, or name/partial name in the session folder."""
     print(f"[extract_files] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
-    fpath, err = _resolve_path(parts[0] if parts and parts[0] else None)
+    spec = parts[0].strip() if parts and parts[0] else None
+    if not spec:
+        return {"success": False, "message": "Which archive? Give me the zip name or path."}
+    hits, _, err = _resolve_targets(spec)
     if err:
         return {"success": False, "message": err}
-    if not os.path.isfile(fpath):
-        return {"success": False, "message": f"That archive doesn't exist: {fpath}"}
+    if len(hits) > 1:
+        return {"success": False, "message": f"'{spec}' matched {len(hits)} files: {_enumerate_files(hits)}. Which one?"}
+    fpath = hits[0]
     if not zipfile.is_zipfile(fpath):
         return {"success": False, "message": f"{os.path.basename(fpath)} isn't a zip file — I can only extract zips for now."}
     dest = (_normalize_path(parts[1]) if len(parts) > 1 and parts[1].strip()
@@ -2918,6 +3039,72 @@ def extract_files(parameter: str | None = None) -> dict:
     except Exception as e:
         return {"success": False, "message": f"Couldn't extract it: {e}"}
     return {"success": True, "message": f"Extracted {len(names)} item{'s' if len(names) != 1 else ''} into {dest}."}
+
+
+def summarize_file(parameter: str | None = None) -> dict:
+    """summarize_file|path-or-name — extracts text (txt/code/pdf/docx) and
+    asks the LLM for a 4-5 line spoken summary. Ungated, read-only."""
+    print(f"[summarize_file] called with parameter={parameter!r}")
+    spec = (parameter or "").split("|")[0].strip()
+    if not spec:
+        return {"success": False, "message": "Which file should I summarize?"}
+    hits, _, err = _resolve_targets(spec)
+    if err:
+        return {"success": False, "message": err}
+    if len(hits) > 1:
+        return {"success": False, "message": f"'{spec}' matched {len(hits)} files: {_enumerate_files(hits)}. Which one?"}
+    fpath = hits[0]
+    name = os.path.basename(fpath)
+    ext = os.path.splitext(fpath)[1].lower()
+
+    text = None
+    if ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            try:
+                from PyPDF2 import PdfReader  # older install name
+            except ImportError:
+                return {"success": False, "message": "I need the pypdf package to read PDFs — run pip install pypdf and I'll be able to summarize them."}
+        try:
+            reader = PdfReader(fpath)
+            pages = [p.extract_text() or "" for p in reader.pages[:15]]
+            text = "\n".join(pages).strip()
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't read that PDF: {e}"}
+        if not text:
+            return {"success": False, "message": f"{name} has no extractable text — it's probably scanned images."}
+    elif ext == ".docx":
+        try:
+            import docx  # python-docx
+            text = "\n".join(p.text for p in docx.Document(fpath).paragraphs).strip()
+        except ImportError:
+            return {"success": False, "message": "I need the python-docx package for Word files — run pip install python-docx."}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't read that document: {e}"}
+    else:
+        # text/code route with the same binary guard as read_file
+        if ext in {".doc", ".xls", ".xlsx", ".ppt", ".pptx", ".png", ".jpg",
+                   ".jpeg", ".gif", ".webp", ".mp3", ".mp4", ".zip", ".exe",
+                   ".msi", ".dll"}:
+            return {"success": False, "message": f"I can't summarize {ext[1:]} files yet — text, code, PDF, and docx only."}
+        try:
+            with open(fpath, "rb") as f:
+                raw = f.read(24000)
+            if b"\x00" in raw:
+                return {"success": False, "message": f"{name} is a binary file — I can't summarize it."}
+            text = raw.decode("utf-8", errors="replace").strip()
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't read it: {e}"}
+    if not text:
+        return {"success": False, "message": f"{name} is empty — nothing to summarize."}
+
+    try:
+        import claude_handler  # lazy: no cycle (claude_handler never imports executor)
+        summary = claude_handler.summarize_text(text[:24000], name)
+    except Exception as e:
+        return {"success": False, "message": f"I read the file but the summary call failed: {e}"}
+    return {"success": True, "speak": True, "message": f"Here's the gist of {name}: {summary}"}
 
 
 # ── Clipboard operations ──────────────────────────────────────────────────────
@@ -3597,6 +3784,7 @@ _ACTION_MAP = {
     "bulk_rename_files": bulk_rename_files,
     "compress_files":    compress_files,
     "extract_files":     extract_files,
+    "summarize_file":    summarize_file,
     "read_clipboard":    read_clipboard,
     "write_clipboard":   write_clipboard,
     "adjust_volume":     adjust_volume,
