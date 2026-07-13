@@ -178,7 +178,7 @@ CLIPBOARD: read_clipboard, write_clipboard[T]
 - read_clipboard: reads the current clipboard content (text) and returns it for you to speak or use in chained actions. Ungated, pure read.
 - write_clipboard[T]: "exact content" — writes the EXACT user-dictated content verbatim to clipboard with NO paraphrasing or reformatting per bible §6.4. Ungated, pure write.
 
-FILES & FOLDERS: open_folder, list_folder, create_file, read_file, search_file, open_file, copy_files (files on disk), compress_files, extract_files, write_file[C], edit_file[C], move_files[C], delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C]
+FILES & FOLDERS: open_folder, list_folder, create_file, read_file, summarize_file, search_file, open_file, copy_files (files on disk), compress_files, extract_files, write_file[C], edit_file[C], move_files[C], delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C]
 Note: copy_files is for copying FILES ON DISK to a new location — NOT text to clipboard. Use write_clipboard to copy text to clipboard. Never confuse the two.
 FILE EXPLORER NAVIGATION — CRITICAL RULES:
 - NEVER use click, fill, or scroll on File Explorer or any desktop app window — those actions only work inside the browser. Clicking "Pictures in the sidebar" will click the wrong thing.
@@ -191,18 +191,20 @@ ACTION PARAMETER FORMATS (fields split with |; relative names resolve against th
 - list_folder: "folder name or path (optional — defaults to session folder)" — speaks the contents.
 - create_file: "path|optional initial content" — refuses if the file already exists.
 - read_file: "path" — reads content for you to reference or read aloud.
+- summarize_file: "name or path" — reads the file (text, code, PDF, or docx) and speaks a 4-5 sentence summary of what's in it. Use whenever the user asks what a file says / contains / is about.
 - search_file: "name or partial name|optional folder" — folder can be a spoken name like pictures or downloads. Defaults to the session folder or home.
 - open_file: "path" — opens with the default app for that file type. If it's actually a folder, it opens in File Explorer.
-- copy_files: "files or pattern|destination folder" — e.g. "copy_files|*.png|D:\\backup". Non-destructive. This copies FILES ON DISK, not text.
-- compress_files: "files or pattern|optional archive name" — creates a new zip, originals untouched.
-- extract_files: "archive|optional destination" — extracts into a new folder named after the archive.
+- copy_files: "files/folders or pattern|destination" — e.g. "copy_files|*.png|D:\\backup" or "copy_files|Document 4.pdf|desktop". Handles FOLDERS too (copied recursively). Destination can be a spoken name (desktop, downloads). Non-destructive. This copies items ON DISK, not text.
+- compress_files: "files/folders or pattern|optional folder or archive name" — creates a new zip next to the sources, originals untouched. Folders are zipped with their contents. Second field may be the folder the files live in OR the zip name — both work.
+- extract_files: "archive name or path|optional destination" — extracts into a new folder named after the archive. Archive resolves by name in the session folder.
 - write_file[C]: "path|content" — overwrites the whole file, always pauses for confirmation.
 - edit_file[C]: "path|find text|replace text" — if the text isn't found or appears more than once, it stops and asks rather than guessing.
-- move_files[C] / organize_files[C]: "files or pattern|destination folder" — the confirmation enumerates exactly which files move where.
-- delete_files[C]: "files or pattern|optional folder" — STRICTEST action: never send vague targets like "everything"; the confirmation enumerates every file by name before anything is deleted.
+- move_files[C] / organize_files[C]: "files/folders or pattern|destination" — handles folders too; the confirmation enumerates exactly what moves where.
+- delete_files[C]: "files/folders or pattern|optional folder" — STRICTEST action: never send vague targets like "everything"; the confirmation enumerates every item by name before anything is deleted. Folders are deleted with everything inside them — works for "delete the MEM 201 folder".
 - organize_folder[C]: "folder" — sorts loose files into category subfolders; the confirmation enumerates the plan.
 - bulk_rename_files[C]: "files or pattern|new base name" — renames to name-001, name-002...; the confirmation enumerates old-to-new.
 For all [C] file actions the executor builds the spoken enumeration itself — send the action directly, do NOT set confirmation_required for them, the pause happens automatically with the exact file list.
+NEVER chain {{stepX.result}} into a file action parameter — results are spoken sentences, not file paths. If you need a folder listing first, send list_folder ALONE, then use the exact names from its ACTION RESULT in your next turn.
 
 DOWNLOADS & INSTALL: download_file, download_application, install_application[C], uninstall_application[C]
 
@@ -449,6 +451,21 @@ def ask_confirmation(text: str, pending_description: str | None = None) -> bool:
     except Exception as e:
         print(f"[ask_confirmation] API error, defaulting NO: {e!r}")
         return False
+
+
+def summarize_text(text: str, filename: str = "") -> str:
+    """4-5 line spoken summary of file content, for executor.summarize_file.
+    Uses haiku — fast and cheap, summary quality is plenty."""
+    message = client.messages.create(
+        model="claude-haiku-4-5",
+        max_tokens=300,
+        system="Summarize the following file content in 4-5 short spoken sentences. "
+               "Plain conversational language — it will be read aloud by a voice "
+               "assistant. No markdown, no bullet points, no headers. Lead with what "
+               "the file IS, then the key points.",
+        messages=[{"role": "user", "content": f"File: {filename}\n\n{text}"}],
+    )
+    return message.content[0].text.strip()
 
 
 def vision_match(screenshot_path: str, instruction: str) -> tuple[int, int] | None:
