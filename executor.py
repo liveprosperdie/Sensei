@@ -3326,9 +3326,14 @@ def write_clipboard(parameter: str | None = None) -> dict:
 # in). Raw-requests fallback deliberately NOT built — it duplicates ~100 lines
 # of security-sensitive redirect/refresh code that can't be verified here.
 
+# playlist-read-private + user-library-read added for open_playlist /
+# open_library. Scope change means the cached token lacks them — delete
+# ~/.sensei_spotify_cache once and re-auth in the browser popup.
 _SPOTIFY_SCOPES = ("user-read-playback-state user-modify-playback-state "
-                   "user-read-currently-playing")
+                   "user-read-currently-playing playlist-read-private "
+                   "user-library-read")
 _spotify_client_cache = None
+_spotify_premute_volume = None  # volume % before mute, restored by unmute
 
 
 def _spotify_client():
@@ -3483,9 +3488,23 @@ def _spotify_dom(action: str) -> dict:
         return {"success": False, "message": f"Spotify web player control failed: {e}"}
 
 
+_SPOTIFY_ALIASES = {
+    "next": "next_track", "skip": "next_track", "previous": "previous_track",
+    "back": "previous_track", "volume": "set_volume", "queue": "add_to_queue",
+    "play_by_mood": "play_mood", "mood": "play_mood",
+    "playlist": "open_playlist", "library": "open_library",
+    "view_saved": "open_library", "saved": "open_library",
+    "liked": "open_library", "liked_songs": "open_library",
+    "current_volume": "get_volume", "get_current_volume": "get_volume",
+    "forward": "skip_forward", "rewind": "skip_back", "backward": "skip_back",
+    "skip_backward": "skip_back", "seek_to": "seek", "whats_playing": "now_playing",
+}
+
+
 def spotify_control(action: str, parameter: str | None = None) -> dict:
     """Spotify hybrid control. Ungated — playback actions are all reversible."""
     action = (action or "").strip().lower().replace(" ", "_")
+    action = _SPOTIFY_ALIASES.get(action, action)
     print(f"[spotify_control] action={action!r} parameter={parameter!r}")
     sp, err = _spotify_client()
     if sp is None:
@@ -3494,6 +3513,12 @@ def spotify_control(action: str, parameter: str | None = None) -> dict:
         if action in ("pause", "resume", "next_track", "previous_track", "now_playing"):
             return _spotify_dom(action)
         return {"success": False, "message": err}
+
+    if action == "lyrics":
+        # Spotify's public Web API has NO lyrics endpoint (that's a licensed
+        # Musixmatch integration, app-only). Honest refusal BEFORE trying.
+        return {"success": False, "speak": True,
+                "message": "Spotify doesn't let outside apps read lyrics — that's locked to their own app. Open the Spotify window and tap the mic icon at the bottom."}
 
     if action == "search":
         if not parameter:
@@ -3619,6 +3644,109 @@ def spotify_control(action: str, parameter: str | None = None) -> dict:
                 mode = "context" if mode in ("on", "all", "playlist") else "off"
             sp.repeat(mode, device_id=dev_id)
             return {"success": True, "message": f"Repeat set to {mode}."}
+
+        if action in ("skip_forward", "skip_back", "seek"):
+            cur = sp.current_playback()
+            if not cur or not cur.get("item"):
+                return {"success": False, "message": "Nothing is playing to seek in."}
+            pos, dur = cur.get("progress_ms", 0), cur["item"].get("duration_ms", 0)
+            p = (parameter or "").strip().lower()
+            if action == "seek":
+                # "1:30" / "90" / "1 minute 30" -> ms
+                m = re.match(r"^(\d+):(\d{1,2})$", p)
+                if m:
+                    target = (int(m.group(1)) * 60 + int(m.group(2))) * 1000
+                else:
+                    mins = re.search(r"(\d+)\s*min", p)
+                    secs = re.search(r"(\d+)\s*sec", p)
+                    if mins or secs:
+                        target = ((int(mins.group(1)) if mins else 0) * 60
+                                  + (int(secs.group(1)) if secs else 0)) * 1000
+                    elif p.isdigit():
+                        target = int(p) * 1000
+                    else:
+                        return {"success": False, "message": "Seek to where? Give me a time like 1:30."}
+            else:
+                delta = int(re.sub(r"\D", "", p) or "10") * 1000
+                target = pos + delta if action == "skip_forward" else pos - delta
+            target = max(0, min(target, max(dur - 1000, 0)))
+            sp.seek_track(target, device_id=dev_id)
+            return {"success": True, "message": f"Jumped to {target // 60000}:{(target // 1000) % 60:02d}."}
+
+        if action == "get_volume":
+            pct = device.get("volume_percent")
+            if pct is None:
+                cur = sp.current_playback()
+                pct = (cur or {}).get("device", {}).get("volume_percent")
+            if pct is None:
+                return {"success": False, "message": "Couldn't read the Spotify volume."}
+            return {"success": True, "speak": True, "message": f"Spotify volume is at {pct} percent."}
+
+        if action in ("mute", "unmute"):
+            global _spotify_premute_volume
+            if action == "mute":
+                pct = device.get("volume_percent")
+                if pct:
+                    _spotify_premute_volume = pct
+                sp.volume(0, device_id=dev_id)
+                return {"success": True, "message": "Spotify muted."}
+            restore = _spotify_premute_volume or 50
+            sp.volume(restore, device_id=dev_id)
+            return {"success": True, "message": f"Spotify back at {restore}."}
+
+        if action == "open_playlist":
+            if not parameter:
+                return {"success": False, "message": "Which playlist?"}
+            want = parameter.strip().lower()
+            pls, offset = [], 0
+            while offset < 200:  # user playlists, paged
+                batch = sp.current_user_playlists(limit=50, offset=offset).get("items", [])
+                pls.extend(batch)
+                if len(batch) < 50:
+                    break
+                offset += 50
+            hits = [pl for pl in pls if pl and want in (pl.get("name") or "").lower()]
+            if not hits:  # fall back to public playlist search
+                res = sp.search(parameter, limit=1, type="playlist")
+                hits = [pl for pl in res.get("playlists", {}).get("items", []) if pl]
+            if not hits:
+                return {"success": False, "message": f"I couldn't find a playlist called '{parameter}'."}
+            pl = hits[0]
+            sp.start_playback(device_id=dev_id, context_uri=pl["uri"])
+            return {"success": True, "message": f"Playing your playlist {pl['name']}."}
+
+        if action in ("open_library", "liked_songs"):
+            # voice context has no UI to "browse" — most useful default is
+            # playing Liked Songs (saved tracks have no context_uri, so queue
+            # the first batch as a uri list)
+            saved = sp.current_user_saved_tracks(limit=50).get("items", [])
+            uris = [it["track"]["uri"] for it in saved if it.get("track")]
+            if not uris:
+                return {"success": False, "message": "Your Liked Songs list looks empty."}
+            sp.start_playback(device_id=dev_id, uris=uris)
+            return {"success": True, "message": f"Playing your Liked Songs — {len(uris)} tracks queued."}
+
+        if action == "play_mood":
+            # No mood API — smart query construction: mood words -> genre/
+            # keyword search terms, play the top playlist match for variety
+            if not parameter:
+                return {"success": False, "message": "What kind of mood?"}
+            moods = {"calm": "calm acoustic chill", "relax": "chill lofi relax",
+                     "sleep": "sleep ambient calm", "sad": "sad acoustic mellow",
+                     "happy": "happy feel good hits", "upbeat": "upbeat energy pop",
+                     "energetic": "high energy workout", "workout": "workout pump",
+                     "party": "party dance hits", "focus": "deep focus instrumental",
+                     "study": "study beats instrumental", "romantic": "romantic love songs",
+                     "angry": "rage metal intense", "nostalgic": "throwback classics"}
+            p = parameter.strip().lower()
+            query = next((q for k, q in moods.items() if k in p), f"{p} mix")
+            res = sp.search(query, limit=1, type="playlist")
+            items = [pl for pl in res.get("playlists", {}).get("items", []) if pl]
+            if not items:
+                return {"success": False, "message": f"Couldn't find anything for that mood."}
+            sp.start_playback(device_id=dev_id, context_uri=items[0]["uri"])
+            return {"success": True, "message": f"Playing {items[0]['name']} for you."}
+
         return {"success": False, "message": f"Unknown spotify action: {action}"}
     except Exception as e:
         msg = str(e)
@@ -3734,8 +3862,18 @@ def _open_single_app(name: str) -> str:
             return f"Couldn't open {name}."
 
     if param in WEB_MAP:
-        webbrowser.open(WEB_MAP[param])
-        return f"Opening {name}."
+        # MUST go through the Selenium-controlled browser, NOT
+        # webbrowser.open() — that launched the system default browser as a
+        # separate process, so youtube_control etc. (which check
+        # get_browser().current_url) never saw the page ("This isn't a
+        # YouTube tab" every time, plus the mystery blank tab).
+        print(f"[open_application] '{param}' is web-only — routing to open_site_tab")
+        try:
+            return open_site_tab(param)
+        except Exception as e:
+            print(f"[open_application] controlled browser failed ({e}) — system browser fallback")
+            webbrowser.open(WEB_MAP[param])
+            return f"Opening {name} in your default browser — I won't be able to control that tab."
 
     exe = _find_exe(param)
     if exe:
