@@ -246,9 +246,10 @@ VS CODE: vscode_control
 GOOGLE WORKSPACE: send_email[C], read_emails, create_document, read_document, create_event, read_schedule
 
 SPOTIFY: spotify_control — format "spotify_control|action|value". All ungated.
-Actions: search|query, play|track or artist, pause, resume, next_track, previous_track, set_volume|0-100, now_playing, add_to_queue|track, shuffle|on/off, repeat|track/context/off.
+Actions: search|query, play|track or artist, pause, resume, next_track, previous_track, set_volume|0-100, now_playing, add_to_queue|track, shuffle|on/off, repeat|track/context/off, devices, transfer|device name.
 Examples: "play blinding lights" -> spotify_control|play|blinding lights. "skip this song" -> spotify_control|next_track. "what's playing" -> spotify_control|now_playing.
 NEVER ask the user whether to use the Spotify app or the web player — the executor resolves that automatically (desktop app first, web player fallback). Just send the action.
+play always starts on THIS computer. If music is on the wrong device or the user asks to move it ("play it here", "put it on the TV"), send spotify_control|transfer|laptop or spotify_control|transfer|device name — you CAN switch devices, NEVER tell the user to switch manually in the app. "what devices are there" -> spotify_control|devices.
 set_volume here changes SPOTIFY's volume; adjust_volume changes the SYSTEM volume — pick based on what the user means.
 
 COMMUNICATION: send_whatsapp[C]
