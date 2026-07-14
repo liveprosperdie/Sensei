@@ -226,10 +226,34 @@ def _ensure_current_handle(driver) -> None:
 
 
 def _ensure_akira_tab(driver) -> None:
-    """Create Akira's own working tab if it doesn't exist. Never switches 
-    focus away from the user's active tab unless _navigate() is called."""
+    """Adopt or create Akira's own working tab. Never switches focus away
+    from the user's active tab unless _navigate() is called. REUSES an
+    existing about:blank tab instead of spawning a new one every attach —
+    creating one each time left blank-tab litter in the user's browser."""
     if hasattr(driver, "_akira_tab") and driver._akira_tab in driver.window_handles:
         return
+    # adopt a leftover blank tab (e.g. from a previous sensei run)
+    try:
+        current = driver.current_window_handle
+    except Exception:
+        current = None
+    for h in driver.window_handles:
+        if h == current:
+            continue  # never steal the tab the user is looking at
+        try:
+            driver.switch_to.window(h)
+            if (driver.current_url or "").startswith("about:blank"):
+                driver._akira_tab = h
+                if current:
+                    driver.switch_to.window(current)
+                return
+        except Exception:
+            continue
+    if current:
+        try:
+            driver.switch_to.window(current)
+        except Exception:
+            pass
     existing = set(driver.window_handles)
     driver.execute_cdp_cmd("Target.createTarget", {"url": "about:blank", "background": True})
     for _ in range(10):
@@ -416,11 +440,15 @@ def get_pc_context() -> dict:
     except Exception:
         pass
 
+    # PASSIVE read via the CDP HTTP endpoint — must NEVER call get_browser()
+    # here: that attaches selenium + creates the Akira tab, which opened a
+    # blank tab at every session start even for file/Spotify/app tasks.
     current_url, current_title = None, None
     try:
-        browser = get_browser()
-        current_url = browser.current_url
-        current_title = browser.title
+        for t in get_all_tabs():
+            if t.get("url") and not t["url"].startswith("about:"):
+                current_url, current_title = t["url"], t.get("title")
+                break
     except Exception:
         pass
 
@@ -1219,7 +1247,7 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     if "netflix.com" not in current_url:
         return {"success": False, "message": "Not a Netflix tab. Switch to Netflix first."}
 
-    # ── PLAYER actions via internal API ────────────────────────────────����────
+    # ── PLAYER actions via internal API ��───────────────────────────────����────
     if action in ("play", "pause", "resume"):
         op = "pause" if action == "pause" else "play"
         ok = _nfx_js(browser, """
@@ -1526,7 +1554,7 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     return {"success": False, "message": f"Unknown netflix_control action: {action}"}
 
 
-# ── Amazon control ────────────────────────────────────────────────────────────
+# ── Amazon control ────────────────────────────────────���───────────────────────
 # SCOPE: search → product → cart → checkout → address confirmation.
 # HARD STOP before payment-method selection. No payment actions exist here.
 
@@ -3275,27 +3303,33 @@ def _spotify_app_running() -> bool:
         return False
 
 
-def _spotify_pick(devices: list) -> dict | None:
-    """Priority: active > desktop app (Computer) > web player > anything."""
-    for d in devices:
-        if d.get("is_active"):
-            return d
-    for d in devices:
-        if d.get("type") == "Computer" and "web player" not in (d.get("name") or "").lower():
-            return d
-    for d in devices:
-        if "web player" in (d.get("name") or "").lower():
-            return d
+def _spotify_pick(devices: list, prefer_local: bool = False) -> dict | None:
+    """Default priority: active > this computer > web player > anything.
+    prefer_local=True (used when STARTING playback): THIS computer first —
+    otherwise 'play X' lands on whatever device was last active (a TV,
+    a phone) instead of the machine the user is talking to."""
+    def _is_local(d):
+        return d.get("type") == "Computer" and "web player" not in (d.get("name") or "").lower()
+    def _is_web(d):
+        return "web player" in (d.get("name") or "").lower()
+    # prefer_local: BOTH local options (app, then web player) outrank a
+    # remote active device like a TV — that's the whole point of the flag
+    order = ([_is_local, _is_web, lambda d: d.get("is_active")] if prefer_local
+             else [lambda d: d.get("is_active"), _is_local, _is_web])
+    for test in order:
+        for d in devices:
+            if test(d):
+                return d
     return devices[0] if devices else None
 
 
-def _spotify_device(sp) -> tuple[dict | None, str, str | None]:
+def _spotify_device(sp, prefer_local: bool = False) -> tuple[dict | None, str, str | None]:
     """Establish a playback device. Returns (device, path_used, error)."""
     try:
         devices = sp.devices().get("devices", [])
     except Exception as e:
         return None, "none", f"Couldn't query Spotify devices: {e}"
-    d = _spotify_pick(devices)
+    d = _spotify_pick(devices, prefer_local)
     if d:
         path = ("desktop app device" if d.get("type") == "Computer"
                 and "web player" not in (d.get("name") or "").lower() else "web player device")
@@ -3321,7 +3355,7 @@ def _spotify_device(sp) -> tuple[dict | None, str, str | None]:
     for _ in range(wait):
         time.sleep(1)
         try:
-            d = _spotify_pick(sp.devices().get("devices", []))
+            d = _spotify_pick(sp.devices().get("devices", []), prefer_local)
         except Exception:
             d = None
         if d:
@@ -3390,7 +3424,44 @@ def spotify_control(action: str, parameter: str | None = None) -> dict:
         except Exception as e:
             return {"success": False, "message": f"Spotify search failed: {e}"}
 
-    device, path, derr = _spotify_device(sp)
+    if action == "devices":
+        try:
+            devs = sp.devices().get("devices", [])
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't list Spotify devices: {e}"}
+        if not devs:
+            return {"success": True, "speak": True, "message": "No Spotify devices are online right now."}
+        named = ", ".join(f"{d['name']}{' (active)' if d.get('is_active') else ''}" for d in devs)
+        return {"success": True, "speak": True, "message": f"Spotify devices: {named}."}
+
+    if action == "transfer":
+        try:
+            devs = sp.devices().get("devices", [])
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't list Spotify devices: {e}"}
+        want = (parameter or "").strip().lower()
+        target = None
+        if want in ("laptop", "computer", "pc", "this", "here", "desktop"):
+            target = next((d for d in devs if d.get("type") == "Computer"
+                           and "web player" not in (d.get("name") or "").lower()), None) \
+                     or next((d for d in devs if "web player" in (d.get("name") or "").lower()), None)
+        elif want:
+            hits = [d for d in devs if want in (d.get("name") or "").lower()]
+            if len(hits) > 1:
+                return {"success": False, "message": f"'{parameter}' matches several devices: {', '.join(d['name'] for d in hits)}. Which one?"}
+            target = hits[0] if hits else None
+        if not target:
+            names = ", ".join(d["name"] for d in devs) or "none online"
+            return {"success": False, "message": f"I couldn't find a device matching '{parameter}'. Available: {names}."}
+        try:
+            sp.transfer_playback(target["id"], force_play=True)
+            return {"success": True, "message": f"Moved playback to {target['name']}."}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't move playback: {e}"}
+
+    # play STARTS new playback -> prefer THIS computer, not whatever device
+    # happened to be active (that's how it ended up on the FireTV Stick)
+    device, path, derr = _spotify_device(sp, prefer_local=(action == "play"))
     if derr:
         return {"success": False, "message": derr}
     print(f"[spotify_control] using {path}: {device.get('name')}")
