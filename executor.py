@@ -3488,6 +3488,45 @@ def _spotify_dom(action: str) -> dict:
         return {"success": False, "message": f"Spotify web player control failed: {e}"}
 
 
+def _focus_browser_window() -> None:
+    """Bring the automation browser's window to the foreground and make sure
+    the Akira tab is the visible one — 'show me X' means SHOW, not background."""
+    try:
+        browser = get_browser(_last_browser_name)
+        browser.switch_to.window(browser._akira_tab)
+        browser.execute_cdp_cmd("Page.bringToFront", {})
+    except Exception as e:
+        print(f"[spotify_control] couldn't focus browser window: {e}")
+
+
+def _spotify_show_uri(app_uri: str, web_path: str, label: str) -> dict:
+    """SHOW a Spotify UI surface. Desktop app running -> spotify: deep link
+    (opens INSIDE the app — library, playlists, liked songs are all
+    deep-linkable even though the app has no automation API). Otherwise ->
+    the same page on the web player in the controlled browser."""
+    if _spotify_app_running():
+        print(f"[spotify_control] deep-linking app UI: {app_uri}")
+        try:
+            os.startfile(app_uri)  # Windows protocol handler -> Spotify app
+            time.sleep(0.8)
+            for w in gw.getWindowsWithTitle("Spotify"):
+                try:
+                    w.activate()
+                    break
+                except Exception:
+                    pass
+            return {"success": True, "message": f"Showing {label} in Spotify."}
+        except Exception as e:
+            print(f"[spotify_control] deep link failed ({e}) — web fallback")
+    try:
+        get_browser()
+        _navigate(f"https://open.spotify.com/{web_path}")
+        _focus_browser_window()
+        return {"success": True, "message": f"Showing {label} in the Spotify web player."}
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't open {label}: {e}"}
+
+
 _SPOTIFY_ALIASES = {
     "next": "next_track", "skip": "next_track", "previous": "previous_track",
     "back": "previous_track", "volume": "set_volume", "queue": "add_to_queue",
@@ -3498,6 +3537,10 @@ _SPOTIFY_ALIASES = {
     "current_volume": "get_volume", "get_current_volume": "get_volume",
     "forward": "skip_forward", "rewind": "skip_back", "backward": "skip_back",
     "skip_backward": "skip_back", "seek_to": "seek", "whats_playing": "now_playing",
+    "lyrics": "show_lyrics", "open_lyrics": "show_lyrics",
+    "view_library": "show_library", "open_my_library": "show_library",
+    "show_liked_songs": "show_liked", "view_liked": "show_liked",
+    "view_playlist": "show_playlist", "open_playlist_ui": "show_playlist",
 }
 
 
@@ -3508,17 +3551,57 @@ def spotify_control(action: str, parameter: str | None = None) -> dict:
     print(f"[spotify_control] action={action!r} parameter={parameter!r}")
     sp, err = _spotify_client()
     if sp is None:
-        # No API possible — DOM fallback for transport, loud fail otherwise
+        # No API possible — DOM fallback for transport, loud fail otherwise.
+        # show_lyrics/show_library are pure navigation, no API needed.
         print(f"[spotify_control] no API client ({err}) — DOM fallback")
         if action in ("pause", "resume", "next_track", "previous_track", "now_playing"):
             return _spotify_dom(action)
-        return {"success": False, "message": err}
+        if action == "show_lyrics":
+            pass  # handled below, needs no client
+        elif action in ("show_library", "show_liked"):
+            pass  # deep link / web nav, needs no client
+        else:
+            return {"success": False, "message": err}
 
-    if action == "lyrics":
-        # Spotify's public Web API has NO lyrics endpoint (that's a licensed
-        # Musixmatch integration, app-only). Honest refusal BEFORE trying.
-        return {"success": False, "speak": True,
-                "message": "Spotify doesn't let outside apps read lyrics — that's locked to their own app. Open the Spotify window and tap the mic icon at the bottom."}
+    if action == "show_lyrics":
+        # No lyrics DATA via the API (licensed Musixmatch), but we CAN show
+        # the lyrics UI: the web player's /lyrics page mirrors the currently
+        # playing track across ALL devices via Spotify Connect.
+        try:
+            get_browser()
+            _navigate("https://open.spotify.com/lyrics")
+            _focus_browser_window()
+            return {"success": True, "message": "Lyrics are up on screen."}
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't open the lyrics view: {e}"}
+
+    if action in ("show_library", "show_liked"):
+        uri = "spotify:collection:tracks" if action == "show_liked" else "spotify:collection"
+        web = "collection/tracks" if action == "show_liked" else "collection"
+        return _spotify_show_uri(uri, web,
+                                 "Liked Songs" if action == "show_liked" else "your library")
+
+    if action == "show_playlist":
+        if not parameter:
+            return {"success": False, "message": "Which playlist?"}
+        want = parameter.strip().lower()
+        try:
+            pls, offset = [], 0
+            while offset < 200:
+                batch = sp.current_user_playlists(limit=50, offset=offset).get("items", [])
+                pls.extend(batch)
+                if len(batch) < 50:
+                    break
+                offset += 50
+            hits = [pl for pl in pls if pl and want in (pl.get("name") or "").lower()]
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't look up your playlists: {e}"}
+        if not hits:
+            names = ", ".join((pl.get("name") or "?") for pl in pls[:8]) or "none found"
+            return {"success": False, "message": f"No playlist matching '{parameter}'. You have: {names}."}
+        pl = hits[0]
+        pid = pl["uri"].split(":")[-1]
+        return _spotify_show_uri(pl["uri"], f"playlist/{pid}", pl["name"])
 
     if action == "search":
         if not parameter:

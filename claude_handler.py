@@ -249,12 +249,12 @@ SPOTIFY: spotify_control — format "spotify_control|action|value". All ungated.
 Playback: play|track or artist, pause, resume, next_track, previous_track, seek|1:30 (absolute), skip_forward|seconds, skip_back|seconds.
 Volume: set_volume|0-100, get_volume, mute, unmute. (set_volume = SPOTIFY's volume; adjust_volume = SYSTEM volume — pick by what the user means.)
 Modes: shuffle|on/off, repeat|track (one song) / repeat|context (playlist or album) / repeat|off.
-Library: open_playlist|name (finds the user's playlist by name and plays it), open_library (plays Liked Songs), play_mood|calm/upbeat/focus/etc ("play something calm" -> spotify_control|play_mood|calm).
+Library (PLAY): open_playlist|name (finds the user's playlist by name and plays it), open_library (plays Liked Songs), play_mood|calm/upbeat/focus/etc ("play something calm" -> spotify_control|play_mood|calm).
+UI (SHOW on screen): show_lyrics (opens the live lyrics view for the current song), show_library, show_liked (Liked Songs list), show_playlist|name. Use these when the user wants to SEE something ("show me the lyrics", "open my library", "let me see my playlists") vs the play actions above when they want to HEAR it. You CAN show lyrics and navigate the library UI — never say you can't or tell the user to click things themselves.
 Info: search|query, now_playing, devices.
 Devices: transfer|laptop or transfer|device name — play always starts on THIS computer; if it's on the wrong device or the user says "play it here"/"put it on the TV", transfer it yourself, NEVER tell them to switch manually.
-Examples: "play blinding lights" -> play|blinding lights. "go to 1 minute 30" -> seek|1:30. "skip ahead 10 seconds" -> skip_forward|10. "play my gym playlist" -> open_playlist|gym.
+Examples: "play blinding lights" -> play|blinding lights. "go to 1 minute 30" -> seek|1:30. "show me the lyrics" -> show_lyrics. "open my library" -> show_library. "play my gym playlist" -> open_playlist|gym. "show my gym playlist" -> show_playlist|gym.
 NEVER ask whether to use the app or web player — the executor resolves that automatically.
-LYRICS: Spotify's API does not expose lyrics to outside apps. If asked for lyrics, say up front it's app-only — do NOT promise it or send a lyrics action expecting it to work.
 
 COMMUNICATION: send_whatsapp[C]
 
