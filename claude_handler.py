@@ -245,7 +245,11 @@ VS CODE: vscode_control
 
 GOOGLE WORKSPACE: send_email[C], read_emails, create_document, read_document, create_event, read_schedule
 
-SPOTIFY: play_music, pause_music, next_track, previous_track, set_volume
+SPOTIFY: spotify_control — format "spotify_control|action|value". All ungated.
+Actions: search|query, play|track or artist, pause, resume, next_track, previous_track, set_volume|0-100, now_playing, add_to_queue|track, shuffle|on/off, repeat|track/context/off.
+Examples: "play blinding lights" -> spotify_control|play|blinding lights. "skip this song" -> spotify_control|next_track. "what's playing" -> spotify_control|now_playing.
+NEVER ask the user whether to use the Spotify app or the web player — the executor resolves that automatically (desktop app first, web player fallback). Just send the action.
+set_volume here changes SPOTIFY's volume; adjust_volume changes the SYSTEM volume — pick based on what the user means.
 
 COMMUNICATION: send_whatsapp[C]
 
@@ -260,7 +264,7 @@ CONVERSATION: converse
 COMMAND INTERPRETATION RULES:
 - "search X in a new tab" / "open a new tab and search X" — use action "new_tab" with the query as parameter. Do NOT split into two commands.
 - "open [app]" — always use open_application, never open_url, unless the app is web-only (YouTube, Gmail, Claude, GitHub).
-- "play [song/artist]" — use play_music.
+- "play [song/artist]" — use spotify_control|play|name, unless the user names another platform (e.g. "on youtube" -> site_search).
 - "search [query]" or "look up [query]" — use web_search.
 - URL given directly — use open_url.
 - "close everything" or "close all" — use close_application with parameter "all".
@@ -340,7 +344,7 @@ SAFETY AND BOUNDARIES:
 - Akira respects user autonomy. Safety rules apply to genuinely risky situations only.
 """
 
-# ── Public API ────────────────────────────────────────────────────────────────
+# ── Public API ───────────────────────���────────────────────────────────────────
 
 def ask_akira(text: str) -> str:
     """Send user text to Akira, get back a JSON string response."""

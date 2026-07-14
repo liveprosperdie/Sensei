@@ -82,6 +82,7 @@ MANUAL_MAP = {
     "powerpoint":r"C:\Program Files\Microsoft Office\root\Office16\powerpnt.exe",
     "zoom":     os.path.join(_home, "AppData", "Roaming", "Zoom", "bin", "Zoom.exe"),
     "filmora":  os.path.join(_home, "AppData", "Local", "Wondershare", "Wondershare Filmora", "Filmora.exe"),
+    "spotify":  os.path.join(_home, "AppData", "Roaming", "Spotify", "Spotify.exe"),
 }
 
 WEB_MAP = {
@@ -3044,6 +3045,15 @@ def extract_files(parameter: str | None = None) -> dict:
     try:
         with zipfile.ZipFile(fpath) as zf:
             names = zf.namelist()
+            # zip-slip guard: a malicious entry like ../../evil.dll would
+            # escape dest via extractall. Resolve every member's real target
+            # path and refuse the WHOLE extraction if any falls outside dest.
+            dest_real = os.path.realpath(dest)
+            for member in names:
+                target = os.path.realpath(os.path.join(dest, member))
+                if target != dest_real and not target.startswith(dest_real + os.sep):
+                    return {"success": False,
+                            "message": f"Refusing to extract {os.path.basename(fpath)} — entry '{member}' would land outside the destination folder. That's a malicious archive pattern."}
             zf.extractall(dest)
     except Exception as e:
         return {"success": False, "message": f"Couldn't extract it: {e}"}
@@ -3211,6 +3221,246 @@ def write_clipboard(parameter: str | None = None) -> dict:
     except Exception as e:
         # write appeared to succeed but verification wasn't possible — say so
         return {"success": True, "message": f"Copied to clipboard ({len(parameter)} chars), but I couldn't verify it: {e}"}
+
+
+# ── Spotify ───────────────────────────────────────────────────────────────────
+# HYBRID control, priority order (never ask the user which):
+#   1. Desktop app installed -> Web API against it (launch + poll if not running)
+#   2. No app -> web player via Web API (open open.spotify.com, poll for device)
+#   3. No API device establishable -> DOM control of open.spotify.com
+#      (transport only; volume/shuffle/repeat/queue fail loud in DOM mode)
+# OAuth: spotipy (SpotifyOAuth = auth-code flow + token cache + refresh built
+# in). Raw-requests fallback deliberately NOT built — it duplicates ~100 lines
+# of security-sensitive redirect/refresh code that can't be verified here.
+
+_SPOTIFY_SCOPES = ("user-read-playback-state user-modify-playback-state "
+                   "user-read-currently-playing")
+_spotify_client_cache = None
+
+
+def _spotify_client():
+    """Returns (spotipy_client_or_None, error_message_or_None). Cached."""
+    global _spotify_client_cache
+    if _spotify_client_cache is not None:
+        return _spotify_client_cache, None
+    cid = os.environ.get("SPOTIFY_CLIENT_ID")
+    secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
+    if not cid or not secret:
+        return None, ("Spotify API needs SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET "
+                      "in the .env — create an app at developer.spotify.com/dashboard.")
+    try:
+        import spotipy
+        from spotipy.oauth2 import SpotifyOAuth
+    except ImportError:
+        return None, "I need the spotipy package — run pip install spotipy."
+    try:
+        auth = SpotifyOAuth(
+            client_id=cid, client_secret=secret,
+            redirect_uri=os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback"),
+            scope=_SPOTIFY_SCOPES,
+            cache_path=os.path.join(os.path.expanduser("~"), ".sensei_spotify_cache"),
+            open_browser=True)
+        client = spotipy.Spotify(auth_manager=auth, requests_timeout=10)
+        _spotify_client_cache = client
+        return client, None
+    except Exception as e:
+        return None, f"Spotify auth failed: {e}"
+
+
+def _spotify_app_running() -> bool:
+    try:
+        return any((p.info["name"] or "").lower() == "spotify.exe"
+                   for p in psutil.process_iter(["name"]))
+    except Exception:
+        return False
+
+
+def _spotify_pick(devices: list) -> dict | None:
+    """Priority: active > desktop app (Computer) > web player > anything."""
+    for d in devices:
+        if d.get("is_active"):
+            return d
+    for d in devices:
+        if d.get("type") == "Computer" and "web player" not in (d.get("name") or "").lower():
+            return d
+    for d in devices:
+        if "web player" in (d.get("name") or "").lower():
+            return d
+    return devices[0] if devices else None
+
+
+def _spotify_device(sp) -> tuple[dict | None, str, str | None]:
+    """Establish a playback device. Returns (device, path_used, error)."""
+    try:
+        devices = sp.devices().get("devices", [])
+    except Exception as e:
+        return None, "none", f"Couldn't query Spotify devices: {e}"
+    d = _spotify_pick(devices)
+    if d:
+        path = ("desktop app device" if d.get("type") == "Computer"
+                and "web player" not in (d.get("name") or "").lower() else "web player device")
+        return d, path, None
+    # no device — bring one up, preferring the installed desktop app
+    exe = _find_exe("spotify")
+    if exe:
+        if not _spotify_app_running():
+            print("[spotify_control] launching desktop app")
+            try:
+                subprocess.Popen(exe)
+            except Exception as e:
+                print(f"[spotify_control] app launch failed: {e}")
+        wait, path = 10, "desktop app device"
+    else:
+        print("[spotify_control] app not installed — opening web player")
+        try:
+            browser = get_browser()
+            _navigate("https://open.spotify.com")
+        except Exception as e:
+            return None, "none", f"Couldn't open the Spotify web player: {e}"
+        wait, path = 12, "web player device"
+    for _ in range(wait):
+        time.sleep(1)
+        try:
+            d = _spotify_pick(sp.devices().get("devices", []))
+        except Exception:
+            d = None
+        if d:
+            return d, path, None
+    return None, "none", ("I couldn't find an active Spotify device — is Spotify "
+                          "installed or open and logged in anywhere?")
+
+
+def _spotify_dom(action: str) -> dict:
+    """LAST-RESORT DOM control of open.spotify.com — transport only."""
+    print(f"[spotify_control] using DOM fallback for {action}")
+    testids = {"pause": "control-button-playpause", "resume": "control-button-playpause",
+               "next_track": "control-button-skip-forward",
+               "previous_track": "control-button-skip-back"}
+    try:
+        browser = get_browser()
+        if "open.spotify.com" not in (browser.current_url or ""):
+            _navigate("https://open.spotify.com")
+            time.sleep(4)
+        if action == "now_playing":
+            el = browser.find_elements(By.CSS_SELECTOR, '[data-testid="now-playing-widget"]')
+            if el and el[0].text.strip():
+                return {"success": True, "speak": True,
+                        "message": "Now playing: " + el[0].text.replace("\n", " by ", 1).replace("\n", ", ")}
+            return {"success": False, "message": "Nothing seems to be playing in the web player."}
+        tid = testids.get(action)
+        if not tid:
+            return {"success": False, "message": f"I can't do {action.replace('_', ' ')} without API access — set up SPOTIFY_CLIENT_ID and SECRET and I'll control Spotify properly."}
+        els = [e for e in browser.find_elements(By.CSS_SELECTOR, f'[data-testid="{tid}"]') if e.is_displayed()]
+        if not els:
+            return {"success": False, "message": "I couldn't find the player controls — are you logged in to the Spotify web player?"}
+        els[0].click()
+        return {"success": True, "message": f"Done — {action.replace('_', ' ')}."}
+    except Exception as e:
+        return {"success": False, "message": f"Spotify web player control failed: {e}"}
+
+
+def spotify_control(action: str, parameter: str | None = None) -> dict:
+    """Spotify hybrid control. Ungated — playback actions are all reversible."""
+    action = (action or "").strip().lower().replace(" ", "_")
+    print(f"[spotify_control] action={action!r} parameter={parameter!r}")
+    sp, err = _spotify_client()
+    if sp is None:
+        # No API possible — DOM fallback for transport, loud fail otherwise
+        print(f"[spotify_control] no API client ({err}) — DOM fallback")
+        if action in ("pause", "resume", "next_track", "previous_track", "now_playing"):
+            return _spotify_dom(action)
+        return {"success": False, "message": err}
+
+    if action == "search":
+        if not parameter:
+            return {"success": False, "message": "Search for what?"}
+        try:
+            res = sp.search(parameter, limit=5, type="track,artist")
+            tracks = [f"{t['name']} by {t['artists'][0]['name']}"
+                      for t in res.get("tracks", {}).get("items", [])[:4]]
+            artists = [a["name"] for a in res.get("artists", {}).get("items", [])[:2]]
+            if not tracks and not artists:
+                return {"success": False, "message": f"No Spotify results for '{parameter}'."}
+            bits = []
+            if tracks:
+                bits.append("Tracks: " + "; ".join(tracks))
+            if artists:
+                bits.append("Artists: " + ", ".join(artists))
+            return {"success": True, "speak": True, "message": ". ".join(bits) + "."}
+        except Exception as e:
+            return {"success": False, "message": f"Spotify search failed: {e}"}
+
+    device, path, derr = _spotify_device(sp)
+    if derr:
+        return {"success": False, "message": derr}
+    print(f"[spotify_control] using {path}: {device.get('name')}")
+    dev_id = device["id"]
+    try:
+        if action == "play":
+            if not parameter:
+                return {"success": False, "message": "Play what? Give me a track or artist."}
+            res = sp.search(parameter, limit=1, type="track")
+            items = res.get("tracks", {}).get("items", [])
+            if not items:
+                return {"success": False, "message": f"Couldn't find '{parameter}' on Spotify."}
+            t = items[0]
+            sp.start_playback(device_id=dev_id, uris=[t["uri"]])
+            return {"success": True, "message": f"Playing {t['name']} by {t['artists'][0]['name']} on {device.get('name')}."}
+        if action == "pause":
+            sp.pause_playback(device_id=dev_id)
+            return {"success": True, "message": "Paused."}
+        if action == "resume":
+            sp.start_playback(device_id=dev_id)
+            return {"success": True, "message": "Resumed."}
+        if action == "next_track":
+            sp.next_track(device_id=dev_id)
+            return {"success": True, "message": "Skipped."}
+        if action == "previous_track":
+            sp.previous_track(device_id=dev_id)
+            return {"success": True, "message": "Back a track."}
+        if action == "set_volume":
+            try:
+                vol = max(0, min(100, int(re.sub(r"\D", "", parameter or ""))))
+            except ValueError:
+                return {"success": False, "message": "Volume needs a number, 0 to 100."}
+            sp.volume(vol, device_id=dev_id)
+            return {"success": True, "message": f"Spotify volume at {vol}."}
+        if action == "now_playing":
+            cur = sp.current_playback()
+            if not cur or not cur.get("item"):
+                return {"success": True, "speak": True, "message": "Nothing is playing right now."}
+            t = cur["item"]
+            state = "playing" if cur.get("is_playing") else "paused"
+            return {"success": True, "speak": True,
+                    "message": f"{t['name']} by {t['artists'][0]['name']}, {state} on {cur.get('device', {}).get('name', 'unknown device')}."}
+        if action == "add_to_queue":
+            if not parameter:
+                return {"success": False, "message": "Queue what?"}
+            res = sp.search(parameter, limit=1, type="track")
+            items = res.get("tracks", {}).get("items", [])
+            if not items:
+                return {"success": False, "message": f"Couldn't find '{parameter}' on Spotify."}
+            t = items[0]
+            sp.add_to_queue(t["uri"], device_id=dev_id)
+            return {"success": True, "message": f"Queued {t['name']} by {t['artists'][0]['name']}."}
+        if action == "shuffle":
+            state = (parameter or "").strip().lower() in ("on", "true", "yes", "1")
+            sp.shuffle(state, device_id=dev_id)
+            return {"success": True, "message": f"Shuffle {'on' if state else 'off'}."}
+        if action == "repeat":
+            mode = (parameter or "off").strip().lower()
+            if mode not in ("track", "context", "off"):
+                mode = "context" if mode in ("on", "all", "playlist") else "off"
+            sp.repeat(mode, device_id=dev_id)
+            return {"success": True, "message": f"Repeat set to {mode}."}
+        return {"success": False, "message": f"Unknown spotify action: {action}"}
+    except Exception as e:
+        msg = str(e)
+        if "PREMIUM_REQUIRED" in msg or "403" in msg:
+            return {"success": False, "message": "Spotify says that needs a Premium account — playback control over the API is Premium-only."}
+        if "NO_ACTIVE_DEVICE" in msg or "404" in msg:
+            return {"success": False, "message": "Spotify lost the active device — start playing something once on any device and I'll take it from there."}
+        return {"success": False, "message": f"Spotify {action.replace('_', ' ')} failed: {e}"}
 
 
 def vscode_control(action: str, parameter: str | None = None) -> dict:
@@ -3777,6 +4027,7 @@ _ACTION_MAP = {
     "flipkart_control":  lambda p: flipkart_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
     "github_control":    lambda p: github_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "vscode_control":    lambda p: vscode_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
+    "spotify_control":   lambda p: spotify_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "create_file":       create_file,
     "read_file":         read_file,
     "write_file":        write_file,
