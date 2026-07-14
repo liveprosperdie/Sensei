@@ -1218,7 +1218,7 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     if "netflix.com" not in current_url:
         return {"success": False, "message": "Not a Netflix tab. Switch to Netflix first."}
 
-    # ── PLAYER actions via internal API ────────────────────────────────���────
+    # ── PLAYER actions via internal API ────────────────────────────────����────
     if action in ("play", "pause", "resume"):
         op = "pause" if action == "pause" else "play"
         ok = _nfx_js(browser, """
@@ -2352,7 +2352,7 @@ def github_control(action: str, parameter: str | None = None) -> dict:
     return {"success": False, "message": f"Unknown github_control action: {action}"}
 
 
-# ─��� File operations (standalone) + VS Code control ───────────────────────────
+# ������ File operations (standalone) + VS Code control ───────────────────────────
 # One function per capability. Standalone actions (create_file, read_file,
 # write_file, edit_file, search_file) are the default route; vscode_control
 # calls the SAME functions when the user explicitly says "in VS Code".
@@ -2775,15 +2775,24 @@ def list_folder(parameter: str | None = None) -> dict:
     _vsc_last_folder = folder
     if not dirs and not files:
         return {"success": True, "speak": True, "message": f"{os.path.basename(folder) or folder} is empty."}
-    parts = []
+    name = os.path.basename(folder) or folder
+    # spoken message stays SHORT (10 named, "and X more") — but "detail"
+    # carries the COMPLETE list (cap 200) which record_action_results feeds
+    # to the LLM, so keep-list bulk deletes can reason over every name
+    spoken, full = [], []
     if dirs:
         shown = ", ".join(dirs[:10]) + (f", and {len(dirs) - 10} more" if len(dirs) > 10 else "")
-        parts.append(f"{len(dirs)} folder{'s' if len(dirs) != 1 else ''}: {shown}")
+        spoken.append(f"{len(dirs)} folder{'s' if len(dirs) != 1 else ''}: {shown}")
+        full.append(f"{len(dirs)} folders: {', '.join(dirs[:200])}"
+                    + (f" (+{len(dirs) - 200} more not shown)" if len(dirs) > 200 else ""))
     if files:
         shown = ", ".join(files[:10]) + (f", and {len(files) - 10} more" if len(files) > 10 else "")
-        parts.append(f"{len(files)} file{'s' if len(files) != 1 else ''}: {shown}")
+        spoken.append(f"{len(files)} file{'s' if len(files) != 1 else ''}: {shown}")
+        full.append(f"{len(files)} files: {', '.join(files[:200])}"
+                    + (f" (+{len(files) - 200} more not shown)" if len(files) > 200 else ""))
     return {"success": True, "speak": True,
-            "message": f"In {os.path.basename(folder) or folder}: " + ". ".join(parts) + "."}
+            "message": f"In {name}: " + ". ".join(spoken) + ".",
+            "detail": f"COMPLETE listing of {folder}: " + ". ".join(full) + "."}
 
 
 def open_file(parameter: str | None = None) -> dict:
@@ -3281,7 +3290,7 @@ def vscode_control(action: str, parameter: str | None = None) -> dict:
     return {"success": False, "message": f"Unknown vscode_control action: {action}"}
 
 
-# ── System actions ────────────────────────────────────────────────────────────
+# ── System actions ────────────────────────────���───────────────────────────────
 
 def _find_exe(name: str) -> str | None:
     """Try to find an executable using glob for version-agnostic paths."""

@@ -397,7 +397,10 @@ def record_action_results(results: list) -> None:
     for r in results:
         if isinstance(r, dict):
             status = "ok" if r.get("success") else "FAILED"
-            lines.append(f"{status}: {r.get('message', '')}")
+            # "detail" carries the FULL data (e.g. list_folder's complete
+            # file list) while "message" is the short spoken form — the LLM
+            # must get the full version to reason over every item
+            lines.append(f"{status}: {r.get('detail') or r.get('message', '')}")
         elif isinstance(r, str) and r.strip():
             lines.append(r)
     if not lines:
