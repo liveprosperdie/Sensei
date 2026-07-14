@@ -654,6 +654,44 @@ def vision_click(browser, instruction: str) -> bool:
     return True
 
 
+# ── Atomic click ──────────────────────────────────────────────────────────────
+
+def atomic_click(driver, text: str | None = None, href: str | None = None) -> bool:
+    """Find AND click in ONE script execution — no staleness window.
+    data-akira-index attributes die when SPAs (YouTube especially) re-stamp
+    their DOM nodes during the LLM-match round-trip; re-finding by href/text
+    at click time inside the same JS pass is immune to that."""
+    if not text and not href:
+        return False
+    return bool(driver.execute_script("""
+        const text = arguments[0], href = arguments[1];
+        function visible(el) {
+            const r = el.getBoundingClientRect();
+            return r.width > 4 && r.height > 4;
+        }
+        if (href) {
+            for (const a of document.querySelectorAll('a[href]')) {
+                if (a.href === href && visible(a)) { a.click(); return true; }
+            }
+        }
+        if (text) {
+            const t = text.replace(/\\s+/g,' ').trim().toLowerCase();
+            const sel = 'a[href], button, [role="button"], [role="menuitem"], [role="tab"], [role="option"], [onclick]';
+            let best = null;
+            for (const el of document.querySelectorAll(sel)) {
+                if (!visible(el)) continue;
+                const et = (el.innerText || el.textContent || el.getAttribute('aria-label') || '')
+                           .replace(/\\s+/g,' ').trim().toLowerCase();
+                if (!et) continue;
+                if (et === t) { el.click(); return true; }
+                if (!best && (et.includes(t) || t.includes(et)) && Math.min(et.length, t.length) > 3) best = el;
+            }
+            if (best) { best.click(); return true; }
+        }
+        return false;
+    """, text, href))
+
+
 # ── Click element (CDP path) ───────────────────────�������──────��───────────────────
 
 def click_element(driver, index: int, expected_text: str | None = None,
@@ -694,6 +732,12 @@ def click_element(driver, index: int, expected_text: str | None = None,
             return false;
         """)
         if not clicked:
+            # attribute gone = SPA re-stamped the node during the LLM
+            # round-trip (YouTube does this constantly). Re-find by the
+            # element's OWN text/href atomically instead of failing.
+            print(f"[CLICK] index {index} attribute stale — atomic re-find by text/href")
+            if atomic_click(driver, text=current.get("text"), href=current.get("href")):
+                return
             els = driver.find_elements(By.CSS_SELECTOR, f'[data-akira-index="{index}"]')
             if els:
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", els[0])
@@ -726,9 +770,26 @@ def youtube_control(parameter: str) -> str:
 
     # ── Group A: JS media controls — zero API cost ────────────────────
 
-    if param in ("play", "pause"):
-        browser.execute_script("document.querySelector('video')?.click();")
-        return "Done."
+    if param in ("play", "pause", "resume"):
+        # STATE-AWARE: v.pause()/v.play() are deterministic (video.click()
+        # was a blind toggle — two 'pause' commands in a row would pause
+        # then secretly resume). Reports actual state instead of "Done."
+        state = browser.execute_script("""
+            const v = document.querySelector('video');
+            if (!v) return 'novideo';
+            const wantPause = arguments[0] === 'pause';
+            if (wantPause) {
+                if (v.paused) return 'already_paused';
+                v.pause(); return 'paused';
+            }
+            if (!v.paused) return 'already_playing';
+            v.play(); return 'playing';
+        """, param)
+        return {"novideo": "There's no video on this page.",
+                "already_paused": "It's already paused.",
+                "paused": "Paused.",
+                "already_playing": "It's already playing.",
+                "playing": "Playing."}.get(state, "Done.")
 
     if param == "skip ad":
         browser.execute_script("""
@@ -831,14 +892,22 @@ def youtube_control(parameter: str) -> str:
         elements = extract_interactive_elements(browser, max_elements=150)
         from claude_handler import find_element_index
         idx = find_element_index(elements, description)
-        if idx is not None and idx < len(elements):
-            clicked = browser.execute_script(f"""
-                var el=document.querySelector('[data-akira-index="{idx}"]');
-                if(el){{el.click();return true;}}return false;
-            """)
-            if clicked:
-                return f"Playing {description}."
-        return f"Couldn't find that video on the page."
+        if idx is None or idx >= len(elements):
+            return "Couldn't find that video on the page."
+        target = elements[idx]
+        print(f"[YT] play-video matched idx={idx} text={target.get('text', '')[:60]!r} href={target.get('href')!r}")
+        # data-akira-index dies during the LLM round-trip (YouTube re-stamps
+        # its renderer nodes) — so NEVER click by index here. We already have
+        # the video's href from extraction: navigating is 100% equivalent to
+        # clicking a thumbnail and cannot go stale.
+        href = target.get("href")
+        if href and "watch" in href:
+            browser.execute_script("window.location.href = arguments[0];", href)
+            return f"Playing {target.get('text') or description}."
+        # non-video match (channel, playlist, button) — atomic find+click
+        if atomic_click(browser, text=target.get("text"), href=href):
+            return f"Opening {target.get('text') or description}."
+        return "Couldn't find that video on the page."
 
     # ── Group C: common controls — DOM matching only ─────────────────────
 
@@ -869,26 +938,22 @@ def youtube_control(parameter: str) -> str:
         """, selector)
         return "Done." if clicked else f"Couldn't find {param}."
     
-    # Menu items that need menu to be opened first
-    if param in {"ambient mode", "sleep timer", "quality", "playback speed menu"}:
+    # Menu items that need menu to be opened first. Menu item labels are
+    # KNOWN text — atomic_click matches them directly in one JS pass, no
+    # extract+LLM+stale-index round-trip needed at all.
+    _menu_labels = {"ambient mode": "Ambient mode", "sleep timer": "Sleep timer",
+                    "quality": "Quality", "playback speed menu": "Playback speed"}
+    if param in _menu_labels:
         browser.execute_script("document.querySelector('.ytp-settings-button')?.click();")
         time.sleep(0.5)
-        elements = extract_interactive_elements(browser, max_elements=150)
-        from claude_handler import find_element_index
-        idx = find_element_index(elements, param)
-        if idx is not None:
-            browser.execute_script(f"document.querySelector('[data-akira-index=\"{idx}\"]')?.click();")
+        if atomic_click(browser, text=_menu_labels[param]):
             return "Done."
         return f"Couldn't find {param} in settings."
-    
+
     if param in {"switch account", "sign out"}:
         browser.execute_script("document.querySelector('button#avatar-btn')?.click();")
-        time.sleep(0.5)
-        elements = extract_interactive_elements(browser, max_elements=150)
-        from claude_handler import find_element_index
-        idx = find_element_index(elements, param)
-        if idx is not None:
-            browser.execute_script(f"document.querySelector('[data-akira-index=\"{idx}\"]')?.click();")
+        time.sleep(0.7)
+        if atomic_click(browser, text=param.title() if param == "switch account" else "Sign out"):
             return "Done."
         return f"Couldn't find {param} in account menu."
     
@@ -3323,18 +3388,42 @@ def _spotify_pick(devices: list, prefer_local: bool = False) -> dict | None:
     return devices[0] if devices else None
 
 
+def _spotify_is_local(d: dict) -> bool:
+    return bool(d) and d.get("type") == "Computer"
+
+
 def _spotify_device(sp, prefer_local: bool = False) -> tuple[dict | None, str, str | None]:
-    """Establish a playback device. Returns (device, path_used, error)."""
+    """Establish a playback device. Returns (device, path_used, error).
+    prefer_local: NEVER silently settle for a remote device (TV/phone) —
+    bring up THIS machine's app or web player first; only fall back to the
+    remote with path='remote fallback' so the caller can disclose it."""
     try:
         devices = sp.devices().get("devices", [])
     except Exception as e:
         return None, "none", f"Couldn't query Spotify devices: {e}"
     d = _spotify_pick(devices, prefer_local)
+    if prefer_local and d and not _spotify_is_local(d):
+        print(f"[spotify_control] only remote device online ({d.get('name')}) — bringing up local")
+        local, lerr = _spotify_bring_up_local(sp)
+        if local:
+            return local, "local device (launched)", None
+        print(f"[spotify_control] local bring-up failed ({lerr}) — remote fallback")
+        return d, "remote fallback", None
     if d:
         path = ("desktop app device" if d.get("type") == "Computer"
                 and "web player" not in (d.get("name") or "").lower() else "web player device")
         return d, path, None
-    # no device — bring one up, preferring the installed desktop app
+    # no device at all — bring up a local one
+    local, lerr = _spotify_bring_up_local(sp)
+    if local:
+        return local, "local device (launched)", None
+    return None, "none", lerr or ("I couldn't find an active Spotify device — is Spotify "
+                                  "installed or open and logged in anywhere?")
+
+
+def _spotify_bring_up_local(sp) -> tuple[dict | None, str | None]:
+    """Launch THIS machine's Spotify (desktop app > web player) and poll until
+    it registers as a Connect device. Returns (local_device, error)."""
     exe = _find_exe("spotify")
     if exe:
         if not _spotify_app_running():
@@ -3343,25 +3432,26 @@ def _spotify_device(sp, prefer_local: bool = False) -> tuple[dict | None, str, s
                 subprocess.Popen(exe)
             except Exception as e:
                 print(f"[spotify_control] app launch failed: {e}")
-        wait, path = 10, "desktop app device"
+        wait = 12
     else:
         print("[spotify_control] app not installed — opening web player")
         try:
-            browser = get_browser()
+            get_browser()
             _navigate("https://open.spotify.com")
         except Exception as e:
-            return None, "none", f"Couldn't open the Spotify web player: {e}"
-        wait, path = 12, "web player device"
+            return None, f"Couldn't open the Spotify web player: {e}"
+        wait = 14
     for _ in range(wait):
         time.sleep(1)
         try:
-            d = _spotify_pick(sp.devices().get("devices", []), prefer_local)
+            devs = sp.devices().get("devices", [])
         except Exception:
-            d = None
-        if d:
-            return d, path, None
-    return None, "none", ("I couldn't find an active Spotify device — is Spotify "
-                          "installed or open and logged in anywhere?")
+            devs = []
+        for d in devs:
+            if _spotify_is_local(d):
+                print(f"[spotify_control] local device registered: {d.get('name')}")
+                return d, None
+    return None, "Spotify opened here but never showed up as a playback device — is it logged in?"
 
 
 def _spotify_dom(action: str) -> dict:
@@ -3476,7 +3566,12 @@ def spotify_control(action: str, parameter: str | None = None) -> dict:
                 return {"success": False, "message": f"Couldn't find '{parameter}' on Spotify."}
             t = items[0]
             sp.start_playback(device_id=dev_id, uris=[t["uri"]])
-            return {"success": True, "message": f"Playing {t['name']} by {t['artists'][0]['name']} on {device.get('name')}."}
+            msg = f"Playing {t['name']} by {t['artists'][0]['name']} on {device.get('name')}."
+            if path == "remote fallback":
+                # never silently play on a TV/phone — disclose and offer to move
+                msg = (f"Heads up — I couldn't get Spotify running on this computer, "
+                       f"so it's playing on {device.get('name')}. Say 'play it here' to move it.")
+            return {"success": True, "speak": path == "remote fallback", "message": msg}
         if action == "pause":
             sp.pause_playback(device_id=dev_id)
             return {"success": True, "message": "Paused."}
