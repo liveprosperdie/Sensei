@@ -4415,6 +4415,12 @@ _ACTION_MAP = {
     "github_control":    lambda p: github_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "vscode_control":    lambda p: vscode_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "spotify_control":   lambda p: spotify_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
+    # Google Workspace via MCP (lazy imports: node/npx only needed on first use)
+    "calendar_control":  lambda p: __import__("calendar_control").calendar_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
+    "docs_control":      lambda p: __import__("docs_control").docs_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
+    "sheets_control":    lambda p: __import__("sheets_control").sheets_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
+    "slides_control":    lambda p: __import__("slides_control").slides_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
+    "gmail_control":     lambda p: __import__("gmail_control").gmail_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "create_file":       create_file,
     "read_file":         read_file,
     "write_file":        write_file,
