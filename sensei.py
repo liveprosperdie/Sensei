@@ -88,6 +88,12 @@ RISKY_VSCODE_PARAMS = frozenset({
     "write file", "edit file",
 })
 
+# Calendar sub-actions that destroy data — always gated. list/create/update/
+# free stay free-flowing (create and update are additive or reversible).
+RISKY_CALENDAR_PARAMS = frozenset({
+    "delete",
+})
+
 
 def _is_dangerous_step(step: dict) -> bool:
     """True if this action step must be confirmation-gated by the safety net."""
@@ -100,6 +106,8 @@ def _is_dangerous_step(step: dict) -> bool:
         return param in RISKY_GITHUB_PARAMS
     if step.get("action") == "vscode_control":
         return param in RISKY_VSCODE_PARAMS
+    if step.get("action") == "calendar_control":
+        return param in RISKY_CALENDAR_PARAMS
     return False
 
 FAILURE_PREFIXES = (
