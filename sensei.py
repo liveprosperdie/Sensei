@@ -394,6 +394,18 @@ def handle_response(response: dict) -> bool:
             except Exception as e:
                 print(f"[v0] record_action_results failed: {e}")
 
+            # same-turn synthesis for workspace reads (speak_summary=True):
+            # the raw API dump is now in history, so ask the LLM to answer the
+            # user's request from it NOW instead of speaking the routing call's
+            # pre-baked "let me check your inbox" and going silent. Must run
+            # AFTER record_action_results (synthesis reads it from history)
+            # and takes precedence over the "speak" override above because raw
+            # dumps are not speakable. Failure keeps the existing response.
+            if any(isinstance(r, dict) and r.get("speak_summary") for r in run_results):
+                summary = claude_handler.synthesize_action_reply()
+                if summary:
+                    response["response"] = summary
+
         # click confirmation discovered at runtime
         if pending_action == "click_confirmed" and run_results:
             response["response"] = run_results[-1]
@@ -476,6 +488,14 @@ def get_akira_response(text: str) -> dict | None:
                     if isinstance(r, dict) and r.get("success") is True and r.get("message"):
                         speak_text = r["message"]
                         break
+                # record confirmed-action outcomes in history too — this path
+                # previously skipped it, so after "delete my meeting" + "yes"
+                # the next turn had no idea the delete ever happened
+                if confirm_results:
+                    try:
+                        claude_handler.record_action_results(confirm_results)
+                    except Exception as e:
+                        print(f"[v0] record_action_results failed: {e}")
             pending_action = pending_parameter = pending_execute = None
             speak_and_wait(speak_text)
             return None
