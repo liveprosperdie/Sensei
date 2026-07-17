@@ -29,10 +29,13 @@ def calendar_control(action: str, parameter: str | None = None) -> dict:
         if action == "list":
             days = int(parts[0]) if parts and parts[0].isdigit() else 7
             now = datetime.now().astimezone()
+            # speak_summary: list results are raw event dumps — synthesized
+            # into a spoken schedule in the same turn (see sensei.handle_response)
             return google_mcp.call("workspace", "list_events", {
                 "timeMin": now.isoformat(),
                 "timeMax": (now + timedelta(days=days)).isoformat(),
-                "singleEvents": True, "orderBy": "startTime", "maxResults": 15})
+                "singleEvents": True, "orderBy": "startTime", "maxResults": 15},
+                speak_summary=True)
 
         if action == "create":
             if len(parts) < 3:
@@ -82,7 +85,7 @@ def calendar_control(action: str, parameter: str | None = None) -> dict:
             return google_mcp.call("workspace", "find_free_time", {
                 "calendarIds": ["primary"],
                 "timeMin": _iso(parts[0]), "timeMax": _iso(parts[1]),
-                "duration": duration})
+                "duration": duration}, speak_summary=True)
 
         return {"success": False, "message": f"Unknown calendar action: {action}"}
     except ValueError as e:

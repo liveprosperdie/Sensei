@@ -94,6 +94,14 @@ RISKY_CALENDAR_PARAMS = frozenset({
     "delete",
 })
 
+# Workspace file deletes (Drive trash via delete_item) — always gated IN CODE,
+# not just the prompt: the slides delete bug happened precisely because no
+# code-level gate or implementation existed behind the prompt's promise.
+# Gates all three dispatchers so a future docs/sheets delete can't ship ungated.
+RISKY_WORKSPACE_PARAMS = frozenset({
+    "delete",
+})
+
 
 def _is_dangerous_step(step: dict) -> bool:
     """True if this action step must be confirmation-gated by the safety net."""
@@ -108,6 +116,8 @@ def _is_dangerous_step(step: dict) -> bool:
         return param in RISKY_VSCODE_PARAMS
     if step.get("action") == "calendar_control":
         return param in RISKY_CALENDAR_PARAMS
+    if step.get("action") in ("slides_control", "docs_control", "sheets_control"):
+        return param in RISKY_WORKSPACE_PARAMS
     return False
 
 FAILURE_PREFIXES = (

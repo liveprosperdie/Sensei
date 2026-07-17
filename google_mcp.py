@@ -31,7 +31,13 @@ DENYLIST = frozenset({
     "create_filter", "delete_filter", "update_label", "delete_label",
     "get_or_create_label",                      # creates labels = outbound-adjacent mutation
     "share_file", "batch_share", "remove_permission",  # sharing "fails outward"
-    "delete_item", "batch_delete", "empty_trash",      # drive scope is organize-only
+    "batch_delete", "empty_trash",  # bulk/irreversible drive ops stay locked
+    # delete_item is deliberately NOT denylisted (changed for the slides
+    # delete fix): it moves ONE item to the Drive TRASH — recoverable, not
+    # permanent (verified in v3.4.4: "Move items to trash"). Its only caller
+    # is slides_control's delete action, which sensei.py confirmation-gates
+    # in code via RISKY_WORKSPACE_PARAMS — the same code-level mechanism as
+    # calendar delete, per the "never prompt-level-only gates" lesson.
 })
 
 _PACKAGE = "@dguido/google-workspace-mcp"
@@ -90,9 +96,13 @@ def _check_auth(server: MCPServer, instance: str) -> dict | None:
     return None
 
 
-def call(instance: str, tool: str, arguments: dict) -> dict:
+def call(instance: str, tool: str, arguments: dict, *,
+         speak_summary: bool = False) -> dict:
     """The single funnel every workspace dispatcher routes through.
-    Enforces the denylist, checks auth, returns {"success","message"}."""
+    Enforces the denylist, checks auth, returns {"success","message"}.
+    speak_summary=True marks a successful READ result (raw API dump) for
+    same-turn LLM synthesis into a spoken reply — see sensei.handle_response.
+    Set it only on read actions whose message is not directly speakable."""
     if tool in DENYLIST:
         print(f"[google_mcp] BLOCKED denylisted tool: {tool}")
         return {"success": False,
@@ -104,4 +114,7 @@ def call(instance: str, tool: str, arguments: dict) -> dict:
     auth_err = _check_auth(server, instance)
     if auth_err:
         return auth_err
-    return server.call_tool(tool, arguments)
+    result = server.call_tool(tool, arguments)
+    if speak_summary and result.get("success"):
+        result["speak_summary"] = True
+    return result
