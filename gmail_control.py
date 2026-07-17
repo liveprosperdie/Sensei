@@ -21,25 +21,31 @@ def gmail_control(action: str, parameter: str | None = None) -> dict:
     param = (parameter or "").strip()
     print(f"[gmail_control] action={action!r} param={param!r}")
 
+    # Every gmail action is a read whose result is a raw API dump —
+    # speak_summary=True gets it synthesized into a spoken digest in the
+    # SAME turn instead of requiring a "you didn't answer" follow-up.
     if action == "search":
         if not param:
             return {"success": False, "message": "Search your mail for what?"}
         return google_mcp.call("gmail", "search_emails",
-                               {"query": param, "maxResults": 10})
+                               {"query": param, "maxResults": 10},
+                               speak_summary=True)
 
     if action == "read":
         if not param:
             return {"success": False, "message": "Which email? I need the message id."}
         return google_mcp.call("gmail", "read_email",
-                               {"id": param, "contentFormat": "text"})
+                               {"id": param, "contentFormat": "text"},
+                               speak_summary=True)
 
     if action == "unread":
         n = int(param) if param.isdigit() else 5
         return google_mcp.call("gmail", "search_emails",
-                               {"query": "is:unread", "maxResults": n})
+                               {"query": "is:unread", "maxResults": n},
+                               speak_summary=True)
 
     if action == "labels":
-        return google_mcp.call("gmail", "list_labels", {})
+        return google_mcp.call("gmail", "list_labels", {}, speak_summary=True)
 
     return {"success": False,
             "message": f"Unknown or disabled gmail action: {action}. Gmail is read-only in Sensei."}
