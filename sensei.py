@@ -94,6 +94,14 @@ RISKY_CALENDAR_PARAMS = frozenset({
     "delete",
 })
 
+# Workspace file deletes (Drive trash via delete_item) — always gated IN CODE,
+# not just the prompt: the slides delete bug happened precisely because no
+# code-level gate or implementation existed behind the prompt's promise.
+# Gates all three dispatchers so a future docs/sheets delete can't ship ungated.
+RISKY_WORKSPACE_PARAMS = frozenset({
+    "delete",
+})
+
 
 def _is_dangerous_step(step: dict) -> bool:
     """True if this action step must be confirmation-gated by the safety net."""
@@ -108,6 +116,8 @@ def _is_dangerous_step(step: dict) -> bool:
         return param in RISKY_VSCODE_PARAMS
     if step.get("action") == "calendar_control":
         return param in RISKY_CALENDAR_PARAMS
+    if step.get("action") in ("slides_control", "docs_control", "sheets_control"):
+        return param in RISKY_WORKSPACE_PARAMS
     return False
 
 FAILURE_PREFIXES = (
@@ -384,6 +394,18 @@ def handle_response(response: dict) -> bool:
             except Exception as e:
                 print(f"[v0] record_action_results failed: {e}")
 
+            # same-turn synthesis for workspace reads (speak_summary=True):
+            # the raw API dump is now in history, so ask the LLM to answer the
+            # user's request from it NOW instead of speaking the routing call's
+            # pre-baked "let me check your inbox" and going silent. Must run
+            # AFTER record_action_results (synthesis reads it from history)
+            # and takes precedence over the "speak" override above because raw
+            # dumps are not speakable. Failure keeps the existing response.
+            if any(isinstance(r, dict) and r.get("speak_summary") for r in run_results):
+                summary = claude_handler.synthesize_action_reply()
+                if summary:
+                    response["response"] = summary
+
         # click confirmation discovered at runtime
         if pending_action == "click_confirmed" and run_results:
             response["response"] = run_results[-1]
@@ -466,6 +488,14 @@ def get_akira_response(text: str) -> dict | None:
                     if isinstance(r, dict) and r.get("success") is True and r.get("message"):
                         speak_text = r["message"]
                         break
+                # record confirmed-action outcomes in history too — this path
+                # previously skipped it, so after "delete my meeting" + "yes"
+                # the next turn had no idea the delete ever happened
+                if confirm_results:
+                    try:
+                        claude_handler.record_action_results(confirm_results)
+                    except Exception as e:
+                        print(f"[v0] record_action_results failed: {e}")
             pending_action = pending_parameter = pending_execute = None
             speak_and_wait(speak_text)
             return None
