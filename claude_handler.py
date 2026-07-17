@@ -195,7 +195,7 @@ ACTION PARAMETER FORMATS (fields split with |; relative names resolve against th
 - search_file: "name or partial name|optional folder" — folder can be a spoken name like pictures or downloads. Defaults to the session folder or home.
 - open_file: "path" — opens with the default app for that file type. If it's actually a folder, it opens in File Explorer.
 - copy_files: "files/folders or pattern|destination" — e.g. "copy_files|*.png|D:\\backup" or "copy_files|Document 4.pdf|desktop". Handles FOLDERS too (copied recursively). Destination can be a spoken name (desktop, downloads). Non-destructive. This copies items ON DISK, not text.
-- compress_files: "files/folders or pattern|optional folder or archive name" — creates a new zip next to the sources, originals untouched. Folders are zipped with their contents. Second field may be the folder the files live in OR the zip name — both work.
+- compress_files: "files/folders or pattern|optional folder or archive name" ��� creates a new zip next to the sources, originals untouched. Folders are zipped with their contents. Second field may be the folder the files live in OR the zip name — both work.
 - extract_files: "archive name or path|optional destination" — extracts into a new folder named after the archive. Archive resolves by name in the session folder.
 - write_file[C]: "path|content" — overwrites the whole file, always pauses for confirmation.
 - edit_file[C]: "path|find text|replace text" — if the text isn't found or appears more than once, it stops and asks rather than guessing.
@@ -247,9 +247,10 @@ GOOGLE WORKSPACE: send_email[C], read_emails, create_document, read_document, cr
 
 GOOGLE WORKSPACE (connected Google account):
 CALENDAR: calendar_control|action|params. Actions: list|days ("what's on my calendar" -> list|7), create|Title|YYYY-MM-DD HH:MM|YYYY-MM-DD HH:MM|optional desc (resolve relative dates like "tomorrow 3pm" to real datetimes yourself using the current date), get|eventId, update|eventId|title=X|start=YYYY-MM-DD HH:MM, delete|eventId [C], free|start|end|minutes (find open slots).
-DOCS: docs_control|action. create|Title|content, read|name or id, append|name or id|text to add. Read/append accept the document NAME — it resolves via Drive search.
-SHEETS: sheets_control|action. create|Name|a,b;c,d (comma separates cells, semicolon separates rows), read|spreadsheetId|optional range, write|spreadsheetId|Sheet1!A1|value1,value2;row2val1...
-SLIDES: slides_control|action. create|Name|Title 1::content;;Title 2::content, read|presentationId|optional slide number, update|presentationId|Title::content;;...
+DOCS: docs_control|action. create|Title|content (ONLY for exact content the user dictated), generate|Title|content brief|short or detailed (a separate AI writer composes the content, then the doc is created), read|name or id, append|name or id|text to add. Read/append accept the document NAME — it resolves via Drive search.
+SHEETS: sheets_control|action. create|Name|a,b;c,d (comma separates cells, semicolon separates rows), generate|Name|brief of the data wanted (an AI writer composes the rows), read|spreadsheetId|optional range, write|spreadsheetId|Sheet1!A1|value1,value2;row2val1...
+SLIDES: slides_control|action. create|Name|Title 1::content;;Title 2::content (user-dictated content only), generate|Name|topic brief|optional slide count (an AI writer composes the slides), read|presentationId|optional slide number, update|presentationId|Title::content;;..., delete|presentation name or id [C] (moves the presentation to the Drive trash).
+CONTENT RULE: whenever a doc, sheet, or slide deck needs content YOU would have to compose yourself (summaries, reports, essays, notes, study material), ALWAYS use the generate action with a SHORT one-or-two-sentence brief describing what to write — NEVER write the content yourself inline in the parameter, it will get cut off. Default to short content; pass "detailed" only when the user explicitly asks for something long, detailed, or of a specific large size.
 GMAIL — READ ONLY. You CANNOT send, draft, reply to, delete, or modify email. NEVER claim you can, NEVER promise "I'll send that" — offer to draft text into a Doc or the clipboard instead. Actions: gmail_control|search|gmail query (from:someone subject:report after:2026/07/01), gmail_control|read|messageId, gmail_control|unread|5, gmail_control|labels.
 If any workspace action reports "Google account not connected", tell the user to run the authenticate step from setup — do not retry silently.
 
@@ -389,10 +390,24 @@ def ask_akira(text: str) -> str:
 
         messages_snapshot = list(conversation_history)
 
+    # Real current date, computed per request from system time — without it
+    # the model guessed the year and put "tomorrow" events in the wrong year.
+    # Separate uncached block so the big cached prompt block stays valid.
+    now = dt.datetime.now().astimezone()
+    date_block = (
+        f"Current date and time: {now.strftime('%A, %Y-%m-%d %H:%M')} "
+        f"({now.tzname()}). Resolve EVERY relative date the user says — "
+        "tomorrow, tonight, next Monday, in two weeks — against this exact "
+        "date. Never guess the year."
+    )
+
     message = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=600,
-        system=[{"type": "text", "text": AKIRA_PROMPT, "cache_control": {"type": "ephemeral"}}],
+        system=[
+            {"type": "text", "text": AKIRA_PROMPT, "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": date_block},
+        ],
         messages=messages_snapshot,
         extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
     )
@@ -423,10 +438,61 @@ def record_action_results(results: list) -> None:
     if not lines:
         return
     note = "[ACTION RESULT — not the user speaking] " + " | ".join(lines)
+    # 8000 chars keeps full folder listings and a sizable inbox digest while
+    # stopping a raw 200-message Gmail dump from bloating every subsequent
+    # routing call for the next 10 turns (history keeps this note around).
+    MAX_NOTE = 8000
+    if len(note) > MAX_NOTE:
+        note = note[:MAX_NOTE] + " …[result truncated]"
     print(f"[record_action_results] {note[:120]!r}")
     with _history_lock:
         conversation_history.append({"role": "user", "content": note})
         conversation_history.append({"role": "assistant", "content": "(noted)"})
+
+
+def synthesize_action_reply() -> str | None:
+    """Same-turn spoken synthesis of the latest ACTION RESULT. Fixes the
+    'let me check your inbox' bug: workspace reads returned raw API dumps
+    that only became usable on the NEXT turn, forcing the user to ask again.
+    Call AFTER record_action_results so the result is already in history.
+    Haiku — summarization quality is plenty, and this runs on every
+    workspace read so it must stay cheap. Returns None on any failure so
+    the caller keeps the routing call's original spoken response."""
+    with _history_lock:
+        messages = list(conversation_history)
+    # drop the trailing "(noted)" stub — ending on an assistant message
+    # would make the API treat it as a prefill to continue from
+    if messages and messages[-1] == {"role": "assistant", "content": "(noted)"}:
+        messages = messages[:-1]
+    if not messages:
+        return None
+    try:
+        message = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=300,
+            system="You are Akira, a voice assistant. The last [ACTION RESULT] "
+                   "message contains the raw data an action just returned for the "
+                   "user's request. Answer their request using that data, in 2 to 6 "
+                   "short spoken sentences. Plain conversational language — no "
+                   "markdown, no bullet points, no lists, nothing that sounds "
+                   "broken read aloud. For email or event lists, summarize the "
+                   "senders, subjects, and anything urgent naturally; never read "
+                   "raw JSON or ids aloud.",
+            messages=messages,
+        )
+        text = message.content[0].text.strip()
+        if not text:
+            return None
+        # keep history honest: what Akira actually SAID replaces the stub ack
+        with _history_lock:
+            if conversation_history and conversation_history[-1] == {
+                    "role": "assistant", "content": "(noted)"}:
+                conversation_history[-1] = {"role": "assistant", "content": text}
+        print(f"[synthesize_action_reply] {text[:100]!r}")
+        return text
+    except Exception as e:
+        print(f"[synthesize_action_reply] failed, keeping original response: {e!r}")
+        return None
 
 
 def clear_history() -> None:
