@@ -2446,6 +2446,117 @@ def github_control(action: str, parameter: str | None = None) -> dict:
     return {"success": False, "message": f"Unknown github_control action: {action}"}
 
 
+# ── Gmail compose (browser automation, DRAFT ONLY — send is unreachable) ────
+
+def gmail_compose(action: str, parameter: str | None = None) -> dict:
+    """
+    Fill a Gmail compose window in the browser and STOP. Never sends.
+
+    Actions:
+      draft|to|subject|body      body is user-dictated text (may contain |)
+      generate|to|subject|brief  Gemini (gemini_content.py) writes the body
+
+    SEND-SAFETY IS STRUCTURAL, NOT CONVENTIONAL. Audit checklist for anyone
+    editing this function — all of these must stay true:
+      1. The ONLY navigation is the compose=new URL; the ONLY element writes
+         are send_keys to the To/Subject fields and a JS innerText set on the
+         Body div, each located by a fixed allowlisted selector.
+      2. There is NO .click() call, NO delegation to _handle_click /
+         atomic_click / vision_click, and NO selector that can match the
+         Send button (its aria-label and tooltip contain "Send"; nothing
+         here queries by aria-label except the exact strings below).
+      3. NO keyboard chords are ever emitted — Gmail sends on Ctrl+Enter /
+         Cmd+Enter, so no Keys.CONTROL / Keys.COMMAND / Keys.ENTER is sent
+         anywhere in this function. Newlines in the body are inserted via
+         JS text assignment, not keystrokes.
+    Deliberately avoids the Gmail MCP server for drafting: its draft_email
+    tool requires a send-capable OAuth token (gmail.modify + mail.google.com),
+    which would break the token-level read-only guarantee on sensei-gmail-ro.
+    """
+    print(f"[gmail_compose] action={action!r}")
+    action = (action or "").strip().lower()
+    if action not in ("draft", "generate"):
+        return {"success": False, "message": f"Unknown gmail_compose action: {action}"}
+
+    parts = (parameter or "").split("|", 2)
+    if len(parts) < 3 or not parts[0].strip():
+        return {"success": False,
+                "message": "Drafting needs a recipient, a subject, and the "
+                           "body or a brief: to|subject|text."}
+    to, subject, body = parts[0].strip(), parts[1].strip(), parts[2].strip()
+
+    if action == "generate":
+        import gemini_content
+        gen = gemini_content.generate(
+            body,
+            format_instructions=(
+                "Write it as a plain-text email body only — no subject line, "
+                "no To/From headers, no markdown, no signature placeholders "
+                "like [Your Name] unless a name was given in the brief."),
+            length="short")
+        if not gen.get("success"):
+            return gen
+        body = gen["text"]
+
+    browser = get_browser(_last_browser_name)
+    try:
+        browser.switch_to.window(browser._akira_tab)
+    except Exception:
+        return {"success": False, "message": "Lost track of my working tab."}
+
+    # compose=new opens the compose window straight from the URL — no
+    # Compose-button click needed, which keeps rule 2 above trivially true.
+    browser.get("https://mail.google.com/mail/u/0/#inbox?compose=new")
+    try:
+        WebDriverWait(browser, 15).until(EC.presence_of_element_located(
+            (By.CSS_SELECTOR, 'input[name="subjectbox"]')))
+    except Exception:
+        return {"success": False,
+                "message": "Gmail's compose window didn't open — you may "
+                           "not be signed in to Gmail in this browser."}
+    time.sleep(0.5)  # compose dialog finishes wiring its fields
+
+    def _first_visible(selectors: list):
+        for sel in selectors:
+            try:
+                for el in browser.find_elements(By.CSS_SELECTOR, sel):
+                    if el.is_displayed():
+                        return el
+            except Exception:
+                continue
+        return None
+
+    to_el = _first_visible(['input[peoplekit-id="BbVjBd"]',
+                            'input[aria-label="To recipients"]',
+                            'textarea[name="to"]'])
+    if not to_el:
+        return {"success": False, "message": "Couldn't find the To field in the compose window."}
+    to_el.send_keys(to)   # plain characters only — never Keys.* constants
+
+    subj_el = _first_visible(['input[name="subjectbox"]'])
+    if not subj_el:
+        return {"success": False, "message": "Couldn't find the Subject field."}
+    subj_el.send_keys(subject)  # focusing subject also chips the recipient
+
+    # Body is contenteditable; set text via JS so multi-line content needs
+    # zero keystrokes (rule 3) and long bodies don't crawl through send_keys.
+    ok = browser.execute_script("""
+        var el = document.querySelector('div[aria-label="Message Body"]')
+              || document.querySelector('div[g_editable="true"][role="textbox"]');
+        if (!el) return false;
+        el.focus();
+        el.innerText = arguments[0];
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        return true;
+    """, body)
+    if not ok:
+        return {"success": False, "message": "Couldn't find the message body field."}
+
+    return {"success": True,
+            "message": f"Draft is ready in Gmail — to {to}, subject {subject}. "
+                       "I never touch Send: review it and send it yourself."}
+
+
 # ������ File operations (standalone) + VS Code control ───────────────────────────
 # One function per capability. Standalone actions (create_file, read_file,
 # write_file, edit_file, search_file) are the default route; vscode_control
@@ -4421,6 +4532,8 @@ _ACTION_MAP = {
     "sheets_control":    lambda p: __import__("sheets_control").sheets_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "slides_control":    lambda p: __import__("slides_control").slides_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "gmail_control":     lambda p: __import__("gmail_control").gmail_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
+    # browser-side Gmail drafting — deliberately NOT the Gmail MCP (see gmail_compose docstring)
+    "gmail_compose":     lambda p: gmail_compose(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "create_file":       create_file,
     "read_file":         read_file,
     "write_file":        write_file,
