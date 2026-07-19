@@ -22,9 +22,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Stable model id confirmed live on ai.google.dev (2026-07). Overridable
-# because Google retires model ids on ~yearly cycles.
-_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# "gemini-flash-latest" is Google's ROLLING alias for the current Flash
+# model (it appears in /v1beta/models itself). A pinned id was tried first
+# ("gemini-2.5-flash") and went stale within one retirement cycle — the API
+# started 404ing when Google retired the model. The alias survives
+# retirements by design; pin a specific id via GEMINI_MODEL only if
+# output reproducibility matters more than availability.
+_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
 _URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
