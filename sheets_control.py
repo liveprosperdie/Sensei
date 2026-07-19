@@ -10,9 +10,27 @@ Action format:
 import google_mcp
 
 
+# Formula functions that can exfiltrate data or pull remote content — the MCP
+# server's own USER_ENTERED security warning names these. LLM-generated cells
+# containing them are force-texted (leading ') rather than evaluated.
+_DANGEROUS_FORMULAS = ("IMPORTDATA", "IMPORTRANGE", "IMPORTXML", "IMPORTHTML",
+                       "IMPORTFEED", "IMAGE", "HYPERLINK")
+
+
+def _cell(raw: str) -> str:
+    cell = raw.strip()
+    # "'=" is Sheets' force-text marker — if the LLM emits it on a formula,
+    # strip it so USER_ENTERED evaluates the formula instead of storing text.
+    if cell.startswith("'="):
+        cell = cell[1:]
+    if cell.startswith("=") and any(f in cell.upper() for f in _DANGEROUS_FORMULAS):
+        return "'" + cell  # neutralize: store as text, never evaluate
+    return cell
+
+
 def _grid(text: str) -> list[list[str]]:
     """'a,b;c,d' -> [["a","b"],["c","d"]]"""
-    return [[cell.strip() for cell in row.split(",")]
+    return [[_cell(cell) for cell in row.split(",")]
             for row in text.split(";") if row.strip()]
 
 
@@ -25,8 +43,12 @@ def sheets_control(action: str, parameter: str | None = None) -> dict:
         if not parts or not parts[0].strip():
             return {"success": False, "message": "What should the spreadsheet be called?"}
         data = _grid(parts[1]) if len(parts) > 1 and parts[1].strip() else [[""]]
+        # USER_ENTERED so formulas evaluate (server default RAW stores "=SUM"
+        # as text — the leading-apostrophe bug). Safe: _cell() neutralizes
+        # dangerous IMPORT*/exfil formulas before anything reaches the API.
         return google_mcp.call("workspace", "create_google_sheet",
-                               {"name": parts[0].strip(), "data": data})
+                               {"name": parts[0].strip(), "data": data,
+                                "valueInputOption": "USER_ENTERED"})
 
     if action == "generate":
         # Name|brief — data rows from Gemini in a separate call, returned in
@@ -51,7 +73,8 @@ def sheets_control(action: str, parameter: str | None = None) -> dict:
             return {"success": False,
                     "message": "The generated sheet data came back in an unusable format."}
         return google_mcp.call("workspace", "create_google_sheet",
-                               {"name": parts[0].strip(), "data": data})
+                               {"name": parts[0].strip(), "data": data,
+                                "valueInputOption": "USER_ENTERED"})
 
     if action == "read":
         if not parts or not parts[0].strip():
@@ -68,6 +91,7 @@ def sheets_control(action: str, parameter: str | None = None) -> dict:
         return google_mcp.call("workspace", "update_google_sheet", {
             "spreadsheetId": parts[0].strip(),
             "range": parts[1].strip(),
-            "data": _grid("|".join(parts[2:]))})
+            "data": _grid("|".join(parts[2:])),
+            "valueInputOption": "USER_ENTERED"})
 
     return {"success": False, "message": f"Unknown sheets action: {action}"}
