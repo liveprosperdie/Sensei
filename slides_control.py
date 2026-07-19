@@ -44,7 +44,9 @@ def _resolve_presentation_id(ref: str) -> tuple[str | None, str | None]:
 def slides_control(action: str, parameter: str | None = None) -> dict:
     action = (action or "").strip().lower()
     parts = (parameter or "").split("|", 1)
-    print(f"[slides_control] action={action!r} params={parts!r}")
+    # Log the raw parameter, not `parts`: the split-once view falsely makes a
+    # trailing "|count" (generate format) look absorbed into the brief.
+    print(f"[slides_control] action={action!r} parameter={parameter!r}")
 
     if action == "create":
         if not parts or not parts[0].strip():
