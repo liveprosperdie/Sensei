@@ -42,7 +42,20 @@ DENYLIST = frozenset({
 
 _PACKAGE = "@dguido/google-workspace-mcp"
 _instances: dict[str, MCPServer] = {}
-_auth_ok: set[str] = set()
+
+# Markers of a GENUINE auth failure in a real tool call's error text, i.e.
+# the server already ran its internal refresh (ensureAuthenticated →
+# validateTokens → refreshTokensIfNeeded → refreshAccessToken, verified in
+# v3.4.4 source) and still could not authenticate. NOT triggered by a merely
+# expired access token — that refreshes silently before the tool runs.
+_AUTH_FAILURE_MARKERS = (
+    "could not be refreshed",     # TOKEN_EXPIRED: refresh attempted, failed (401 path)
+    "revoked or expired",         # INVALID_GRANT: refresh token dead
+    "authentication failed",      # authenticate() threw — interactive flow failed too
+    "no valid authentication",
+    "re-authenticate",
+    "google-workspace-mcp auth",  # every auth-error fix names the auth CLI command
+)
 
 
 def _npx() -> list[str]:
@@ -78,22 +91,22 @@ def _get(instance: str) -> MCPServer:
     return _instances[instance]
 
 
-def _check_auth(server: MCPServer, instance: str) -> dict | None:
-    """One-time-per-session token check via the server's get_status tool.
-    Returns an error dict if not connected, else None."""
-    if instance in _auth_ok:
-        return None
-    status = server.call_tool("get_status", {})
-    text = status["message"].lower()
-    # Live-observed shape (v3.4.4): "[ERROR] ... Issues: credentials,
-    # config_validation, token_file, api_validation. Set up OAuth..." —
-    # an issues list naming credentials/token problems, not structured JSON.
-    if not status["success"] or (
-            "issues:" in text and ("credentials" in text or "token" in text)):
-        return {"success": False,
-                "message": "Google account not connected, please re-authenticate."}
-    _auth_ok.add(instance)
-    return None
+def _is_auth_failure(result: dict) -> bool:
+    """True if a FAILED tool result is a genuine auth failure (refresh was
+    attempted by the server and still failed), vs an ordinary tool error.
+
+    Why no get_status pre-gate anymore: get_status in v3.4.4 only does
+    static reads — it checks expiry_date in authClient.credentials / the
+    token file and NEVER attempts a refresh (handleGetStatus → checkTokenFile
+    read the file; no refreshTokensIfNeeded call anywhere in that path).
+    Real tool calls go through ensureAuthenticated → validateTokens →
+    refreshTokensIfNeeded, which proactively refreshes any token expired or
+    within 5 min of expiry. So a refreshable-but-expired token made
+    get_status report a token issue while every real call would have
+    succeeded. Let the real call run; only translate its failure into
+    "not connected" when the error text is an actual auth error."""
+    text = result.get("message", "").lower()
+    return any(marker in text for marker in _AUTH_FAILURE_MARKERS)
 
 
 def call(instance: str, tool: str, arguments: dict, *,
@@ -111,10 +124,10 @@ def call(instance: str, tool: str, arguments: dict, *,
         server = _get(instance)
     except (FileNotFoundError, ValueError) as e:
         return {"success": False, "message": str(e)}
-    auth_err = _check_auth(server, instance)
-    if auth_err:
-        return auth_err
     result = server.call_tool(tool, arguments)
+    if not result.get("success") and _is_auth_failure(result):
+        return {"success": False,
+                "message": "Google account not connected, please re-authenticate."}
     if speak_summary and result.get("success"):
         result["speak_summary"] = True
     return result
