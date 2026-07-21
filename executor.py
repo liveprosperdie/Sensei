@@ -3422,6 +3422,102 @@ def file_to_doc(parameter: str | None = None) -> dict:
     return result
 
 
+# ── Images & wallpaper ────────────────────────────────────────────────────────
+# No prior image-search code exists in the project (verified: download_file /
+# download_application are prompt-listed but unimplemented) — Bing HTML scrape
+# is the keyless search route.
+
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+
+
+def _search_image_url(query: str) -> tuple[str | None, str | None]:
+    """First full-size image URL from Bing image search. (url, error)."""
+    try:
+        resp = requests.get(
+            "https://www.bing.com/images/search",
+            params={"q": query, "form": "HDRSC2"},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            timeout=10)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        return None, f"Image search failed: {e}"
+    m = re.search(r'murl&quot;:&quot;(https?://[^&]+?)&quot;', resp.text)
+    if not m:
+        return None, f"No image results for '{query}'."
+    return m.group(1).replace("\\/", "/"), None
+
+
+def download_image(parameter: str | None = None) -> dict:
+    """download_image|url-or-query|optional save path. URL → direct download;
+    plain text → Bing image search first. Saves to Pictures by default.
+    Returns the local path in message AND result['path']. No wallpaper logic."""
+    print(f"[download_image] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    spec = parts[0].strip() if parts and parts[0].strip() else None
+    if not spec:
+        return {"success": False, "message": "Download what? Give me an image URL or something to search for."}
+    if spec.lower().startswith(("http://", "https://")):
+        url, query = spec, None
+    else:
+        url, err = _search_image_url(spec)
+        if err:
+            return {"success": False, "message": err}
+        query = spec
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                            timeout=20)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Couldn't download the image: {e}"}
+    if not resp.headers.get("Content-Type", "").startswith("image/"):
+        return {"success": False, "message": "That URL didn't return an image."}
+    # extension: from content-type, falling back to URL path
+    ctype = resp.headers["Content-Type"].split(";")[0]
+    ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
+           "image/webp": ".webp", "image/bmp": ".bmp"}.get(ctype) or \
+        (os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
+         if os.path.splitext(urllib.parse.urlparse(url).path)[1].lower() in _IMG_EXTS else ".jpg")
+    if len(parts) > 1 and parts[1].strip():
+        save_path = _normalize_path(parts[1])
+        if os.path.isdir(save_path) or not os.path.splitext(save_path)[1]:
+            base = re.sub(r"[^\w\- ]", "", query or "image").strip() or "image"
+            save_path = os.path.join(save_path, base + ext)
+    else:
+        base = re.sub(r"[^\w\- ]", "", query or
+                      os.path.splitext(os.path.basename(urllib.parse.urlparse(url).path))[0]
+                      or "image").strip() or "image"
+        save_path = os.path.join(os.path.expanduser("~/Pictures"), base + ext)
+    try:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        with open(save_path, "wb") as f:
+            f.write(resp.content)
+    except OSError as e:
+        return {"success": False, "message": f"Downloaded but couldn't save it: {e}"}
+    _remember(save_path)
+    return {"success": True, "path": save_path,
+            "message": f"Image saved to {save_path}"}
+
+
+def set_wallpaper(parameter: str | None = None) -> dict:
+    """set_wallpaper|local image path. Local files ONLY — no download logic."""
+    print(f"[set_wallpaper] called with parameter={parameter!r}")
+    fpath, err = _resolve_path(parameter)
+    if err:
+        return {"success": False, "message": err}
+    if not os.path.isfile(fpath):
+        return {"success": False, "message": f"That image doesn't exist: {fpath}"}
+    if os.path.splitext(fpath)[1].lower() not in _IMG_EXTS:
+        return {"success": False, "message": f"{os.path.basename(fpath)} isn't an image file."}
+    import ctypes
+    # SPI_SETDESKWALLPAPER=20, SPIF_UPDATEINIFILE|SPIF_SENDCHANGE=3
+    ok = ctypes.windll.user32.SystemParametersInfoW(20, 0, os.path.abspath(fpath), 3)
+    if not ok:
+        return {"success": False,
+                "message": f"Windows refused that wallpaper (error {ctypes.GetLastError()})."}
+    return {"success": True,
+            "message": f"Wallpaper set to {os.path.basename(fpath)}."}
+
+
 # ── Clipboard operations ──────────────────────────────────────────────────────
 # PRIMARY route: PowerShell Get-Clipboard / Set-Clipboard via subprocess, with
 # content passed as BASE64 to sidestep quoting and console-codepage encoding
@@ -4644,6 +4740,8 @@ _ACTION_MAP = {
     "extract_files":     extract_files,
     "summarize_file":    summarize_file,
     "file_to_doc":       file_to_doc,
+    "download_image":    download_image,
+    "set_wallpaper":     set_wallpaper,
     "read_clipboard":    read_clipboard,
     "write_clipboard":   write_clipboard,
     "adjust_volume":     adjust_volume,
