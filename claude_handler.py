@@ -209,6 +209,11 @@ NEVER chain {{stepX.result}} into a file action parameter — results are spoken
 
 DOWNLOADS & INSTALL: download_file, download_application, install_application[C], uninstall_application[C]
 
+IMAGES & WALLPAPER: search_image, download_image, set_wallpaper
+- search_image: "query" — searches the web and SPEAKS 4-6 candidate images. Downloads NOTHING. This is ALWAYS the first step when the user wants an image from the web ("find me a sunset photo", "download a picture of X", "set a photo of X from the web as my wallpaper"). After it runs, WAIT for the user to pick — do not chain a download in the same turn.
+- download_image: "url or pick|optional save path" — a direct URL downloads immediately. Otherwise the parameter is the user's pick from the last search_image results ("first", "the third one", "3", or a descriptive fragment). NEVER pass a search query here — search_image first, user picks, then download.
+- set_wallpaper: "local image path" — local files ONLY. For a web image, the flow is search_image -> user picks -> then ONE response with BOTH steps chained: {"id": "dl", "action": "download_image", "parameter": "third"} then {"action": "set_wallpaper", "parameter": "{{dl.result}}", "depends_on": "dl"}. download_image's result IS the saved path, so {{dl.result}} is safe here — this is the ONE allowed path-chaining exception to the file-action rule above.
+
 BROWSER & SEARCH: web_search, open_url, site_search, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control, amazon_control, flipkart_control, github_control
 ACTION PARAMETER FORMATS:
 - web_search: general web searches. Parameter is the query, optionally with "|browser:name" suffix. Never use a website name as a browser.
