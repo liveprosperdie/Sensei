@@ -178,7 +178,7 @@ CLIPBOARD: read_clipboard, write_clipboard[T]
 - read_clipboard: reads the current clipboard content (text) and returns it for you to speak or use in chained actions. Ungated, pure read.
 - write_clipboard[T]: "exact content" — writes the EXACT user-dictated content verbatim to clipboard with NO paraphrasing or reformatting per bible §6.4. Ungated, pure write.
 
-FILES & FOLDERS: open_folder, list_folder, create_file, read_file, summarize_file, search_file, open_file, copy_files (files on disk), compress_files, extract_files, write_file[C], edit_file[C], move_files[C], delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C]
+FILES & FOLDERS: open_folder, list_folder, create_file, read_file, summarize_file, file_to_doc, search_file, open_file, copy_files (files on disk), compress_files, extract_files, write_file[C], edit_file[C], move_files[C], delete_files[C], organize_files[C], organize_folder[C], bulk_rename_files[C]
 Note: copy_files is for copying FILES ON DISK to a new location — NOT text to clipboard. Use write_clipboard to copy text to clipboard. Never confuse the two.
 FILE EXPLORER NAVIGATION — CRITICAL RULES:
 - NEVER use click, fill, or scroll on File Explorer or any desktop app window — those actions only work inside the browser. Clicking "Pictures in the sidebar" will click the wrong thing.
@@ -190,12 +190,13 @@ ACTION PARAMETER FORMATS (fields split with |; relative names resolve against th
 - open_folder: "folder name or path" — opens it in File Explorer and makes it the session folder.
 - list_folder: "folder name or path (optional — defaults to session folder)" — speaks the contents.
 - create_file: "path|optional initial content" — refuses if the file already exists.
-- read_file: "path" — reads content for you to reference or read aloud.
+- read_file: "path" — reads content for you to reference or read aloud. Handles PDF and docx too (text is extracted).
 - summarize_file: "name or path" — reads the file (text, code, PDF, or docx) and speaks a 4-5 sentence summary of what's in it. Use whenever the user asks what a file says / contains / is about.
+- file_to_doc: "file name or path|Doc Title|what to put in the doc|[short or detailed]" — extracts the text of a local file (PDF, docx, text, code) and creates a Google Doc from it in ONE action. The third field describes what to extract ("everything", "just the electrical engineering courses section"). Use this whenever the user wants file content turned into a Google Doc — NEVER chain read_file into docs_control for that (read_file only returns a snippet; file_to_doc passes the FULL extracted text to the doc writer).
 - search_file: "name or partial name|optional folder" — folder can be a spoken name like pictures or downloads. Defaults to the session folder or home.
 - open_file: "path" — opens with the default app for that file type. If it's actually a folder, it opens in File Explorer.
 - copy_files: "files/folders or pattern|destination" — e.g. "copy_files|*.png|D:\\backup" or "copy_files|Document 4.pdf|desktop". Handles FOLDERS too (copied recursively). Destination can be a spoken name (desktop, downloads). Non-destructive. This copies items ON DISK, not text.
-- compress_files: "files/folders or pattern|optional folder or archive name" ����� creates a new zip next to the sources, originals untouched. Folders are zipped with their contents. Second field may be the folder the files live in OR the zip name — both work.
+- compress_files: "files/folders or pattern|optional folder or archive name" ������� creates a new zip next to the sources, originals untouched. Folders are zipped with their contents. Second field may be the folder the files live in OR the zip name — both work.
 - extract_files: "archive name or path|optional destination" — extracts into a new folder named after the archive. Archive resolves by name in the session folder.
 - write_file[C]: "path|content" — overwrites the whole file, always pauses for confirmation.
 - edit_file[C]: "path|find text|replace text" — if the text isn't found or appears more than once, it stops and asks rather than guessing.

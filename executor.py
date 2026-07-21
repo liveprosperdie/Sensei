@@ -2630,8 +2630,48 @@ def create_file(parameter: str | None = None) -> dict:
     return {"success": True, "message": f"Created {os.path.basename(fpath)} in {os.path.dirname(fpath)}."}
 
 
+def _extract_document_text(fpath: str, max_chars: int = 24000) -> tuple[str | None, str | None]:
+    """Shared PDF/docx text extraction. Returns (text, error) — exactly one
+    is None. Factored out of summarize_file (where it was proven live) so
+    read_file and file_to_doc reuse the SAME extraction path instead of
+    growing second implementations."""
+    name = os.path.basename(fpath)
+    ext = os.path.splitext(fpath)[1].lower()
+    if ext == ".pdf":
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            try:
+                from PyPDF2 import PdfReader  # older install name
+            except ImportError:
+                return None, "I need the pypdf package to read PDFs — run pip install pypdf and I'll be able to read them."
+        try:
+            reader = PdfReader(fpath)
+            pages = [p.extract_text() or "" for p in reader.pages[:15]]
+            text = "\n".join(pages).strip()
+        except Exception as e:
+            return None, f"Couldn't read that PDF: {e}"
+        if not text:
+            return None, f"{name} has no extractable text — it's probably scanned images."
+        return text[:max_chars], None
+    if ext == ".docx":
+        try:
+            import docx  # python-docx
+            text = "\n".join(p.text for p in docx.Document(fpath).paragraphs).strip()
+        except ImportError:
+            return None, "I need the python-docx package for Word files — run pip install python-docx."
+        except Exception as e:
+            return None, f"Couldn't read that document: {e}"
+        if not text:
+            return None, f"{name} is empty — nothing to read."
+        return text[:max_chars], None
+    return None, f"No text extractor for {ext[1:] if ext else 'that kind of'} files."
+
+
 def read_file(parameter: str | None = None) -> dict:
-    """read_file|path — reads up to 4000 chars, speaks a snippet."""
+    """read_file|path — reads up to 4000 chars, speaks a snippet. PDF and
+    docx route through _extract_document_text (same path summarize_file
+    uses); other binary formats are still refused."""
     print(f"[read_file] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
     fpath, err = _resolve_path(parts[0] if parts and parts[0] else None)
@@ -2639,9 +2679,20 @@ def read_file(parameter: str | None = None) -> dict:
         return {"success": False, "message": err}
     if not os.path.isfile(fpath):
         return {"success": False, "message": f"That file doesn't exist: {fpath}"}
-    # binary guard — reading a PDF/image/exe as text produces spoken garbage
     ext = os.path.splitext(fpath)[1].lower()
-    if ext in {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    # PDFs/docx are extractable — same proven path summarize_file uses
+    if ext in {".pdf", ".docx"}:
+        text, xerr = _extract_document_text(fpath)
+        if xerr:
+            return {"success": False, "message": xerr}
+        _remember(fpath)
+        content = text[:4000]  # same cap as the plain-text route
+        snippet = content[:600].strip()
+        more = " There's more — I read the first part only." if len(text) > 4000 else ""
+        return {"success": True, "speak": True,
+                "message": f"{os.path.basename(fpath)} ({len(content)} chars read): {snippet}{more}"}
+    # binary guard — reading an image/exe as text produces spoken garbage
+    if ext in {".doc", ".xls", ".xlsx", ".ppt", ".pptx",
                ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic",
                ".mp3", ".mp4", ".wav", ".mkv", ".avi", ".mov", ".zip", ".rar",
                ".7z", ".exe", ".msi", ".dll", ".bin", ".iso"}:
@@ -3281,30 +3332,11 @@ def summarize_file(parameter: str | None = None) -> dict:
     ext = os.path.splitext(fpath)[1].lower()
 
     text = None
-    if ext == ".pdf":
-        try:
-            from pypdf import PdfReader
-        except ImportError:
-            try:
-                from PyPDF2 import PdfReader  # older install name
-            except ImportError:
-                return {"success": False, "message": "I need the pypdf package to read PDFs — run pip install pypdf and I'll be able to summarize them."}
-        try:
-            reader = PdfReader(fpath)
-            pages = [p.extract_text() or "" for p in reader.pages[:15]]
-            text = "\n".join(pages).strip()
-        except Exception as e:
-            return {"success": False, "message": f"Couldn't read that PDF: {e}"}
-        if not text:
-            return {"success": False, "message": f"{name} has no extractable text — it's probably scanned images."}
-    elif ext == ".docx":
-        try:
-            import docx  # python-docx
-            text = "\n".join(p.text for p in docx.Document(fpath).paragraphs).strip()
-        except ImportError:
-            return {"success": False, "message": "I need the python-docx package for Word files — run pip install python-docx."}
-        except Exception as e:
-            return {"success": False, "message": f"Couldn't read that document: {e}"}
+    if ext in {".pdf", ".docx"}:
+        # shared extraction path — same function read_file/file_to_doc use
+        text, xerr = _extract_document_text(fpath)
+        if xerr:
+            return {"success": False, "message": xerr}
     else:
         # text/code route with the same binary guard as read_file
         if ext in {".doc", ".xls", ".xlsx", ".ppt", ".pptx", ".png", ".jpg",
@@ -3328,6 +3360,66 @@ def summarize_file(parameter: str | None = None) -> dict:
     except Exception as e:
         return {"success": False, "message": f"I read the file but the summary call failed: {e}"}
     return {"success": True, "speak": True, "message": f"Here's the gist of {name}: {summary}"}
+
+
+def file_to_doc(parameter: str | None = None) -> dict:
+    """file_to_doc|path-or-name|Doc Title|what to put in the doc|[short or detailed]
+    Extracts text from a local file (pdf/docx/txt/code — same extraction path
+    as summarize_file) and hands it to Gemini as SOURCE material for a new
+    Google Doc. The extracted text stays inside this process — it never
+    travels through the action-routing JSON (see gemini_content.py header),
+    which is why this is one action and not a read_file→docs_control chain:
+    {{step.result}} substitution only carries the spoken 600-char snippet."""
+    print(f"[file_to_doc] called with parameter={parameter!r}")
+    parts = (parameter or "").split("|")
+    if len(parts) < 3 or not parts[0].strip() or not parts[1].strip() or not parts[2].strip():
+        return {"success": False,
+                "message": "I need the file, a document title, and what to put in it — file to doc|file|Title|what to extract."}
+    spec, title, instruction = parts[0].strip(), parts[1].strip(), parts[2].strip()
+    length = parts[3].strip().lower() if len(parts) > 3 and parts[3].strip() else "short"
+
+    hits, _, err = _resolve_targets(spec)
+    if err:
+        return {"success": False, "message": err}
+    if len(hits) > 1:
+        return {"success": False,
+                "message": f"'{spec}' matched {len(hits)} files: {_enumerate_files(hits)}. Which one?"}
+    fpath = hits[0]
+    name = os.path.basename(fpath)
+    ext = os.path.splitext(fpath)[1].lower()
+
+    if ext in {".pdf", ".docx"}:
+        text, xerr = _extract_document_text(fpath)
+        if xerr:
+            return {"success": False, "message": xerr}
+    else:
+        try:
+            with open(fpath, "rb") as f:
+                raw = f.read(24000)
+            if b"\x00" in raw:
+                return {"success": False, "message": f"{name} is a binary file — I can't read it as text."}
+            text = raw.decode("utf-8", errors="replace").strip()
+        except Exception as e:
+            return {"success": False, "message": f"Couldn't read it: {e}"}
+    if not text:
+        return {"success": False, "message": f"{name} is empty — nothing to put in a doc."}
+
+    import gemini_content  # lazy, same as docs_control
+    gen = gemini_content.generate(
+        f"{instruction}\n\nUse ONLY the following source text extracted from "
+        f"{name}. Do not invent content that isn't in it.\n\n--- SOURCE ---\n"
+        f"{text[:24000]}",
+        "Write plain text suitable for a Google Doc. No markdown syntax, "
+        "no # headers, no asterisks.",
+        length)
+    if not gen["success"]:
+        return gen
+    import google_mcp
+    result = google_mcp.call("workspace", "create_google_doc",
+                             {"name": title, "content": gen["text"]})
+    if result.get("success"):
+        result["message"] = f"Created {title} from {name}. {result.get('message', '')}".strip()
+    return result
 
 
 # ── Clipboard operations ──────────────────────────────────────────────────────
@@ -3427,7 +3519,7 @@ def write_clipboard(parameter: str | None = None) -> dict:
         return {"success": True, "message": f"Copied to clipboard ({len(parameter)} chars), but I couldn't verify it: {e}"}
 
 
-# ── Spotify ───────────────────────────────────────────────────────────────────
+# ── Spotify ────────────────���──────────────────────────────────────────────────
 # HYBRID control, priority order (never ask the user which):
 #   1. Desktop app installed -> Web API against it (launch + poll if not running)
 #   2. No app -> web player via Web API (open open.spotify.com, poll for device)
@@ -4551,6 +4643,7 @@ _ACTION_MAP = {
     "compress_files":    compress_files,
     "extract_files":     extract_files,
     "summarize_file":    summarize_file,
+    "file_to_doc":       file_to_doc,
     "read_clipboard":    read_clipboard,
     "write_clipboard":   write_clipboard,
     "adjust_volume":     adjust_volume,
