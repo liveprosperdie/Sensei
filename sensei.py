@@ -267,10 +267,12 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
         if parameter and isinstance(parameter, str) and "{{" in parameter:
             def _sub(m):
                 r = step_results.get(m.group(1), m.group(0))
-                # dict results must inject their message, never the repr ���
+                # dict results: prefer machine field "path" (download_image ->
+                # set_wallpaper needs a real path, not the spoken "Image saved
+                # to ..." sentence), fall back to message, never the repr —
                 # str(dict) produced garbage params like "{'success': True...}"
                 if isinstance(r, dict):
-                    return str(r.get("message", ""))
+                    return str(r.get("path") or r.get("message", ""))
                 return str(r)
             parameter = re.sub(r"\{\{(\w+)\.result\}\}", _sub, parameter)
             print(f"[run_actions] substituted parameter={parameter!r}")
@@ -312,9 +314,13 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
         if step_id:
             step_results[step_id] = result
 
-        if isinstance(result, str) and result.startswith(FAILURE_PREFIXES):
-            if step_id:
-                failed_ids.add(step_id)
+        # AUDIT FIX: dict failures ({"success": False}) never entered
+        # failed_ids — depends_on only skipped on string failures, so e.g.
+        # a failed download_image still let set_wallpaper run on garbage.
+        failed = (isinstance(result, str) and result.startswith(FAILURE_PREFIXES)) or \
+                 (isinstance(result, dict) and result.get("success") is False)
+        if failed and step_id:
+            failed_ids.add(step_id)
 
         results.append(result)
 
