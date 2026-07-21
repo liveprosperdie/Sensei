@@ -3430,8 +3430,14 @@ def file_to_doc(parameter: str | None = None) -> dict:
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
 
 
-def _search_image_url(query: str) -> tuple[str | None, str | None]:
-    """First full-size image URL from Bing image search. (url, error)."""
+# Bing kept over Unsplash: keyless, and the user's spoken pick — not the
+# source — is now the relevance/safety filter.
+_img_last_results: list = []   # cards from the last search_image call
+_img_last_query: str = ""
+
+
+def _search_image_urls(query: str, limit: int = 6) -> tuple[list, str | None]:
+    """Up to `limit` distinct full-size image URLs from Bing. (urls, error)."""
     try:
         resp = requests.get(
             "https://www.bing.com/images/search",
@@ -3440,29 +3446,59 @@ def _search_image_url(query: str) -> tuple[str | None, str | None]:
             timeout=10)
         resp.raise_for_status()
     except requests.RequestException as e:
-        return None, f"Image search failed: {e}"
-    m = re.search(r'murl&quot;:&quot;(https?://[^&]+?)&quot;', resp.text)
-    if not m:
-        return None, f"No image results for '{query}'."
-    return m.group(1).replace("\\/", "/"), None
+        return [], f"Image search failed: {e}"
+    urls, seen = [], set()
+    for u in re.findall(r'murl&quot;:&quot;(https?://[^&]+?)&quot;', resp.text):
+        u = u.replace("\\/", "/")
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+        if len(urls) >= limit:
+            break
+    if not urls:
+        return [], f"No image results for '{query}'."
+    return urls, None
+
+
+def search_image(parameter: str | None = None) -> dict:
+    """search_image|query — speaks 4-6 candidates, downloads NOTHING.
+    The user then picks by ordinal via download_image."""
+    global _img_last_results, _img_last_query
+    print(f"[search_image] called with parameter={parameter!r}")
+    query = (parameter or "").split("|")[0].strip()
+    if not query:
+        return {"success": False, "message": "Search for what? Describe the image you want."}
+    urls, err = _search_image_urls(query)
+    if err:
+        return {"success": False, "message": err}
+    _img_last_results = [
+        {"label": f"number {i + 1} from {urllib.parse.urlparse(u).netloc}", "href": u}
+        for i, u in enumerate(urls)]
+    _img_last_query = query
+    listing = "; ".join(c["label"] for c in _img_last_results)
+    return {"success": True, "speak": True,
+            "message": f"Found {len(urls)} images for {query}: {listing}. "
+                       "Which one should I download? Say something like the first one."}
 
 
 def download_image(parameter: str | None = None) -> dict:
-    """download_image|url-or-query|optional save path. URL → direct download;
-    plain text → Bing image search first. Saves to Pictures by default.
+    """download_image|url-or-pick|optional save path. URL → direct download
+    (unchanged path); anything else → ordinal/fuzzy pick from the last
+    search_image results via _pick_card — NEVER a blind search-and-grab.
     Returns the local path in message AND result['path']. No wallpaper logic."""
     print(f"[download_image] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
     spec = parts[0].strip() if parts and parts[0].strip() else None
     if not spec:
-        return {"success": False, "message": "Download what? Give me an image URL or something to search for."}
+        return {"success": False, "message": "Download what? Give me an image URL, or search for images first and pick one."}
     if spec.lower().startswith(("http://", "https://")):
         url, query = spec, None
     else:
-        url, err = _search_image_url(spec)
-        if err:
-            return {"success": False, "message": err}
-        query = spec
+        if not _img_last_results:
+            return {"success": False,
+                    "message": f"I haven't searched for images yet. Say search for {spec} first, then pick one."}
+        pick = _pick_card(_img_last_results, spec)
+        url, query = pick["href"], _img_last_query
     try:
         resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"},
                             timeout=20)
@@ -4358,10 +4394,12 @@ def adjust_brightness(parameter: str) -> str:
     return f"Brightness {new}%." if result.returncode == 0 else "Couldn't change brightness."
 
 
-def screenshot() -> str:
+def screenshot() -> dict:
+    # AUDIT FIX: returned a bare string with no path — unchainable and
+    # unverifiable. Now returns success + path so {{step.result}} works.
     path = os.path.join(_screenshot_dir, f"screenshot_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
     ImageGrab.grab().save(path)
-    return f"Screenshot saved."
+    return {"success": True, "path": path, "message": "Screenshot saved."}
 
 
 def lock_screen() -> str:
@@ -4740,6 +4778,7 @@ _ACTION_MAP = {
     "extract_files":     extract_files,
     "summarize_file":    summarize_file,
     "file_to_doc":       file_to_doc,
+    "search_image":      search_image,
     "download_image":    download_image,
     "set_wallpaper":     set_wallpaper,
     "read_clipboard":    read_clipboard,
