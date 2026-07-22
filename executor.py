@@ -490,6 +490,12 @@ def extract_interactive_elements(driver, max_elements: int = 150) -> list[dict]:
         let idx = 0;
         const maxItems = arguments[0];
         
+        // Clear indices from any previous scan — indices go stale between
+        // scans, and a leftover data-akira-index would make the dedupe
+        // check below skip every element on a re-scan.
+        document.querySelectorAll('[data-akira-index]').forEach(el =>
+            el.removeAttribute('data-akira-index'));
+        
         // Helper to get visible text
         function getText(el) {
             try {
@@ -3450,20 +3456,14 @@ def file_to_doc(parameter: str | None = None) -> dict:
 
 
 # ── Images & wallpaper ────────────────────────────────────────────────────────
-# No prior image-search code exists in the project (verified: download_file /
-# download_application are prompt-listed but unimplemented) — Bing HTML scrape
-# is the keyless search route.
+# Image search sources (in order):
+#   1. Unsplash API   (if UNSPLASH_ACCESS_KEY is set — curated, always safe)
+#   2. Openverse API  (keyless default — CC-licensed, mature=false enforced)
+# _is_safe_image_result() is applied as defense-in-depth: an unsafe result is
+# silently dropped BEFORE it can reach _img_last_results or any spoken text.
 
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
 
-
-# Bing HTML scraping REMOVED — it returned adult-content domains for
-# innocent queries ("mountain landscape") with zero filtering. Replaced by
-# real image-search APIs with server-side safety filtering:
-#   1. Unsplash API   (if UNSPLASH_ACCESS_KEY is set — curated, always safe)
-#   2. Openverse API  (keyless default — CC-licensed, mature=false enforced)
-# Plus _is_safe_image_result() as defense-in-depth before ANY url/domain/title
-# is stored or spoken.
 _img_last_results: list = []   # cards from the last search_image call
 _img_last_query: str = ""
 
