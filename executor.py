@@ -518,15 +518,42 @@ def extract_interactive_elements(driver, max_elements: int = 150) -> list[dict]:
         function addElement(el, role, text, href = null) {
             try {
                 if (idx >= maxItems) return false;
-                if (!text && role !== 'input' && role !== 'textbox') return true;
+                // Dedupe: passes overlap (image/video anchors are also
+                // a[href]) — double-adds corrupted ordinal counting.
+                if (el.hasAttribute('data-akira-index')) return true;
+                if (!text && role !== 'input' && role !== 'textbox' && role !== 'image') return true;
                 el.setAttribute('data-akira-index', String(idx));
-                items.push({index: idx, role: role, text: text, href: href});
+                const r = el.getBoundingClientRect();
+                items.push({index: idx, role: role, text: text, href: href,
+                            x: Math.round(r.left + window.scrollX),
+                            y: Math.round(r.top + window.scrollY),
+                            w: Math.round(r.width), h: Math.round(r.height)});
                 idx++;
                 return true;
             } catch(e) {
                 return true;
             }
         }
+        
+        // 0. PRIORITY: image search results. An anchor whose content is
+        // dominated by a real <img> is an image result, NOT a nav link —
+        // this is the role distinction whose absence caused ordinal/fuzzy
+        // matching to click page chrome on Google Images.
+        try {
+            document.querySelectorAll('a[href]').forEach(el => {
+                if (!isVisible(el)) return;
+                const img = el.querySelector('img');
+                if (!img) return;
+                const ir = img.getBoundingClientRect();
+                const ar = el.getBoundingClientRect();
+                // real thumbnail: >=50px each way and fills >=50% of anchor
+                if (ir.width < 50 || ir.height < 50) return;
+                if ((ir.width * ir.height) < 0.5 * (ar.width * ar.height)) return;
+                const text = (img.getAttribute('alt') || getText(el) || '')
+                             .replace(/\\s+/g,' ').trim().slice(0, 200);
+                addElement(el, 'image', text || 'image result', el.href);
+            });
+        } catch(e) {}
         
         // 1. PRIORITY: YouTube video thumbnails (most common miss)
         try {
@@ -3430,34 +3457,80 @@ def file_to_doc(parameter: str | None = None) -> dict:
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
 
 
-# Bing kept over Unsplash: keyless, and the user's spoken pick — not the
-# source — is now the relevance/safety filter.
+# Bing HTML scraping REMOVED — it returned adult-content domains for
+# innocent queries ("mountain landscape") with zero filtering. Replaced by
+# real image-search APIs with server-side safety filtering:
+#   1. Unsplash API   (if UNSPLASH_ACCESS_KEY is set — curated, always safe)
+#   2. Openverse API  (keyless default — CC-licensed, mature=false enforced)
+# Plus _is_safe_image_result() as defense-in-depth before ANY url/domain/title
+# is stored or spoken.
 _img_last_results: list = []   # cards from the last search_image call
 _img_last_query: str = ""
 
+# Defense-in-depth: never surface a result whose URL, domain, or title trips
+# this — even if the API's own filter misses it.
+_UNSAFE_IMG_RE = re.compile(
+    r"porn|xxx|sex|nude|naked|nsfw|adult|hentai|erotic|escort|fetish|xvideo|"
+    r"xhamster|redtube|onlyfans|playboy|hustler|penthouse", re.IGNORECASE)
+
+
+def _is_safe_image_result(url: str, title: str = "") -> bool:
+    domain = urllib.parse.urlparse(url).netloc
+    if _UNSAFE_IMG_RE.search(domain) or _UNSAFE_IMG_RE.search(url) or \
+       (title and _UNSAFE_IMG_RE.search(title)):
+        print(f"[search_image] SAFETY-FILTERED: {domain}")
+        return False
+    return True
+
 
 def _search_image_urls(query: str, limit: int = 6) -> tuple[list, str | None]:
-    """Up to `limit` distinct full-size image URLs from Bing. (urls, error)."""
+    """Up to `limit` safe image results. Each: {url, title, source_domain}.
+    Unsplash (keyed) -> Openverse (keyless). (results, error)."""
+    unsplash_key = os.environ.get("UNSPLASH_ACCESS_KEY")
+    if unsplash_key:
+        try:
+            resp = requests.get(
+                "https://api.unsplash.com/search/photos",
+                params={"query": query, "per_page": limit * 2, "content_filter": "high"},
+                headers={"Authorization": f"Client-ID {unsplash_key}"}, timeout=10)
+            resp.raise_for_status()
+            out = []
+            for r in resp.json().get("results", []):
+                url = r.get("urls", {}).get("full") or r.get("urls", {}).get("regular")
+                title = (r.get("description") or r.get("alt_description") or "").strip()
+                if url and _is_safe_image_result(url, title):
+                    out.append({"url": url, "title": title,
+                                "source_domain": "unsplash.com"})
+                if len(out) >= limit:
+                    break
+            if out:
+                return out, None
+            print("[search_image] Unsplash empty — falling back to Openverse")
+        except requests.RequestException as e:
+            print(f"[search_image] Unsplash failed ({e}) — falling back to Openverse")
     try:
         resp = requests.get(
-            "https://www.bing.com/images/search",
-            params={"q": query, "form": "HDRSC2"},
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-            timeout=10)
+            "https://api.openverse.org/v1/images/",
+            params={"q": query, "page_size": limit * 3, "mature": "false"},
+            headers={"User-Agent": "AkiraAssistant/1.0"}, timeout=15)
         resp.raise_for_status()
     except requests.RequestException as e:
         return [], f"Image search failed: {e}"
-    urls, seen = [], set()
-    for u in re.findall(r'murl&quot;:&quot;(https?://[^&]+?)&quot;', resp.text):
-        u = u.replace("\\/", "/")
-        if u not in seen:
-            seen.add(u)
-            urls.append(u)
-        if len(urls) >= limit:
+    out, seen = [], set()
+    for r in resp.json().get("results", []):
+        url, title = r.get("url"), (r.get("title") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        if not _is_safe_image_result(url, title):
+            continue
+        out.append({"url": url, "title": title,
+                    "source_domain": urllib.parse.urlparse(url).netloc})
+        if len(out) >= limit:
             break
-    if not urls:
+    if not out:
         return [], f"No image results for '{query}'."
-    return urls, None
+    return out, None
 
 
 def search_image(parameter: str | None = None) -> dict:
@@ -3468,16 +3541,19 @@ def search_image(parameter: str | None = None) -> dict:
     query = (parameter or "").split("|")[0].strip()
     if not query:
         return {"success": False, "message": "Search for what? Describe the image you want."}
-    urls, err = _search_image_urls(query)
+    results, err = _search_image_urls(query)
     if err:
         return {"success": False, "message": err}
     _img_last_results = [
-        {"label": f"number {i + 1} from {urllib.parse.urlparse(u).netloc}", "href": u}
-        for i, u in enumerate(urls)]
+        {"label": f"number {i + 1}, {r['title'][:60] if r['title'] else 'untitled'}",
+         "href": r["url"]}
+        for i, r in enumerate(results)]
     _img_last_query = query
+    print(f"[search_image] {len(results)} safe results: "
+          f"{[r['source_domain'] for r in results]}")
     listing = "; ".join(c["label"] for c in _img_last_results)
     return {"success": True, "speak": True,
-            "message": f"Found {len(urls)} images for {query}: {listing}. "
+            "message": f"Found {len(results)} images for {query}: {listing}. "
                        "Which one should I download? Say something like the first one."}
 
 
