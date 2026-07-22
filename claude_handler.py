@@ -620,7 +620,29 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
     
     instruction_lower = instruction.lower()
     instruction_words = set(re.findall(r'\w+', instruction_lower))
-    
+
+    # Meta-words describe WHERE/WHAT KIND, never element content. Counting
+    # them in word-overlap matched "third image in Google search results"
+    # to the "Google apps" nav button (live failure). Strip before scoring.
+    _META_WORDS = {
+        'image', 'images', 'photo', 'photos', 'picture', 'pictures',
+        'thumbnail', 'google', 'bing', 'search', 'result', 'results',
+        'page', 'one', 'the', 'a', 'an', 'in', 'on', 'of', 'from', 'at',
+        'click', 'select', 'open', 'first', 'second', 'third', 'fourth',
+        'fifth', 'top', 'left', 'right', 'middle', 'bottom',
+    }
+    content_words = instruction_words - _META_WORDS
+
+    # Role intent: "image"/"photo" etc. means role='image' elements ONLY —
+    # never nav chrome. Same for video/button/link.
+    _ROLE_KEYWORDS = {
+        'image': 'image', 'photo': 'image', 'picture': 'image',
+        'thumbnail': 'image', 'video': 'video', 'button': 'button',
+        'link': 'link',
+    }
+    role_intent = next((r for kw, r in _ROLE_KEYWORDS.items()
+                        if re.search(r'\b' + kw + r's?\b', instruction_lower)), None)
+
     # Extract filters from instruction (domain names, roles, etc)
     filters = {
         'imdb': lambda el: el.get('href') and 'imdb.com' in el.get('href', ''),
@@ -628,22 +650,71 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
         'wikipedia': lambda el: el.get('href') and 'wikipedia.org' in el.get('href', ''),
         'reddit': lambda el: el.get('href') and 'reddit.com' in el.get('href', ''),
         'github': lambda el: el.get('href') and 'github.com' in el.get('href', ''),
-        'button': lambda el: el.get('role') == 'button',
-        'link': lambda el: el.get('role') == 'link',
-        'video': lambda el: el.get('role') == 'video',
     }
     
-    # Apply filters
+    # Apply filters: role intent first (strongest signal), then domain
     filtered = elements
+    if role_intent:
+        role_matches = [el for el in filtered if el.get('role') == role_intent]
+        if role_matches:
+            filtered = role_matches
+            print(f"[FILTER] role='{role_intent}': {len(filtered)} candidates")
     for keyword, filter_func in filters.items():
         if keyword in instruction_lower:
-            filtered = [el for el in filtered if filter_func(el)]
-            if filtered:
+            narrowed = [el for el in filtered if filter_func(el)]
+            if narrowed:
+                filtered = narrowed
                 print(f"[FILTER] Applied '{keyword}' filter, {len(filtered)} matches")
                 break
     
     if not filtered:
         filtered = elements  # Fallback to all if filter removed everything
+
+    # Ordinal + role intent ("third image", "second video") is a POSITIONAL
+    # request — text phases would only mis-match on meta-words. Jump straight
+    # to visual-order ordinal selection over the role-filtered set.
+    _ORDINALS = {
+        'first': 0, '1st': 0, 'second': 1, '2nd': 1, 'third': 2, '3rd': 2,
+        'fourth': 3, '4th': 3, 'fifth': 4, '5th': 4, 'sixth': 5, '6th': 5,
+        'top': 0,
+    }
+    ordinal_word = next((w for w in _ORDINALS if re.search(r'\b' + w + r'\b', instruction_lower)), None)
+
+    def _visual_sort(els):
+        # Reading order: rows of ~40px tolerance top->bottom, then left->right.
+        # DOM order lied on Google Images (nav/chrome interleaves results).
+        return sorted(els, key=lambda e: ((e.get('y') or 0) // 40, e.get('x') or 0))
+
+    if role_intent and (ordinal_word or re.search(r'\b(left|right|middle)\b', instruction_lower)):
+        cands = _visual_sort([el for el in filtered if el.get('role') == role_intent]
+                             or filtered)
+        # Content words ("from iStock", "of Denali") narrow candidates BEFORE
+        # ordinal counting — caught by verification: 'third image from
+        # iStock' must count within iStock results, not all images.
+        if content_words:
+            narrowed = [e for e in cands if any(
+                w in (e.get('text') or '').lower() or w in (e.get('href') or '').lower()
+                for w in content_words)]
+            if narrowed:
+                cands = narrowed
+        if cands:
+            if ordinal_word is not None:
+                offset = _ORDINALS[ordinal_word]
+                if offset < len(cands):
+                    match = cands[offset]
+                    print(f"[MATCH] ROLE+ORDINAL role={role_intent} #{offset + 1} "
+                          f"index={match['index']} text='{match['text'][:40]}'")
+                    return match['index']
+            # left/right/middle among the first visual row
+            row_y = (cands[0].get('y') or 0)
+            row = [e for e in cands if abs((e.get('y') or 0) - row_y) <= 60] or cands
+            row.sort(key=lambda e: e.get('x') or 0)
+            pos = 'right' if 'right' in instruction_lower else \
+                  'middle' if 'middle' in instruction_lower else 'left'
+            match = row[-1] if pos == 'right' else row[len(row) // 2] if pos == 'middle' else row[0]
+            print(f"[MATCH] ROLE+POSITION role={role_intent} pos={pos} "
+                  f"index={match['index']} text='{match['text'][:40]}'")
+            return match['index']
     
     # Phase 1: Substring match on filtered elements.
     # Collect ALL matches, then prefer the LONGEST matched element text —
@@ -673,16 +744,18 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
                   f"(longest of {len(phase1_matches)} matches)")
             return top['index']
     
-    # Phase 2: Word overlap on filtered elements - prioritize early matches
-    if instruction_words and len(instruction_words) >= 2:
+    # Phase 2: Word overlap on filtered elements — CONTENT words only.
+    # Meta-words ("google", "search", "image") scored as real overlap and
+    # matched nav chrome; now only non-meta words count, min 2 (a 1-word
+    # accidental collision like "iStock" in a footer link scored 2.38 live).
+    if content_words and len(content_words) >= 2:
         best_match = None
         best_score = 0
         for el in filtered[:50]:  # Only check first 50 of filtered
             text_words = set(re.findall(r'\w+', el['text'].lower()))
-            overlap = len(instruction_words & text_words)
-            # Require at least 2 words OR 50% overlap
-            overlap_ratio = overlap / len(instruction_words) if instruction_words else 0
-            if overlap >= 2 or overlap_ratio >= 0.5:
+            overlap = len(content_words & text_words)
+            overlap_ratio = overlap / len(content_words)
+            if overlap >= 2 or (overlap >= 1 and overlap_ratio >= 0.5):
                 # Bonus for early position in list
                 position_bonus = (50 - filtered.index(el)) / 50.0
                 score = overlap + position_bonus
@@ -693,22 +766,16 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
             print(f"[MATCH] WORD OVERLAP index={best_match} score={best_score:.2f}")
             return best_match
     
-    # Phase 3: Special pattern matching (ordinals, positions)
-    ordinals = {
-        'first': 0, 'second': 1, 'third': 2, 'fourth': 3, 'fifth': 4,
-        '1st': 0, '2nd': 1, '3rd': 2, '4th': 3, '5th': 4,
-        'top': 0, 'next': 1
-    }
-    # Scope ordinals to content-like elements only — excludes page chrome
-    # (address bar, nav links, account menu) that caused wrong-element clicks.
-    ordinal_candidates = [el for el in filtered if el.get('role') in {'link', 'video', 'button'}]
-    for word, offset in ordinals.items():
-        if word in instruction_lower:
-            # Use ordinal_candidates list for ordinals
-            if offset < len(ordinal_candidates):
-                match = ordinal_candidates[offset]
-                print(f"[MATCH] ORDINAL index={match['index']}")
-                return match['index']
+    # Phase 3: bare ordinals with no role keyword — visual order over
+    # content-like roles (image results included; page chrome excluded).
+    if ordinal_word is not None:
+        ordinal_candidates = _visual_sort(
+            [el for el in filtered if el.get('role') in {'link', 'video', 'image', 'button'}])
+        offset = _ORDINALS[ordinal_word]
+        if offset < len(ordinal_candidates):
+            match = ordinal_candidates[offset]
+            print(f"[MATCH] ORDINAL index={match['index']} text='{match['text'][:40]}'")
+            return match['index']
     
     # Phase 4: LLM matching (COSTS TOKENS)
     print(f"[LLM] Calling Haiku for '{instruction}'")
