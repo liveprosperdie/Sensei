@@ -15,6 +15,7 @@ import threading
 import numpy as np
 import openwakeword
 import claude_handler
+import action_guard
 from groq import Groq
 import soundfile as sf
 from executor import execute, get_all_tabs, get_pc_context
@@ -247,7 +248,12 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
     if not steps and response.get("action"):
         steps = [{"action": response["action"], "parameter": response.get("parameter")}]
 
-    results    = []
+    # HARD RULE (code, not convention): no download_image in the same chain
+    # as search_image, and at most one download_image per chain. The LLM is
+    # told this in AKIRA_PROMPT; action_guard makes it impossible regardless.
+    steps, guard_notes = action_guard.sanitize_actions(steps)
+
+    results    = list(guard_notes)
     failed_ids = set()
 
     for step in steps:
