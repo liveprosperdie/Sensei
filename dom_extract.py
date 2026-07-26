@@ -64,6 +64,63 @@ _EXTRACT_SCRIPT = """
             }
         }
 
+        // -1. STRUCTURAL CONTROLS: filter tabs and profile pickers.
+        //
+        // This pass MUST come first. addElement() is first-claim-wins, and
+        // both of the passes below used to swallow these:
+        //   * Google's Images tab is <a href="...&udm=2">Images</a>, so the
+        //     generic link pass (3) claimed it as role='link' and the
+        //     [role="tab"] pass (7) never saw it.
+        //   * A Netflix profile is a link wrapping a big <img>, so the image
+        //     pass (0) claimed it as role='image' with text 'image result' —
+        //     the profile NAME lives in a sibling span, so it was lost and no
+        //     spoken name could ever match.
+        // Claiming them here preserves the role AND the real label.
+        try {
+            const labelSubs = ['.profile-name', '[data-uia*="profile-name"]',
+                               '.profile-title'];
+            function structLabel(el) {
+                let s = (el.getAttribute('aria-label') || '').trim();
+                if (s) return s;
+                for (const q of labelSubs) {
+                    try {
+                        const t = el.querySelector(q);
+                        if (t) {
+                            const v = (t.innerText || t.textContent || '').trim();
+                            if (v) return v;
+                        }
+                    } catch(e) {}
+                }
+                s = (el.innerText || el.textContent || '').trim();
+                if (s) return s;
+                const img = el.querySelector('img');
+                return img ? (img.getAttribute('alt') || '').trim() : '';
+            }
+
+            // Profiles before tabs: a Netflix profile link can also match a
+            // generic nav selector, and the profile role is more specific.
+            document.querySelectorAll(
+                '[data-uia*="action-select-profile"], [data-uia*="profile-link"], ' +
+                'a[href*="switchProfile"], .profile-link, .choose-profile .profile, ' +
+                'li.profile a'
+            ).forEach(el => {
+                if (!isVisible(el)) return;
+                const text = structLabel(el).replace(/\\s+/g,' ').slice(0, 200);
+                if (text) addElement(el, 'profile', text, el.href || null);
+            });
+
+            document.querySelectorAll(
+                '[role="tablist"] [role="tab"], [role="tab"], ' +
+                '#hdtb-msb a[href], #hdtb-msb [role="listitem"] a[href], ' +
+                'div[role="navigation"] a[href*="udm="], ' +
+                'div[role="navigation"] a[href*="tbm="]'
+            ).forEach(el => {
+                if (!isVisible(el)) return;
+                const text = structLabel(el).replace(/\\s+/g,' ').slice(0, 200);
+                if (text) addElement(el, 'tab', text, el.href || null);
+            });
+        } catch(e) {}
+
         // 0. PRIORITY: image search results. An anchor whose content is
         // dominated by a real <img> is an image result, NOT a nav link —
         // this is the role distinction whose absence caused ordinal/fuzzy
