@@ -36,6 +36,8 @@ from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from pycaw.pycaw import AudioUtilities
 
+import image_flow
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _home = os.path.expanduser("~")
@@ -475,182 +477,10 @@ def get_all_tabs() -> list[dict]:
     return []
 
 
-# ── Element extraction ────────────────────────────────────────────────────────
-
-def extract_interactive_elements(driver, max_elements: int = 150) -> list[dict]:
-    """
-    Extract interactive elements using aggressive DOM approach (no CDP tree overhead).
-    Captures YouTube video thumbnails, address bar, and all clickable elements.
-    """
-
-    # Aggressive DOM extraction script - wrapped in try-catch
-    script = """
-    try {
-        const items = [];
-        let idx = 0;
-        const maxItems = arguments[0];
-        
-        // Clear indices from any previous scan — indices go stale between
-        // scans, and a leftover data-akira-index would make the dedupe
-        // check below skip every element on a re-scan.
-        document.querySelectorAll('[data-akira-index]').forEach(el =>
-            el.removeAttribute('data-akira-index'));
-        
-        // Helper to get visible text
-        function getText(el) {
-            try {
-                return (el.innerText || el.textContent || el.value || el.placeholder ||
-                        el.getAttribute('aria-label') || el.getAttribute('title') ||
-                        el.getAttribute('alt') || el.getAttribute('name') || '')
-                       .replace(/\\s+/g,' ').trim().slice(0, 200);
-            } catch(e) {
-                return '';
-            }
-        }
-        
-        // Helper to check visibility
-        function isVisible(el) {
-            try {
-                if (!el) return false;
-                const r = el.getBoundingClientRect();
-                if (r.width < 5 || r.height < 5) return false;
-                const s = window.getComputedStyle(el);
-                return s.visibility !== 'hidden' && s.display !== 'none';
-            } catch(e) {
-                return false;
-            }
-        }
-        
-        function addElement(el, role, text, href = null) {
-            try {
-                if (idx >= maxItems) return false;
-                // Dedupe: passes overlap (image/video anchors are also
-                // a[href]) — double-adds corrupted ordinal counting.
-                if (el.hasAttribute('data-akira-index')) return true;
-                if (!text && role !== 'input' && role !== 'textbox' && role !== 'image') return true;
-                el.setAttribute('data-akira-index', String(idx));
-                const r = el.getBoundingClientRect();
-                items.push({index: idx, role: role, text: text, href: href,
-                            x: Math.round(r.left + window.scrollX),
-                            y: Math.round(r.top + window.scrollY),
-                            w: Math.round(r.width), h: Math.round(r.height)});
-                idx++;
-                return true;
-            } catch(e) {
-                return true;
-            }
-        }
-        
-        // 0. PRIORITY: image search results. An anchor whose content is
-        // dominated by a real <img> is an image result, NOT a nav link —
-        // this is the role distinction whose absence caused ordinal/fuzzy
-        // matching to click page chrome on Google Images.
-        try {
-            document.querySelectorAll('a[href]').forEach(el => {
-                if (!isVisible(el)) return;
-                const img = el.querySelector('img');
-                if (!img) return;
-                const ir = img.getBoundingClientRect();
-                const ar = el.getBoundingClientRect();
-                // real thumbnail: >=50px each way and fills >=50% of anchor
-                if (ir.width < 50 || ir.height < 50) return;
-                if ((ir.width * ir.height) < 0.5 * (ar.width * ar.height)) return;
-                const text = (img.getAttribute('alt') || getText(el) || '')
-                             .replace(/\\s+/g,' ').trim().slice(0, 200);
-                addElement(el, 'image', text || 'image result', el.href);
-            });
-        } catch(e) {}
-        
-        // 1. PRIORITY: YouTube video thumbnails (most common miss)
-        try {
-            document.querySelectorAll('ytd-video-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer').forEach(el => {
-                if (!isVisible(el)) return;
-                const titleEl = el.querySelector('#video-title, .title');
-                const thumbnailEl = el.querySelector('a#thumbnail');
-                if (titleEl && thumbnailEl) {
-                    const text = getText(titleEl);
-                    const href = thumbnailEl.href;
-                    if (text) addElement(thumbnailEl, 'video', text, href);
-                }
-            });
-        } catch(e) {}
-        
-        // 2. Address bar (omnibox) - critical for URL editing
-        try {
-            const omnibox = document.querySelector('input[type="text"][role="combobox"]') ||
-                            document.querySelector('input.omnibox') ||
-                            document.querySelector('#searchInput');
-            if (omnibox && isVisible(omnibox)) {
-                addElement(omnibox, 'addressbar', 'address bar', null);
-            }
-        } catch(e) {}
-        
-        // 3. All standard links
-        try {
-            document.querySelectorAll('a[href]').forEach(el => {
-                if (!isVisible(el)) return;
-                const text = getText(el);
-                if (text) addElement(el, 'link', text, el.href);
-            });
-        } catch(e) {}
-        
-        // 4. Buttons (explicit and implicit)
-        try {
-            document.querySelectorAll('button, [role="button"], [onclick], input[type="button"], input[type="submit"]').forEach(el => {
-                if (!isVisible(el)) return;
-                const text = getText(el);
-                addElement(el, 'button', text || 'button', null);
-            });
-        } catch(e) {}
-        
-        // 5. Form inputs
-        try {
-            document.querySelectorAll('input:not([type="hidden"]), textarea, select').forEach(el => {
-                if (!isVisible(el)) return;
-                const text = getText(el) || el.type || 'input';
-                addElement(el, 'input', text, null);
-            });
-        } catch(e) {}
-        
-        // 6. Video controls (play/pause buttons)
-        try {
-            document.querySelectorAll('video, [class*="play"], [class*="pause"], [aria-label*="play"], [aria-label*="pause"]').forEach(el => {
-                if (!isVisible(el)) return;
-                const text = getText(el) || el.className.split(' ').find(c => c.includes('play') || c.includes('pause')) || 'media control';
-                if (text) addElement(el, 'media', text, null);
-            });
-        } catch(e) {}
-        
-        // 7. Clickable divs with role or aria-label (common in modern web apps)
-        try {
-            document.querySelectorAll('[role="menuitem"], [role="tab"], [role="option"], [role="checkbox"], [role="radio"], [aria-label][onclick]').forEach(el => {
-                if (!isVisible(el)) return;
-                const text = getText(el);
-                if (text) addElement(el, el.getAttribute('role') || 'clickable', text, null);
-            });
-        } catch(e) {}
-        
-        return items;
-    } catch(e) {
-        console.error('Element extraction failed:', e);
-        return [];
-    }
-    """
-    
-    try:
-        elements = driver.execute_script(script, max_elements)
-    except Exception as e:
-        print(f"[EXTRACT] Script execution failed: {e}")
-        return []
-    
-    if not elements:
-        current_url = driver.current_url if hasattr(driver, 'current_url') else 'page'
-        print(f"[EXTRACT] No elements found on {current_url[:50] if current_url else 'page'}")
-        return []
-    
-    current_url = driver.current_url if hasattr(driver, 'current_url') else 'page'
-    print(f"[EXTRACT] Found {len(elements)} elements on {current_url[:50] if current_url else 'page'}")
-    return elements
+# ── Element extraction — moved to dom_extract.py so the production
+# extraction and the headless verification harness share ONE implementation.
+# probe_element powers the O(1) staleness check in click_element.
+from dom_extract import extract_interactive_elements, probe_element
 
 
 # ── Vision click ──────────────────────────────────────────────────────────────
@@ -728,29 +558,42 @@ def atomic_click(driver, text: str | None = None, href: str | None = None) -> bo
 # ── Click element (CDP path) ───────────────────────�������──────��───────────────────
 
 def click_element(driver, index: int, expected_text: str | None = None,
-                  expected_href: str | None = None, instruction: str | None = None) -> dict:
+                  expected_href: str | None = None, instruction: str | None = None,
+                  elements: list | None = None) -> dict:
     """
     Click element at index. Validates staleness, checks RISKY_KEYWORDS.
     No vision fallback here - that's handled by caller.
+
+    Staleness is checked with an O(1) single-node probe first — the old
+    unconditional full-page re-extraction between match and click doubled
+    per-click latency even when nothing on the page had changed. Only a
+    failed probe pays for the full re-extract + re-match.
     """
-    fresh = extract_interactive_elements(driver, max_elements=200)
-
-    if index >= len(fresh):
-        return {"success": False, "reason": "index out of range"}
-
-    current = fresh[index]
-    stale = (
-        (expected_text is not None and current["text"] != expected_text) or
-        (expected_href is not None and current["href"] != expected_href)
+    probe = probe_element(driver, index)
+    # href is the strongest identity signal (probe text can legitimately
+    # differ from extraction text for image anchors, whose extraction text
+    # prefers the img alt attribute) — compare text only when there's no href.
+    stale = probe is None or (
+        (expected_href is not None and probe.get("href") != expected_href) or
+        (expected_href is None and expected_text is not None and
+         probe.get("text") != expected_text)
     )
 
-    if stale:
+    if not stale:
+        current = (elements[index] if elements and index < len(elements)
+                   else {"index": index, "text": probe.get("text") or "",
+                         "href": probe.get("href")})
+    else:
+        print(f"[CLICK] probe stale for index {index} — full re-extract")
+        fresh = extract_interactive_elements(driver, max_elements=200)
         if instruction:
-            from claude_handler import find_element_index
+            from element_matcher import find_element_index
             new_idx = find_element_index(fresh, instruction)
             if new_idx is None or new_idx >= len(fresh):
                 return {"success": False, "reason": "element changed and re-match failed"}
             index = new_idx
+            current = fresh[index]
+        elif index < len(fresh):
             current = fresh[index]
         else:
             return {"success": False, "reason": "element changed, no instruction to re-match"}
@@ -923,7 +766,7 @@ def youtube_control(parameter: str) -> str:
         description = param.replace("play video", "").replace("click video", "").strip()
         time.sleep(0.8)
         elements = extract_interactive_elements(browser, max_elements=150)
-        from claude_handler import find_element_index
+        from element_matcher import find_element_index
         idx = find_element_index(elements, description)
         if idx is None or idx >= len(elements):
             return "Couldn't find that video on the page."
@@ -3456,158 +3299,16 @@ def file_to_doc(parameter: str | None = None) -> dict:
 
 
 # ── Images & wallpaper ────────────────────────────────────────────────────────
-# Image search sources (in order):
-#   1. Unsplash API   (if UNSPLASH_ACCESS_KEY is set — curated, always safe)
-#   2. Openverse API  (keyless default — CC-licensed, mature=false enforced)
-# _is_safe_image_result() is applied as defense-in-depth: an unsafe result is
-# silently dropped BEFORE it can reach _img_last_results or any spoken text.
+# The search/pick/download pipeline lives in image_flow.py (OS-independent,
+# headlessly testable, chain rules enforced by action_guard.py). executor
+# only wires the platform hooks and re-exports the two actions.
 
-_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
+image_flow.configure(navigate=_navigate, remember=_remember,
+                     normalize_path=_normalize_path)
 
-_img_last_results: list = []   # cards from the last search_image call
-_img_last_query: str = ""
-
-# Defense-in-depth: never surface a result whose URL, domain, or title trips
-# this — even if the API's own filter misses it.
-_UNSAFE_IMG_RE = re.compile(
-    r"porn|xxx|sex|nude|naked|nsfw|adult|hentai|erotic|escort|fetish|xvideo|"
-    r"xhamster|redtube|onlyfans|playboy|hustler|penthouse", re.IGNORECASE)
-
-
-def _is_safe_image_result(url: str, title: str = "") -> bool:
-    domain = urllib.parse.urlparse(url).netloc
-    if _UNSAFE_IMG_RE.search(domain) or _UNSAFE_IMG_RE.search(url) or \
-       (title and _UNSAFE_IMG_RE.search(title)):
-        print(f"[search_image] SAFETY-FILTERED: {domain}")
-        return False
-    return True
-
-
-def _search_image_urls(query: str, limit: int = 6) -> tuple[list, str | None]:
-    """Up to `limit` safe image results. Each: {url, title, source_domain}.
-    Unsplash (keyed) -> Openverse (keyless). (results, error)."""
-    unsplash_key = os.environ.get("UNSPLASH_ACCESS_KEY")
-    if unsplash_key:
-        try:
-            resp = requests.get(
-                "https://api.unsplash.com/search/photos",
-                params={"query": query, "per_page": limit * 2, "content_filter": "high"},
-                headers={"Authorization": f"Client-ID {unsplash_key}"}, timeout=10)
-            resp.raise_for_status()
-            out = []
-            for r in resp.json().get("results", []):
-                url = r.get("urls", {}).get("full") or r.get("urls", {}).get("regular")
-                title = (r.get("description") or r.get("alt_description") or "").strip()
-                if url and _is_safe_image_result(url, title):
-                    out.append({"url": url, "title": title,
-                                "source_domain": "unsplash.com"})
-                if len(out) >= limit:
-                    break
-            if out:
-                return out, None
-            print("[search_image] Unsplash empty — falling back to Openverse")
-        except requests.RequestException as e:
-            print(f"[search_image] Unsplash failed ({e}) — falling back to Openverse")
-    try:
-        resp = requests.get(
-            "https://api.openverse.org/v1/images/",
-            params={"q": query, "page_size": limit * 3, "mature": "false"},
-            headers={"User-Agent": "AkiraAssistant/1.0"}, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        return [], f"Image search failed: {e}"
-    out, seen = [], set()
-    for r in resp.json().get("results", []):
-        url, title = r.get("url"), (r.get("title") or "").strip()
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        if not _is_safe_image_result(url, title):
-            continue
-        out.append({"url": url, "title": title,
-                    "source_domain": urllib.parse.urlparse(url).netloc})
-        if len(out) >= limit:
-            break
-    if not out:
-        return [], f"No image results for '{query}'."
-    return out, None
-
-
-def search_image(parameter: str | None = None) -> dict:
-    """search_image|query — speaks 4-6 candidates, downloads NOTHING.
-    The user then picks by ordinal via download_image."""
-    global _img_last_results, _img_last_query
-    print(f"[search_image] called with parameter={parameter!r}")
-    query = (parameter or "").split("|")[0].strip()
-    if not query:
-        return {"success": False, "message": "Search for what? Describe the image you want."}
-    results, err = _search_image_urls(query)
-    if err:
-        return {"success": False, "message": err}
-    _img_last_results = [
-        {"label": f"number {i + 1}, {r['title'][:60] if r['title'] else 'untitled'}",
-         "href": r["url"]}
-        for i, r in enumerate(results)]
-    _img_last_query = query
-    print(f"[search_image] {len(results)} safe results: "
-          f"{[r['source_domain'] for r in results]}")
-    listing = "; ".join(c["label"] for c in _img_last_results)
-    return {"success": True, "speak": True,
-            "message": f"Found {len(results)} images for {query}: {listing}. "
-                       "Which one should I download? Say something like the first one."}
-
-
-def download_image(parameter: str | None = None) -> dict:
-    """download_image|url-or-pick|optional save path. URL → direct download
-    (unchanged path); anything else → ordinal/fuzzy pick from the last
-    search_image results via _pick_card — NEVER a blind search-and-grab.
-    Returns the local path in message AND result['path']. No wallpaper logic."""
-    print(f"[download_image] called with parameter={parameter!r}")
-    parts = (parameter or "").split("|")
-    spec = parts[0].strip() if parts and parts[0].strip() else None
-    if not spec:
-        return {"success": False, "message": "Download what? Give me an image URL, or search for images first and pick one."}
-    if spec.lower().startswith(("http://", "https://")):
-        url, query = spec, None
-    else:
-        if not _img_last_results:
-            return {"success": False,
-                    "message": f"I haven't searched for images yet. Say search for {spec} first, then pick one."}
-        pick = _pick_card(_img_last_results, spec)
-        url, query = pick["href"], _img_last_query
-    try:
-        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"},
-                            timeout=20)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        return {"success": False, "message": f"Couldn't download the image: {e}"}
-    if not resp.headers.get("Content-Type", "").startswith("image/"):
-        return {"success": False, "message": "That URL didn't return an image."}
-    # extension: from content-type, falling back to URL path
-    ctype = resp.headers["Content-Type"].split(";")[0]
-    ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif",
-           "image/webp": ".webp", "image/bmp": ".bmp"}.get(ctype) or \
-        (os.path.splitext(urllib.parse.urlparse(url).path)[1].lower()
-         if os.path.splitext(urllib.parse.urlparse(url).path)[1].lower() in _IMG_EXTS else ".jpg")
-    if len(parts) > 1 and parts[1].strip():
-        save_path = _normalize_path(parts[1])
-        if os.path.isdir(save_path) or not os.path.splitext(save_path)[1]:
-            base = re.sub(r"[^\w\- ]", "", query or "image").strip() or "image"
-            save_path = os.path.join(save_path, base + ext)
-    else:
-        base = re.sub(r"[^\w\- ]", "", query or
-                      os.path.splitext(os.path.basename(urllib.parse.urlparse(url).path))[0]
-                      or "image").strip() or "image"
-        save_path = os.path.join(os.path.expanduser("~/Pictures"), base + ext)
-    try:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with open(save_path, "wb") as f:
-            f.write(resp.content)
-    except OSError as e:
-        return {"success": False, "message": f"Downloaded but couldn't save it: {e}"}
-    _remember(save_path)
-    return {"success": True, "path": save_path,
-            "message": f"Image saved to {save_path}"}
+_IMG_EXTS = image_flow.IMG_EXTS
+search_image = image_flow.search_image
+download_image = image_flow.download_image
 
 
 def set_wallpaper(parameter: str | None = None) -> dict:
@@ -4680,7 +4381,7 @@ def fill(parameter: str) -> str:
     should_submit = len(parts) > 2 and parts[2].strip().lower() == "submit"
     browser = get_browser(_last_browser_name)
     elements = extract_interactive_elements(browser, max_elements=100)
-    from claude_handler import find_element_index
+    from element_matcher import find_element_index
     index = find_element_index(elements, instruction)
     if index is None or index >= len(elements):
         return "Couldn't find that field."
@@ -4768,7 +4469,7 @@ def _handle_click(parameter: str) -> str | dict:
     if elements:
         print(f"[DEBUG] First 5 elements: {[el['text'][:40] for el in elements[:5]]}")
     
-    from claude_handler import find_element_index
+    from element_matcher import find_element_index
     index = find_element_index(elements, parameter)
     print(f"[CLICK] Matched index={index} for '{parameter}'")
 
@@ -4781,7 +4482,8 @@ def _handle_click(parameter: str) -> str | dict:
     
     try:
         result = click_element(browser, index, expected_text=target["text"],
-                               expected_href=target["href"], instruction=parameter)
+                               expected_href=target["href"], instruction=parameter,
+                               elements=elements)
     except Exception as e:
         print(f"[CLICK] Exception: {e!r}")
         return f"Couldn't click that: {e}"
