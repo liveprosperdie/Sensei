@@ -266,6 +266,230 @@ def _ensure_akira_tab(driver) -> None:
         time.sleep(0.3)
 
 
+# ── Tab targeting & user activation ───────────────────────────────────────────
+#
+# ONE implementation of "make sure I am driving the right tab", replacing the
+# ad-hoc `switch_to.window(browser._akira_tab)` that was copy-pasted across the
+# control functions (each with its own silent `except: pass`, so a stale handle
+# produced commands executed against the wrong page while still reporting
+# success).
+#
+# Policy: never steal OS focus for ordinary DOM work. Only the handful of
+# actions the BROWSER itself refuses without user activation (fullscreen,
+# keyboard shortcuts) go through _with_user_activation.
+
+# Virtual key codes for the shortcuts we actually send. Chrome ignores
+# dispatchKeyEvent without a correct windowsVirtualKeyCode for non-text keys.
+_VK_CODES = {
+    'f': (0x46, 'KeyF', 'f'), 'm': (0x4D, 'KeyM', 'm'),
+    's': (0x53, 'KeyS', 's'), 't': (0x54, 'KeyT', 't'),
+    'c': (0x43, 'KeyC', 'c'), 'k': (0x4B, 'KeyK', 'k'),
+    'j': (0x4A, 'KeyJ', 'j'), 'l': (0x4C, 'KeyL', 'l'),
+    ' ': (0x20, 'Space', ' '),
+    'escape': (0x1B, 'Escape', ''), 'esc': (0x1B, 'Escape', ''),
+    'enter': (0x0D, 'Enter', '\r'),
+    'left': (0x25, 'ArrowLeft', ''), 'up': (0x26, 'ArrowUp', ''),
+    'right': (0x27, 'ArrowRight', ''), 'down': (0x28, 'ArrowDown', ''),
+}
+
+
+def _ensure_target_tab(browser) -> str | None:
+    """Point the driver at Akira's working tab and RETURN its url.
+
+    Re-resolves through _ensure_akira_tab when the stored handle has died, so
+    a closed tab degrades to "adopt/create another" instead of executing the
+    command against whatever tab happened to be active."""
+    try:
+        handles = browser.window_handles
+    except Exception as e:
+        print(f"[FOCUS] driver unreachable: {e}")
+        return None
+
+    target = getattr(browser, "_akira_tab", None)
+    if not target or target not in handles:
+        print(f"[FOCUS] stored tab {target!r} is stale — re-resolving")
+        try:
+            _ensure_akira_tab(browser)
+            target = getattr(browser, "_akira_tab", None)
+        except Exception as e:
+            print(f"[FOCUS] re-resolve failed: {e}")
+            target = None
+    if not target:
+        return None
+
+    try:
+        if browser.current_window_handle != target:
+            browser.switch_to.window(target)
+    except Exception:
+        try:
+            browser.switch_to.window(target)
+        except Exception as e:
+            print(f"[FOCUS] switch failed: {e}")
+            return None
+
+    try:
+        url = browser.current_url or ""
+    except Exception:
+        url = ""
+    print(f"[FOCUS] tab={target} url={url[:80]}")
+    return url
+
+
+def _activate_tab(browser) -> bool:
+    """Make the working tab the ACTIVE tab inside its own window.
+
+    Does not raise the window above other applications — a background tab
+    cannot receive key events or enter fullscreen, but foregrounding the whole
+    browser over the user's editor is a separate, more invasive step."""
+    ok = False
+    try:
+        browser.execute_cdp_cmd("Page.bringToFront", {})
+        ok = True
+    except Exception as e:
+        print(f"[FOCUS] bringToFront failed: {e}")
+    return ok
+
+
+def _browser_hwnd(browser) -> int | None:
+    """Top-level window handle of the browser showing our working tab.
+
+    Matched by the page TITLE rather than by pid: the pid on
+    driver.service.process is chromedriver's, not the browser's (the browser is
+    launched separately by _attach_cdp and merely attached to over CDP), so a
+    pid comparison would never match. The current tab's title is in the window
+    caption, which is a signal we actually have."""
+    try:
+        page_title = (browser.title or "").strip()
+    except Exception:
+        page_title = ""
+
+    candidates: list[int] = []
+    titled: list[int] = []
+
+    def _cb(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            cls = win32gui.GetClassName(hwnd) or ""
+            title = win32gui.GetWindowText(hwnd) or ""
+            if "Chrome_WidgetWin" not in cls or not title:
+                return
+            candidates.append(hwnd)
+            if page_title and page_title[:40] in title:
+                titled.append(hwnd)
+        except Exception:
+            return
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception as e:
+        print(f"[FOCUS] EnumWindows failed: {e}")
+        return None
+    if titled:
+        return titled[0]
+    return candidates[0] if candidates else None
+
+
+def _is_browser_foreground(browser) -> bool:
+    """True when a browser window is the OS foreground window. Logged on every
+    activation attempt because "the click went to VS Code" is exactly the class
+    of bug this tells us about."""
+    try:
+        fg = win32gui.GetForegroundWindow()
+        cls = win32gui.GetClassName(fg) or ""
+        title = win32gui.GetWindowText(fg) or ""
+    except Exception:
+        return False
+    is_browser = "Chrome_WidgetWin" in cls
+    print(f"[FOCUS] foreground='{title[:40]}' class={cls} browser={is_browser}")
+    return is_browser
+
+
+def _with_user_activation(browser) -> bool:
+    """The ONLY path that raises the browser window over other apps.
+
+    Reserved for actions the browser refuses without a transient user
+    activation: requestFullscreen() and site keyboard shortcuts. Everything
+    else must use _ensure_target_tab/_activate_tab and leave focus alone."""
+    _activate_tab(browser)
+    if _is_browser_foreground(browser):
+        return True
+    hwnd = _browser_hwnd(browser)
+    if not hwnd:
+        print("[FOCUS] no browser hwnd found — cannot grant user activation")
+        return False
+    try:
+        win32gui.ShowWindow(hwnd, 5)          # SW_SHOW
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.25)
+        print(f"[FOCUS] raised browser hwnd={hwnd}")
+        return _is_browser_foreground(browser)
+    except Exception as e:
+        # SetForegroundWindow legitimately fails when the OS denies the
+        # foreground lock; report it rather than pretending the key landed.
+        print(f"[FOCUS] SetForegroundWindow failed: {e}")
+        return False
+
+
+def _send_trusted_key(browser, key: str, hold: float = 0.03) -> bool:
+    """Dispatch a key through CDP so it counts as REAL user input.
+
+    A JS `.click()` or send_keys on <body> is untrusted: `event.isTrusted` is
+    false and no user-activation window opens, so YouTube's/Netflix's handlers
+    for fullscreen silently no-op. Input.dispatchKeyEvent goes in at the
+    browser level and does carry activation."""
+    k = (key or '').lower()
+    vk, code, text = _VK_CODES.get(k, (0, '', key))
+    key_name = {'escape': 'Escape', 'esc': 'Escape', 'enter': 'Enter',
+                ' ': ' ', 'left': 'ArrowLeft', 'right': 'ArrowRight',
+                'up': 'ArrowUp', 'down': 'ArrowDown'}.get(k, key)
+    try:
+        down = {"type": "keyDown", "key": key_name, "code": code,
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+        if text:
+            down["text"] = text
+        browser.execute_cdp_cmd("Input.dispatchKeyEvent", down)
+        time.sleep(hold)
+        browser.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": "keyUp", "key": key_name, "code": code,
+            "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+        print(f"[FOCUS] sent trusted key {key_name!r}")
+        return True
+    except Exception as e:
+        print(f"[FOCUS] trusted key {key!r} failed: {e}")
+        return False
+
+
+def _send_trusted_click(browser, selector: str) -> bool:
+    """Trusted mouse press/release at an element's centre, for controls that
+    (like fullscreen) require activation rather than a synthetic click."""
+    try:
+        box = browser.execute_script("""
+            const el = document.querySelector(arguments[0]);
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) return null;
+            return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+        """, selector)
+    except Exception as e:
+        print(f"[FOCUS] trusted click probe failed: {e}")
+        return False
+    if not box:
+        print(f"[FOCUS] no element for trusted click: {selector}")
+        return False
+    try:
+        for kind in ("mousePressed", "mouseReleased"):
+            browser.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": kind, "x": box["x"], "y": box["y"],
+                "button": "left", "clickCount": 1})
+            time.sleep(0.02)
+        print(f"[FOCUS] trusted click at ({box['x']:.0f},{box['y']:.0f}) {selector}")
+        return True
+    except Exception as e:
+        print(f"[FOCUS] trusted click failed: {e}")
+        return False
+
+
 def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
     binary_name = os.path.basename(binary_path).lower()
     if not _port_ready(port):
@@ -1495,7 +1719,7 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     return {"success": False, "message": f"Unknown netflix_control action: {action}"}
 
 
-# ── Amazon control ────────────────────────────────────���───────────────────────
+# ── Amazon control ────────────────────────────────────���──────────────��────────
 # SCOPE: search → product → cart → checkout → address confirmation.
 # HARD STOP before payment-method selection. No payment actions exist here.
 
