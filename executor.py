@@ -37,6 +37,7 @@ from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from pycaw.pycaw import AudioUtilities
 
 import image_flow
+import system_control as _system_control
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -4576,24 +4577,8 @@ def screenshot() -> dict:
     return {"success": True, "path": path, "message": "Screenshot saved."}
 
 
-def lock_screen() -> str:
-    subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"])
-    return "Locking screen."
-
-
-def hibernate() -> str:
-    subprocess.Popen(["shutdown", "/h"])
-    return "Hibernating."
-
-
-def shutdown() -> str:
-    subprocess.Popen(["shutdown", "/s", "/t", "0", "/f"])
-    return "Shutting down."
-
-
-def restart() -> str:
-    subprocess.Popen(["shutdown", "/r", "/t", "0", "/f"])
-    return "Restarting."
+# lock_screen / hibernate / shutdown / restart now live in system_control.py
+# (see _ACTION_MAP aliases) so power handling has a single implementation.
 
 
 def _find_window(param: str):
@@ -5059,14 +5044,22 @@ _ACTION_MAP = {
     "adjust_volume":     adjust_volume,
     "adjust_brightness": adjust_brightness,
     "screenshot":        lambda _: screenshot(),
-    "lock_screen":       lambda _: lock_screen(),
-    "hibernate":         lambda _: hibernate(),
-    "shutdown":          lambda _: shutdown(),
-    "restart":           lambda _: restart(),
+    # Legacy action names kept as aliases onto the single system_control
+    # implementation — the old local copies used bare `shutdown /f`, which
+    # force-killed apps past unsaved work, and never checked whether
+    # hibernate was even enabled.
+    "lock_screen":       _system_control.lock_pc,
+    "hibernate":         _system_control.hibernate_pc,
+    "shutdown":          _system_control.shutdown_pc,
+    "restart":           _system_control.restart_pc,
     "switch_window":     switch_window,
     "maximize_window":   maximize_window,
     "minimize_window":   minimize_window,
     "bookmark_page":     lambda _: _bookmark(),
+    # Windows system/settings control. Imported as one dict so adding an
+    # action there needs no edit here. Tier 2 entries are confirmation-gated
+    # by sensei's existing safety net, not by anything in this map.
+    **_system_control.ACTIONS,
 }
 
 

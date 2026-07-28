@@ -16,6 +16,7 @@ import numpy as np
 import openwakeword
 import claude_handler
 import action_guard
+import system_control
 from groq import Groq
 import soundfile as sf
 from executor import execute, get_all_tabs, get_pc_context
@@ -60,6 +61,10 @@ DANGEROUS_ACTIONS = frozenset({
     "close_application", "shutdown", "restart", "hibernate",
     "edit_file", "uninstall_application",
     "write_file",  # overwrites file content — gated same as edit_file
+    # Tier 2 Windows system actions (cleanup + power). Pulled from
+    # system_control.TIER2_ACTIONS so the gate list cannot drift from the
+    # implementations — a new Tier 2 action is gated the moment it exists.
+    *system_control.TIER2_ACTIONS,
     # NOTE: delete_files / move_files / organize_files / organize_folder /
     # bulk_rename_files are NOT pre-gated here. They gate themselves in
     # executor.py with a dry-run + spoken enumeration of the exact files

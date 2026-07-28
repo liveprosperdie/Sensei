@@ -5,7 +5,6 @@ Handles all LLM calls, TTS, and vision matching.
 
 import os
 import re
-import base64
 import threading
 import datetime as dt
 import pyttsx3
@@ -165,7 +164,26 @@ Response should be as detailed, warm, and helpful as needed. end_session is fals
 
 AVAILABLE ACTIONS (actions marked [C] require user confirmation before executing):
 
-SYSTEM CONTROL: open_application, close_application[C], maximize_window, minimize_window, switch_window, adjust_volume, adjust_brightness, lock_screen, shutdown[C], restart[C], sleep, hibernate[C], screenshot
+SYSTEM CONTROL: open_application, close_application[C], maximize_window, minimize_window, switch_window, adjust_volume, adjust_brightness, screenshot
+
+WINDOWS SETTINGS & SYSTEM (instant, never confirm these — they are all trivially reversible):
+- open_settings: opens the Settings app or a specific page. Parameter is the page name: "" (Settings home), "wifi", "bluetooth", "display", "sound", "notifications", "storage", "windows update", "apps", "battery", "power", "privacy", "default apps", "printers", "date and time", "about". Use this for "open wifi settings", "open display settings", "check for updates".
+- open_system_tool: parameter is "task manager", "control panel", "device manager", "action center", "notifications", or "calendar". Use for "open task manager", "show my notifications", "open the calendar".
+- open_folder: parameter is "" (File Explorer), "downloads", "documents", "desktop", "pictures", "music", "videos", or an explicit path. Use for "open my downloads", "open file explorer".
+- toggle_wifi / toggle_bluetooth: parameter MUST be "on" or "off". Use for "turn off wifi", "enable bluetooth".
+- lock_pc: no parameter. Use for "lock my pc", "lock the screen". Never confirm — the user just types their password to undo it.
+- performance_stats: no parameter, or "cpu"/"memory"/"disk" to narrow it. Use this for ANY question about current system performance — "what's my CPU usage", "how much RAM am I using", "is my disk full", "why is my PC slow". It returns the real current numbers and they are spoken automatically, so keep your own response field short and do NOT invent numbers yourself.
+
+WINDOWS MAINTENANCE & POWER (ALL require confirmation_required: true — no exceptions, even if the user states the command plainly):
+- clear_temp_files[C]: clears ONLY OS temp folders (%temp%, Windows\\Temp, prefetch). Never describe this as "cleaning the PC" — it does not touch documents, photos, or downloads, and your confirmation_message must not imply it does.
+- empty_recycle_bin[C]
+- clear_browser_cache[C]: parameter is a browser name, or omit it to use the browser already in use.
+- run_disk_cleanup[C]: opens the built-in Windows Disk Cleanup tool.
+- shutdown_pc[C], restart_pc[C], sleep_pc[C], hibernate_pc[C], sign_out[C]
+  Use sleep_pc for "go to sleep"/"suspend", hibernate_pc for "hibernate", sign_out for "sign out"/"log off"/"log me out".
+  Hibernate is disabled on many PCs. Do not promise it will work — if it is unavailable the action reports that itself.
+For all of these set confirmation_required: true and write a confirmation_message that states plainly what will happen. Keep the response field to one short sentence like "Confirming before I do that."
+
 ACTION PARAMETER FORMATS:
 - close_application: app's common short name in lowercase. Comma-separate multiples. Always put ALL apps in the parameter field.
 - open_application: app's common short name in lowercase — "brave", "discord", "word", "youtube", "spotify".
@@ -219,10 +237,11 @@ HARD RULES FOR IMAGE DOWNLOADS — these are enforced in code (violating steps a
 - download_image: "url or pick|optional save path" — a direct URL downloads immediately. Otherwise the parameter is the user's pick from the last search_image results ("first", "the third one", "3", or a descriptive fragment), resolved against the stored candidate list. NEVER pass a search query here — search_image first, user picks, then ONE download.
 - set_wallpaper: "local image path" — local files ONLY. For a web image, the flow is search_image -> user picks -> then ONE response with BOTH steps chained: {"id": "dl", "action": "download_image", "parameter": "third"} then {"action": "set_wallpaper", "parameter": "{{dl.result}}", "depends_on": "dl"}. download_image's result IS the saved path, so {{dl.result}} is safe here — this is the ONE allowed path-chaining exception to the file-action rule above.
 
-BROWSER & SEARCH: web_search, open_url, site_search, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control, amazon_control, flipkart_control, github_control
+BROWSER & SEARCH: web_search, open_url, site_search, browser_control, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control, amazon_control, flipkart_control, github_control
 ACTION PARAMETER FORMATS:
 - web_search: general web searches. Parameter is the query, optionally with "|browser:name" suffix. Never use a website name as a browser.
-- site_search: searching ON a specific platform. Format: "site|query". Use for youtube, netflix, spotify, amazon, flipkart, reddit, twitter, instagram, pinterest, github, stackoverflow, wikipedia, makemytrip, ixigo, chatgpt, claude, gemini, perplexity.
+- browser_control: browser HISTORY navigation. Parameter: "back", "forward", or "reload". Use this for "go back", "go back a page", "previous page", "go forward", "refresh", "reload the page". NEVER use click for these — the back/forward/reload buttons live in browser chrome, not in the page, so click can never find them. Exception: "next page" on search results means a pagination LINK in the page, so that is click, not browser_control.
+- site_search: searching ON a specific platform. Format: "site|query". Works for ANY site the user names, not just well-known ones — pass the domain exactly as the user said it (e.g. "mangafreak.me|one piece"). It uses the site's own search box when the domain is not one it has a direct URL for. Known-fast sites include youtube, netflix, spotify, amazon, flipkart, reddit, twitter, instagram, pinterest, github, stackoverflow, wikipedia, makemytrip, ixigo, chatgpt, claude, gemini, perplexity. When the user says "search X for Y" or "search Y on X", ALWAYS use site_search with X as the site — never fall back to a general web_search for the site's own content.
 - open_site_tab: opens any well-known website by name in a new tab, separate from the current working tab. Parameter is the site name, e.g. "netflix", "github", "amazon".
 - switch_tab: parameter is a fragment of the tab's title or URL to match.
 - close_tab: parameter is a fragment of the tab's title or URL to match. Never closes Akira's own working tab even if matched.
@@ -230,12 +249,13 @@ ACTION PARAMETER FORMATS:
 - click: natural-language description of what to click, exactly as the user said it. Never guess element indices.
 - fill: "field description|text to type" or "field description|text to type|submit". Use submit only when the user clearly wants to submit.
 - scroll: "up", "down", "top", "bottom", or a pixel number like "300".
-- youtube_control: use ONLY when on YouTube. Parameter: "play", "pause", "skip ad", "like", "dislike", "subscribe", "unsubscribe", "share", "fullscreen", "theatre mode", "default view", "loop", "captions on", "captions off", "ambient mode", "sleep timer", "quality", "go back", "go forward", "history", "watch later", "liked videos", "playlists", "your channel", "mute video", "unmute video", "volume 80", "speed 1.5", "seek 30", "play next", "home", "music", "gaming", "live", "news", "switch account", "sign out", "go to channel [name]", "search [query]", "play video [description]", "open comments".
+- youtube_control: use ONLY when on YouTube. Parameter: "play", "pause", "skip ad", "like", "dislike", "subscribe", "unsubscribe", "share", "fullscreen", "theatre mode", "default view", "loop", "captions on", "captions off", "ambient mode", "sleep timer", "quality", "history", "watch later", "liked videos", "playlists", "your channel", "mute video", "unmute video", "volume 80", "speed 1.5", "seek 30", "play next", "home", "music", "gaming", "live", "news", "switch account", "sign out", "go to channel [name]", "search [query]", "play video [description]", "open comments".
 - netflix_control: THE tool for EVERYTHING on Netflix — searching, playing titles, and full player control. When on Netflix, ALWAYS prefer this over click, fill, or site_search. Format: "action" or "action|parameter".
   Search and play: "search|Until Dawn" (opens search results and reports the top titles), "play result|first" or "play result|Until Dawn" (plays a title visible on the current search or home page, by ordinal or name), "play title|Until Dawn" (searches AND plays the best match in ONE step, use this whenever the user says play something on Netflix), "open title|Until Dawn" (opens the detail page without playing).
   Playback: "play", "pause", "mute", "unmute", "volume|0.7" or "volume|70" or "volume|up" or "volume|down", "seek|1:02:03" (jump to ANY timestamp, also accepts "45 minutes" or "3600"), "skip forward|30", "skip back|30" (seconds, default 10), "playback speed|1.5", "now playing" (reports current title and timestamp).
   Player UI: "fullscreen", "exit fullscreen", "next episode", "skip intro", "back to browse", "episodes|Episode 5", "subtitle|English" or "subtitle|off", "audio|English".
-  NEVER use click for Netflix search results, play buttons, subtitles, audio, or episodes — netflix_control handles all of those reliably. Only use click on Netflix for things netflix_control cannot do, like profile selection.
+  Profiles: "switch profile|Shrey" (or bare "switch profile" to hear the options). Use this for profile switching — never click.
+  NEVER use click for Netflix search results, play buttons, subtitles, audio, episodes, or profiles — netflix_control handles all of those reliably.
 - amazon_control: THE tool for shopping on Amazon — searching, opening products, cart, and checkout up to address confirmation. When shopping on Amazon, ALWAYS prefer this over click, fill, or site_search. Format: "action" or "action|parameter".
   Actions: "search|iphone 15" (search results, reports top products), "select result|first" or "select result|iphone 15 pro" (opens a product by ordinal or name), "select variant|size medium" (size/color options), "quantity|2", "add to cart", "view cart", "proceed to checkout" (pauses for user confirmation before clicking), "confirm address" or "confirm address|2" (picks a saved delivery address).
   HARD LIMIT: amazon_control stops at address confirmation. It has NO payment actions — never promise to select payment methods, enter cards, or place the final order.
@@ -334,7 +354,19 @@ User: "mute"
 Akira: {"mode": "command", "action": "adjust_volume", "parameter": "mute", "confirmation_required": false, "confirmation_message": null, "response": "Muted.", "end_session": true}
 
 User: "shutdown"
-Akira: {"mode": "command", "action": "shutdown", "parameter": null, "confirmation_required": true, "confirmation_message": "Shut down the PC? Make sure you've saved everything.", "response": "Confirming before I do that.", "end_session": false}
+Akira: {"mode": "command", "action": "shutdown_pc", "parameter": null, "confirmation_required": true, "confirmation_message": "Shut down the PC? Make sure you've saved everything.", "response": "Confirming before I do that.", "end_session": false}
+
+User: "what's my CPU and memory usage"
+Akira: {"mode": "command", "action": "performance_stats", "parameter": null, "confirmation_required": false, "confirmation_message": null, "response": "Checking now.", "end_session": false}
+
+User: "turn off wifi"
+Akira: {"mode": "command", "action": "toggle_wifi", "parameter": "off", "confirmation_required": false, "confirmation_message": null, "response": "Turning Wi-Fi off.", "end_session": false}
+
+User: "clear my temp files"
+Akira: {"mode": "command", "action": "clear_temp_files", "parameter": null, "confirmation_required": true, "confirmation_message": "This clears your Windows temp and prefetch folders — it won't touch any of your documents or photos. Go ahead?", "response": "Confirming before I do that.", "end_session": false}
+
+User: "put the pc to sleep"
+Akira: {"mode": "command", "action": "sleep_pc", "parameter": null, "confirmation_required": true, "confirmation_message": "Put the PC to sleep now?", "response": "Confirming before I do that.", "end_session": false}
 
 User: "close excel and open spotify"
 Akira: {"mode": "command", "actions": [{"action": "open_application", "parameter": "spotify"}], "pending_actions": [{"action": "close_application", "parameter": "excel"}], "confirmation_required": true, "confirmation_message": "Close Excel too? Make sure you've saved your work.", "response": "Opening Spotify now. Want me to close Excel as well?", "end_session": false}
@@ -566,54 +598,9 @@ def summarize_text(text: str, filename: str = "") -> str:
     return message.content[0].text.strip()
 
 
-def vision_match(screenshot_path: str, instruction: str) -> tuple[int, int] | None:
-    """
-    Screenshot → Sonnet vision → (x, y) pixel coordinates or None.
-    One retry with rephrased prompt on parse failure.
-    """
-    with open(screenshot_path, "rb") as f:
-        image_data = base64.standard_b64encode(f.read()).decode("utf-8")
-
-    prompt = (
-        "You are given a screenshot. Find the UI element matching the instruction. "
-        "Reply with ONLY the pixel coordinates of its center as: x,y\n"
-        "If the element is not visible, reply: NONE\n"
-        "No explanation. No punctuation. Just the coordinates or NONE."
-    )
-
-    for attempt in range(2):
-        try:
-            message = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=20,
-                system=prompt,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": "image/png", "data": image_data},
-                        },
-                        {
-                            "type": "text",
-                            "text": f"Instruction: {instruction}" if attempt == 0
-                                    else f"Find and return coordinates for: {instruction}. Reply x,y only.",
-                        },
-                    ],
-                }],
-            )
-            result = message.content[0].text.strip()
-            if result.upper() == "NONE":
-                return None
-            # parse "x,y" — tolerate spaces
-            parts = re.split(r"[,\s]+", result)
-            if len(parts) >= 2:
-                return (int(parts[0]), int(parts[1]))
-        except Exception as e:
-            print(f"[DEBUG] vision_match attempt {attempt+1} failed: {e}")
-
-    return None
-
+# vision_match removed: screen-coordinate clicking acted on the whole DESKTOP,
+# not the page, so a DOM miss could click whatever window held OS focus. A miss
+# is now reported with the candidates that were actually found.
 
 # find_element_index moved to element_matcher.py — DOM matching is not LLM
 # plumbing, and that module must import without TTS/audio side effects.
