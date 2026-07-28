@@ -209,26 +209,46 @@ _COLLECT_SCRIPT = r"""
         } catch (e) { return false; }
     }
 
+    const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+
+    // A profile avatar keeps its NAME in a span that is a SIBLING of the
+    // link, OUTSIDE it — so querySelector on the link can never reach it.
+    // That is precisely how names came back as 'image result'.
+    function siblingLabel(el) {
+        try {
+            const p = el.parentElement;
+            if (!p) return '';
+            for (const sp of p.querySelectorAll('span, .profile-name')) {
+                if (el.contains(sp)) continue;
+                const s = clean(sp.innerText || sp.textContent);
+                if (s) return s;
+            }
+        } catch (e) {}
+        return '';
+    }
+
     function labelOf(el) {
-        // Own direct text wins when it is short and meaningful (a real tab
-        // label). Otherwise look in the known name sub-elements, then ARIA,
-        // then the image alt as a last resort.
-        let own = (el.getAttribute('aria-label') || '').trim();
-        if (own) return own;
+        // Order: known name sub-elements -> sibling span -> own text ->
+        // aria-label -> img alt. Own text comes before aria-label so a real
+        // tab keeps its visible word ('Images') rather than a verbose
+        // aria-label like 'Search for Images instead'.
         for (const q of labelSels) {
             try {
                 const t = el.querySelector(q);
                 if (t) {
-                    const s = (t.innerText || t.textContent || '').trim();
+                    const s = clean(t.innerText || t.textContent);
                     if (s) return s;
                 }
             } catch (e) {}
         }
-        let s = (el.innerText || el.textContent || '').trim();
-        if (s) return s;
+        const sib = siblingLabel(el);
+        if (sib) return sib;
+        const own = clean(el.innerText || el.textContent);
+        if (own) return own;
+        const aria = clean(el.getAttribute('aria-label'));
+        if (aria) return aria;
         const img = el.querySelector('img');
-        if (img) return (img.getAttribute('alt') || '').trim();
-        return '';
+        return img ? clean(img.getAttribute('alt')) : '';
     }
 
     for (const sel of sels) {

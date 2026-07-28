@@ -44,7 +44,7 @@ _EXTRACT_SCRIPT = """
             }
         }
 
-        function addElement(el, role, text, href = null) {
+        function addElement(el, role, text, href = null, extra = null) {
             try {
                 if (idx >= maxItems) return false;
                 // Dedupe: passes overlap (image/video anchors are also
@@ -53,10 +53,12 @@ _EXTRACT_SCRIPT = """
                 if (!text && role !== 'input' && role !== 'textbox' && role !== 'image') return true;
                 el.setAttribute('data-akira-index', String(idx));
                 const r = el.getBoundingClientRect();
-                items.push({index: idx, role: role, text: text, href: href,
-                            x: Math.round(r.left + window.scrollX),
-                            y: Math.round(r.top + window.scrollY),
-                            w: Math.round(r.width), h: Math.round(r.height)});
+                const item = {index: idx, role: role, text: text, href: href,
+                              x: Math.round(r.left + window.scrollX),
+                              y: Math.round(r.top + window.scrollY),
+                              w: Math.round(r.width), h: Math.round(r.height)};
+                if (extra) Object.assign(item, extra);
+                items.push(item);
                 idx++;
                 return true;
             } catch(e) {
@@ -78,24 +80,64 @@ _EXTRACT_SCRIPT = """
         // Claiming them here preserves the role AND the real label.
         try {
             const labelSubs = ['.profile-name', '[data-uia*="profile-name"]',
-                               '.profile-title'];
-            function structLabel(el) {
-                let s = (el.getAttribute('aria-label') || '').trim();
-                if (s) return s;
+                               '[data-uia*="profile"] .profile-name', '.profile-title'];
+            const clean = s => (s || '').replace(/\\s+/g,' ').trim();
+            const ownText   = el => clean(el.innerText || el.textContent);
+            const ariaLabel = el => clean(el.getAttribute('aria-label'));
+            const imgAlt    = el => {
+                const i = el.querySelector('img');
+                return i ? clean(i.getAttribute('alt')) : '';
+            };
+            const subLabel  = el => {
                 for (const q of labelSubs) {
                     try {
                         const t = el.querySelector(q);
                         if (t) {
-                            const v = (t.innerText || t.textContent || '').trim();
+                            const v = ownText(t);
                             if (v) return v;
                         }
                     } catch(e) {}
                 }
-                s = (el.innerText || el.textContent || '').trim();
-                if (s) return s;
-                const img = el.querySelector('img');
-                return img ? (img.getAttribute('alt') || '').trim() : '';
-            }
+                return '';
+            };
+            // A profile avatar usually keeps the NAME in a span that is a
+            // SIBLING of the link (outside it), so querySelector on the link
+            // can never reach it — that is how names became 'image result'.
+            const siblingLabel = el => {
+                try {
+                    const p = el.parentElement;
+                    if (!p) return '';
+                    for (const sp of p.querySelectorAll('span, .profile-name')) {
+                        if (el.contains(sp)) continue;
+                        const v = ownText(sp);
+                        if (v) return v;
+                    }
+                } catch(e) {}
+                return '';
+            };
+
+            // Plan order: .profile-name / data-uia / sibling span / aria-label
+            // / img.alt, with own text only as a last resort (it is usually
+            // empty or decorative on an avatar link).
+            const profileLabel = el =>
+                subLabel(el) || siblingLabel(el) || ariaLabel(el) ||
+                imgAlt(el) || ownText(el);
+            // Tabs are the reverse: the visible word ('Images') IS the label.
+            // Sibling lookup is deliberately NOT used here — a tab's siblings
+            // are the OTHER tabs, so it would mislabel every one of them.
+            const tabLabel = el => ownText(el) || ariaLabel(el) || imgAlt(el);
+
+            const isSelected = el => {
+                try {
+                    const a = el.getAttribute('aria-selected');
+                    if (a !== null) return a === 'true';
+                    if (el.getAttribute('aria-current')) return true;
+                    const c = clean(el.getAttribute('class'));
+                    return /(^|\\s)(selected|active)(\\s|$)/.test(c);
+                } catch(e) {
+                    return false;
+                }
+            };
 
             // Profiles before tabs: a Netflix profile link can also match a
             // generic nav selector, and the profile role is more specific.
@@ -105,7 +147,7 @@ _EXTRACT_SCRIPT = """
                 'li.profile a'
             ).forEach(el => {
                 if (!isVisible(el)) return;
-                const text = structLabel(el).replace(/\\s+/g,' ').slice(0, 200);
+                const text = profileLabel(el).slice(0, 200);
                 if (text) addElement(el, 'profile', text, el.href || null);
             });
 
@@ -116,8 +158,9 @@ _EXTRACT_SCRIPT = """
                 'div[role="navigation"] a[href*="tbm="]'
             ).forEach(el => {
                 if (!isVisible(el)) return;
-                const text = structLabel(el).replace(/\\s+/g,' ').slice(0, 200);
-                if (text) addElement(el, 'tab', text, el.href || null);
+                const text = tabLabel(el).slice(0, 200);
+                if (text) addElement(el, 'tab', text, el.href || null,
+                                     {selected: isSelected(el)});
             });
         } catch(e) {}
 

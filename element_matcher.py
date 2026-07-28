@@ -124,7 +124,7 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
     # guaranteeing the tab was excluded and a photo was clicked. structural_ui
     # normally intercepts these before we are called; this is the backstop.
     if role_intent in ('image', 'video') and \
-            re.search(r'\b(tab|tabs|profile|profiles)\b', instruction_lower):
+            re.search(r'\b(tabs?|profiles?|buttons?)\b', instruction_lower):
         print(f"[FILTER] suppressing role='{role_intent}' — structural request")
         role_intent = None
 
