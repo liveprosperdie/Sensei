@@ -29,6 +29,11 @@ _META_WORDS = {
     'page', 'one', 'the', 'a', 'an', 'in', 'on', 'of', 'from', 'at',
     'click', 'select', 'open', 'first', 'second', 'third', 'fourth',
     'fifth', 'sixth', 'top', 'left', 'right', 'middle', 'bottom',
+    # Element-KIND words. "first link mangafreak.me" scored 'link' as
+    # content, so any element whose text merely contained "link" competed
+    # with the real target.
+    'link', 'links', 'tab', 'tabs', 'button', 'buttons', 'profile',
+    'profiles', 'video', 'videos', 'item', 'items', 'option', 'options',
 }
 
 # Role intent: "image"/"photo" etc. means role='image' elements ONLY —
@@ -45,12 +50,29 @@ _ORDINALS = {
     'top': 0,
 }
 
-# Well-known domain shortcuts (fast path); _source_tokens() generalizes
-# "from <anything>" so new sources don't need dict entries.
+# Bare site NAMES (no TLD spoken) — a soft hint only, since "youtube" can
+# legitimately appear in link text. Explicit domains go through
+# _domain_tokens() below and are treated as a HARD constraint instead.
 _DOMAIN_FILTERS = {
     'imdb': 'imdb.com', 'youtube': 'youtube.com', 'wikipedia': 'wikipedia.org',
     'reddit': 'reddit.com', 'github': 'github.com',
 }
+
+# An explicitly spoken domain ("mangafreak.me", "imdb.com"). Matched as an
+# ATOMIC unit and removed from the string before word tokenization: splitting
+# "mangafreak.me" on \w+ produced the junk token 'me', which substring-matched
+# "Home", "Games" and "menu", so narrowing became a no-op and 'first' picked
+# whatever happened to be first ("AI Mode").
+_DOMAIN_RE = re.compile(
+    r'\b([a-z0-9][a-z0-9-]{1,})\.'
+    r'(com|me|net|org|io|tv|co|in|ai|gg|to|xyz|us|uk|dev|app|info|biz|site|online)'
+    r'\b')
+
+
+def _domain_tokens(instruction_lower: str) -> list[str]:
+    """Explicit domains named in the instruction, as full 'name.tld' strings."""
+    return [f"{m.group(1)}.{m.group(2)}"
+            for m in _DOMAIN_RE.finditer(instruction_lower)]
 
 
 def _source_tokens(instruction_lower: str) -> list[str]:
@@ -72,8 +94,11 @@ def _visual_sort(els: list[dict]) -> list[dict]:
 
 
 def _matches_words(el: dict, words: set[str]) -> bool:
+    """Bare substring containment, but only for tokens long enough to be
+    meaningful. 1-2 char tokens ('me', 'go', 'x') match almost any page text,
+    which silently turned narrowing into a pass-through."""
     hay = f"{el.get('text') or ''} {el.get('href') or ''}".lower()
-    return any(w in hay for w in words)
+    return any(w in hay for w in words if len(w) >= 3)
 
 
 def find_element_index(elements: list[dict], instruction: str) -> int | None:
@@ -83,11 +108,25 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
         return None
 
     instruction_lower = instruction.lower()
-    instruction_words = set(re.findall(r'\w+', instruction_lower))
-    content_words = instruction_words - _META_WORDS
+    # Strip explicit domains BEFORE \w+ tokenizing so they contribute as one
+    # atomic constraint instead of leaking junk fragments into content words.
+    domains = _domain_tokens(instruction_lower)
+    tokenizable = _DOMAIN_RE.sub(' ', instruction_lower)
+    instruction_words = set(re.findall(r'\w+', tokenizable))
+    content_words = {w for w in (instruction_words - _META_WORDS) if len(w) >= 3}
 
     role_intent = next((r for kw, r in _ROLE_KEYWORDS.items()
                         if re.search(r'\b' + kw + r's?\b', instruction_lower)), None)
+
+    # A structural request ("the Images tab", "Shrey profile") is NOT a request
+    # for an image/video element. Without this, "Images tab" set
+    # role_intent='image' and hard-filtered the pool to image RESULTS —
+    # guaranteeing the tab was excluded and a photo was clicked. structural_ui
+    # normally intercepts these before we are called; this is the backstop.
+    if role_intent in ('image', 'video') and \
+            re.search(r'\b(tabs?|profiles?|buttons?)\b', instruction_lower):
+        print(f"[FILTER] suppressing role='{role_intent}' — structural request")
+        role_intent = None
 
     # Apply filters: role intent first (strongest signal), then source/domain
     filtered = elements
@@ -96,13 +135,29 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
         if role_matches:
             filtered = role_matches
             print(f"[FILTER] role='{role_intent}': {len(filtered)} candidates")
-    for keyword, domain in _DOMAIN_FILTERS.items():
-        if keyword in instruction_lower:
-            narrowed = [el for el in filtered if domain in (el.get('href') or '')]
-            if narrowed:
-                filtered = narrowed
-                print(f"[FILTER] Applied '{keyword}' filter, {len(filtered)} matches")
-                break
+
+    # HARD constraint: an explicitly named domain must appear in the href. If
+    # nothing on the page is from that domain, the honest answer is "not here"
+    # — falling through to ordinal counting is what clicked "AI Mode" when the
+    # user asked for the first mangafreak.me link.
+    if domains:
+        narrowed = [el for el in filtered
+                    if any(d in (el.get('href') or '').lower() for d in domains)]
+        print(f"[FILTER] named domain(s) {domains}: {len(narrowed)} matches")
+        if not narrowed:
+            print(f"[FILTER] no element on this page links to {domains} — "
+                  f"refusing to guess")
+            return None
+        filtered = narrowed
+    else:
+        for keyword, domain in _DOMAIN_FILTERS.items():
+            if re.search(r'\b' + keyword + r'\b', instruction_lower):
+                narrowed = [el for el in filtered if domain in (el.get('href') or '')]
+                if narrowed:
+                    filtered = narrowed
+                    print(f"[FILTER] Applied '{keyword}' filter, {len(filtered)} matches")
+                    break
+
     src_tokens = _source_tokens(instruction_lower)
     if src_tokens:
         narrowed = [el for el in filtered if _matches_words(el, set(src_tokens))]

@@ -16,6 +16,7 @@ import numpy as np
 import openwakeword
 import claude_handler
 import action_guard
+import system_control
 from groq import Groq
 import soundfile as sf
 from executor import execute, get_all_tabs, get_pc_context
@@ -60,6 +61,10 @@ DANGEROUS_ACTIONS = frozenset({
     "close_application", "shutdown", "restart", "hibernate",
     "edit_file", "uninstall_application",
     "write_file",  # overwrites file content — gated same as edit_file
+    # Tier 2 Windows system actions (cleanup + power). Pulled from
+    # system_control.TIER2_ACTIONS so the gate list cannot drift from the
+    # implementations — a new Tier 2 action is gated the moment it exists.
+    *system_control.TIER2_ACTIONS,
     # NOTE: delete_files / move_files / organize_files / organize_folder /
     # bulk_rename_files are NOT pre-gated here. They gate themselves in
     # executor.py with a dry-run + spoken enumeration of the exact files
@@ -120,6 +125,28 @@ def _is_dangerous_step(step: dict) -> bool:
     if step.get("action") in ("slides_control", "docs_control", "sheets_control"):
         return param in RISKY_WORKSPACE_PARAMS
     return False
+
+
+def _confirmation_prompt(unsafe: list[dict]) -> str:
+    """Confirmation wording for the safety net's own fallback.
+
+    Only used when the LLM failed to supply a confirmation_message. For
+    clear_temp_files the generic "are you sure?" is not good enough — the user
+    must hear WHICH folders are about to be emptied, so the read-only preview
+    is used to name them (and their real size) before anything is deleted.
+    """
+    if any(a.get("action") == "clear_temp_files" for a in unsafe):
+        try:
+            preview = system_control.preview_temp_cleanup()
+            if preview.get("success"):
+                return (preview["message"] +
+                        " Nothing in your documents, photos, or downloads is touched. Go ahead?")
+        except Exception as e:
+            print(f"[handle_response] temp preview failed: {e}")
+        return ("This clears only your Windows temp and prefetch folders — "
+                "nothing in your documents, photos, or downloads. Go ahead?")
+    return "Just confirming before I do that."
+
 
 FAILURE_PREFIXES = (
     "I couldn't find", "Couldn't click", "Couldn't find",
@@ -361,7 +388,7 @@ def handle_response(response: dict) -> bool:
             response["actions"]               = safe
             response.pop("action", None)
             response.pop("parameter", None)
-            response["confirmation_message"]  = "Just confirming before I do that."
+            response["confirmation_message"]  = _confirmation_prompt(unsafe)
             # speak the question, not the LLM's premature "doing it now" text
             response["response"] = response["confirmation_message"]
         elif unsafe:

@@ -1,0 +1,580 @@
+"""
+Windows system/settings control — everyday OS surfaces, split by risk tier.
+
+TIER 1 (instant): settings pages, explorer folders, task manager, control
+panel, wifi/bluetooth toggles, action center, calendar flyout, lock, and a
+REAL performance query (psutil numbers, not "go read Task Manager yourself").
+
+TIER 2 (confirmation-gated): temp cleanup, recycle bin, browser cache, disk
+cleanup, shutdown/restart/sleep/hibernate/sign out. These are registered in
+sensei.DANGEROUS_ACTIONS so the EXISTING confirmation_required safety net
+gates them — this module deliberately contains no confirmation logic of its
+own, so there is exactly one confirmation mechanism in the codebase.
+
+Every function returns the standard {'success': bool, 'message': str} the
+executor's result handling already understands. 'speak' marks a message whose
+numbers must be read aloud verbatim.
+"""
+
+import ctypes
+import os
+import shutil
+import subprocess
+import time
+
+import psutil
+
+# CREATE_NO_WINDOW keeps helper processes from flashing a console at the user.
+_NO_WINDOW = 0x08000000
+
+
+def _run(args, timeout: float = 20.0, shell: bool = False) -> tuple[bool, str]:
+    """Run a helper process quietly. Returns (ok, combined_output)."""
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, shell=shell,
+                           timeout=timeout, creationflags=_NO_WINDOW)
+        out = ((p.stdout or "") + (p.stderr or "")).strip()
+        return p.returncode == 0, out
+    except subprocess.TimeoutExpired:
+        return False, "timed out"
+    except Exception as e:
+        return False, str(e)
+
+
+def _launch(target: str) -> bool:
+    """Fire-and-forget a shell target (ms-settings: URI, folder, or exe).
+
+    os.startfile is the right call for URI protocols and folders — subprocess
+    cannot resolve 'ms-settings:' style targets.
+    """
+    try:
+        os.startfile(target)
+        return True
+    except Exception as e:
+        print(f"[SYS] launch {target!r} failed: {e}")
+        return False
+
+
+# ── Tier 1: settings pages & shell locations ──────────────────────────────────
+
+# ms-settings: URIs are the documented, version-stable way into specific
+# Settings pages. Poking the Settings UI with clicks would break every time
+# Microsoft reshuffles the layout.
+_SETTINGS_PAGES = {
+    "settings": "", "wifi": "network-wifi", "wi-fi": "network-wifi",
+    "wireless": "network-wifi", "network": "network-status",
+    "internet": "network-status", "bluetooth": "bluetooth",
+    "display": "display", "screen": "display", "brightness": "display",
+    "sound": "sound", "audio": "sound", "volume": "sound",
+    "notifications": "notifications", "storage": "storage",
+    "windows update": "windowsupdate", "update": "windowsupdate",
+    "updates": "windowsupdate",
+    "apps": "appsfeatures", "apps and features": "appsfeatures",
+    "apps & features": "appsfeatures", "installed apps": "appsfeatures",
+    "battery": "batterysaver", "power": "powersleep", "privacy": "privacy",
+    "personalization": "personalization", "themes": "themes",
+    "default apps": "defaultapps", "mouse": "mousetouchpad",
+    "keyboard": "easeofaccess-keyboard", "printers": "printers",
+    "language": "regionlanguage", "date and time": "dateandtime",
+    "about": "about",
+}
+
+_FOLDERS = {
+    "downloads": "Downloads", "documents": "Documents", "desktop": "Desktop",
+    "pictures": "Pictures", "music": "Music", "videos": "Videos",
+}
+
+
+def open_settings(parameter: str = "") -> dict:
+    """Open the Settings app, or jump straight to a named page."""
+    key = (parameter or "").strip().lower()
+    page = _SETTINGS_PAGES.get(key)
+    if page is None:
+        # Tolerate "open wifi settings" phrasing that leaves noise words in.
+        cleaned = key.replace("settings", "").replace("page", "").strip()
+        page = _SETTINGS_PAGES.get(cleaned)
+    if page is None:
+        known = "Wi-Fi, Bluetooth, display, sound, notifications, storage, Windows Update, apps"
+        return {"success": False,
+                "message": f"I don't have a Settings page for '{parameter}'. I can open {known}."}
+    ok = _launch(f"ms-settings:{page}")
+    label = "Settings" if not page else (key or "Settings").title()
+    return {"success": ok,
+            "message": f"Opening {label}." if ok else "I couldn't open Settings."}
+
+
+def open_folder(parameter: str = "") -> dict:
+    """Open File Explorer, a known user folder, or an explicit path."""
+    key = (parameter or "").strip().lower()
+    if not key or key in ("file explorer", "explorer", "this pc"):
+        return {"success": _launch("explorer.exe"),
+                "message": "Opening File Explorer."}
+
+    name = _FOLDERS.get(key) or _FOLDERS.get(key.rstrip("s")) or \
+        _FOLDERS.get(key + "s")
+    if name:
+        path = os.path.join(os.path.expanduser("~"), name)
+        if not os.path.isdir(path):
+            return {"success": False, "message": f"I couldn't find your {name} folder."}
+        return {"success": _launch(path), "message": f"Opening {name}."}
+
+    expanded = os.path.expandvars(os.path.expanduser(parameter.strip()))
+    if os.path.isdir(expanded):
+        return {"success": _launch(expanded),
+                "message": f"Opening {os.path.basename(expanded) or expanded}."}
+    return {"success": False, "message": f"I couldn't find a folder called '{parameter}'."}
+
+
+def open_system_tool(parameter: str = "") -> dict:
+    """Task Manager, Control Panel, and the taskbar flyouts."""
+    key = (parameter or "").strip().lower()
+
+    if key in ("task manager", "taskmgr", "processes"):
+        return {"success": _launch("taskmgr.exe"), "message": "Opening Task Manager."}
+    if key in ("control panel", "controlpanel"):
+        return {"success": _launch("control.exe"), "message": "Opening Control Panel."}
+    if key in ("device manager", "devices"):
+        return {"success": _launch("devmgmt.msc"), "message": "Opening Device Manager."}
+
+    # Action center and the calendar flyout have no launchable target — they
+    # are shell surfaces opened by their reserved hotkeys (Win+A / Win+N).
+    if key in ("action center", "quick settings", "control center"):
+        return {"success": _send_win_key("a"), "message": "Opening Action Center."}
+    if key in ("notifications", "notification center", "notification centre"):
+        return {"success": _send_win_key("n"), "message": "Opening notifications."}
+    if key in ("calendar", "date", "clock", "time", "calendar flyout"):
+        # Win+N opens notifications WITH the calendar in Windows 11.
+        return {"success": _send_win_key("n"), "message": "Opening the calendar."}
+
+    return {"success": False, "message": f"I don't know the tool '{parameter}'."}
+
+
+def _send_win_key(letter: str) -> bool:
+    """Press Win+<letter> for shell surfaces that have no launch target."""
+    try:
+        import pyautogui
+        pyautogui.hotkey("win", letter)
+        return True
+    except Exception as e:
+        print(f"[SYS] win+{letter} failed: {e}")
+        return False
+
+
+def lock_pc(parameter: str = "") -> dict:
+    """Lock the workstation. Tier 1 — the user reverses it with their password."""
+    try:
+        ok = bool(ctypes.windll.user32.LockWorkStation())
+        return {"success": ok,
+                "message": "Locking your PC." if ok else "I couldn't lock the PC."}
+    except Exception as e:
+        return {"success": False, "message": f"I couldn't lock the PC: {e}"}
+
+
+# ── Tier 1: radio toggles ─────────────────────────────────────────────────────
+
+def _radio_powershell(kind: str, on: bool) -> tuple[bool, str]:
+    """Flip a radio via WinRT Radio API.
+
+    There is no supported plain-Win32 toggle, and netsh only handles adapters
+    (which disables the whole NIC rather than the radio, and needs admin).
+    """
+    state = "On" if on else "Off"
+    script = f"""
+    [Windows.Devices.Radios.Radio,Windows.System.Devices,ContentType=WindowsRuntime]|Out-Null
+    [Windows.Devices.Radios.RadioAccessStatus,Windows.System.Devices,ContentType=WindowsRuntime]|Out-Null
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    $task = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {{
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+        $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' }}
+    function Await($op, $t) {{
+        $m = $task.MakeGenericMethod($t)
+        $r = $m.Invoke($null, @($op)); $r.Wait(5000) | Out-Null; $r.Result
+    }}
+    Await ([Windows.Devices.Radios.Radio]::RequestAccessAsync()) ([Windows.Devices.Radios.RadioAccessStatus]) | Out-Null
+    $radios = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+    $target = $radios | Where-Object {{ $_.Kind -eq '{kind}' }}
+    if (-not $target) {{ Write-Output 'NORADIO'; exit }}
+    foreach ($r in $target) {{
+        Await ($r.SetStateAsync('{state}')) ([Windows.Devices.Radios.RadioAccessStatus]) | Out-Null
+    }}
+    Write-Output 'OK'
+    """
+    ok, out = _run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-Command", script], timeout=25.0)
+    return (ok and "OK" in out), out
+
+
+def _toggle_radio(kind: str, label: str, parameter: str) -> dict:
+    p = (parameter or "").strip().lower()
+    if p in ("on", "enable", "enabled", "turn on"):
+        want = True
+    elif p in ("off", "disable", "disabled", "turn off"):
+        want = False
+    else:
+        return {"success": False, "message": f"Should I turn {label} on or off?"}
+
+    ok, out = _radio_powershell(kind, want)
+    if ok:
+        return {"success": True, "message": f"{label} turned {'on' if want else 'off'}."}
+    if "NORADIO" in out:
+        return {"success": False, "message": f"I don't see a {label} radio on this PC."}
+    print(f"[SYS] {label} toggle failed: {out[:200]}")
+    # Falling back to the Settings page keeps the request useful instead of
+    # dead-ending: the user can flip the switch themselves in one tap.
+    _launch(f"ms-settings:{'network-wifi' if kind == 'WiFi' else 'bluetooth'}")
+    return {"success": False,
+            "message": f"I couldn't toggle {label} directly, so I opened {label} settings for you."}
+
+
+def toggle_wifi(parameter: str = "") -> dict:
+    return _toggle_radio("WiFi", "Wi-Fi", parameter)
+
+
+def toggle_bluetooth(parameter: str = "") -> dict:
+    return _toggle_radio("Bluetooth", "Bluetooth", parameter)
+
+
+# ── Tier 1: real performance query ────────────────────────────────────────────
+
+def _gb(n: float) -> float:
+    return round(n / (1024 ** 3), 1)
+
+
+def performance_stats(parameter: str = "") -> dict:
+    """Actual current CPU/RAM/disk numbers, spoken.
+
+    Reads them programmatically instead of opening Task Manager and leaving
+    the user to read the window themselves. 'speak' is set so the executor
+    reads these exact numbers aloud rather than pre-baked LLM text.
+    """
+    # A 0.6s sampling window: cpu_percent() with no interval returns a
+    # meaningless 0.0 on first call because it has no previous sample.
+    cpu = psutil.cpu_percent(interval=0.6)
+    mem = psutil.virtual_memory()
+    try:
+        disk = psutil.disk_usage(os.path.abspath(os.sep))
+    except Exception:
+        disk = None
+
+    want = (parameter or "").strip().lower()
+    parts = []
+    if not want or "cpu" in want or "processor" in want or "all" in want:
+        parts.append(f"CPU is at {cpu:.0f} percent")
+        try:
+            freq = psutil.cpu_freq()
+            if freq and freq.current:
+                parts[-1] += f" across {psutil.cpu_count(logical=True)} threads"
+        except Exception:
+            pass
+    if not want or any(k in want for k in ("ram", "memory", "mem", "all")):
+        parts.append(f"memory {_gb(mem.used)} of {_gb(mem.total)} gigabytes used, "
+                     f"{mem.percent:.0f} percent")
+    if disk and (not want or any(k in want for k in ("disk", "drive", "storage", "all"))):
+        parts.append(f"disk {_gb(disk.used)} of {_gb(disk.total)} gigabytes used, "
+                     f"{disk.percent:.0f} percent full")
+
+    if not parts:
+        parts.append(f"CPU {cpu:.0f} percent, memory {mem.percent:.0f} percent")
+
+    top = _top_processes(3)
+    message = ", ".join(parts) + "."
+    if top:
+        message += " Heaviest right now: " + ", ".join(top) + "."
+
+    print(f"[SYS] perf cpu={cpu} mem={mem.percent} "
+          f"disk={disk.percent if disk else 'n/a'}")
+    return {"success": True, "speak": True, "message": message,
+            "cpu_percent": cpu, "memory_percent": mem.percent,
+            "memory_used_gb": _gb(mem.used), "memory_total_gb": _gb(mem.total),
+            "disk_percent": disk.percent if disk else None}
+
+
+def _top_processes(limit: int = 3) -> list[str]:
+    """Top CPU consumers. Two-pass because the first cpu_percent() per process
+    always reads 0.0 — a single pass would rank everything at zero."""
+    try:
+        procs = list(psutil.process_iter(["name"]))
+        for p in procs:
+            try:
+                p.cpu_percent(None)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        time.sleep(0.4)
+        scored = []
+        cores = psutil.cpu_count(logical=True) or 1
+        for p in procs:
+            try:
+                pct = p.cpu_percent(None) / cores
+                name = (p.info.get("name") or "").replace(".exe", "")
+                if name and pct >= 1.0:
+                    scored.append((pct, name))
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        scored.sort(reverse=True)
+        merged: dict[str, float] = {}
+        for pct, name in scored:
+            merged[name] = merged.get(name, 0.0) + pct
+        ranked = sorted(merged.items(), key=lambda kv: kv[1], reverse=True)
+        return [f"{n} at {v:.0f} percent" for n, v in ranked[:limit]]
+    except Exception as e:
+        print(f"[SYS] top processes failed: {e}")
+        return []
+
+
+# ── Tier 2: cleanup (confirmation-gated by sensei's safety net) ───────────────
+
+def _temp_targets() -> list[str]:
+    """ONLY known-safe OS temp locations. Deliberately excludes every user
+    document/media folder — a vague "clean my PC" must never reach them."""
+    win = os.environ.get("SystemRoot", r"C:\Windows")
+    cands = [os.environ.get("TEMP") or os.path.join(os.path.expanduser("~"),
+             "AppData", "Local", "Temp"),
+             os.path.join(win, "Temp"),
+             os.path.join(win, "Prefetch")]
+    return [p for p in cands if p and os.path.isdir(p)]
+
+
+def _dir_size(path: str, cap: int = 20000) -> tuple[int, int]:
+    """(bytes, file_count), scanning at most `cap` files so a huge temp tree
+    can't stall the voice loop."""
+    total = files = 0
+    try:
+        for root, _dirs, names in os.walk(path):
+            for n in names:
+                try:
+                    total += os.path.getsize(os.path.join(root, n))
+                    files += 1
+                except OSError:
+                    continue
+                if files >= cap:
+                    return total, files
+    except Exception:
+        pass
+    return total, files
+
+
+def preview_temp_cleanup(parameter: str = "") -> dict:
+    """What clear_temp_files WOULD delete. Used to build an honest
+    confirmation message with real folders and a real size."""
+    targets = _temp_targets()
+    if not targets:
+        return {"success": False, "message": "I couldn't find any temp folders."}
+    total = files = 0
+    lines = []
+    for t in targets:
+        b, f = _dir_size(t)
+        total += b
+        files += f
+        lines.append(f"{t} ({_gb(b)} GB, {f} files)")
+    print(f"[SYS] temp preview: {lines}")
+    return {"success": True, "speak": True, "targets": targets,
+            "bytes": total, "files": files,
+            "message": (f"I'd clear {files} files, about {_gb(total)} gigabytes, "
+                        f"from {len(targets)} temp folders: "
+                        + "; ".join(os.path.basename(t.rstrip('\\/')) or t
+                                    for t in targets) + ".")}
+
+
+def clear_temp_files(parameter: str = "") -> dict:
+    """Delete contents of OS temp folders only. Locked/in-use files are
+    skipped rather than fought over — that is normal, not a failure."""
+    targets = _temp_targets()
+    if not targets:
+        return {"success": False, "message": "I couldn't find any temp folders."}
+
+    removed = freed = skipped = 0
+    for t in targets:
+        for name in os.listdir(t):
+            path = os.path.join(t, name)
+            try:
+                size = os.path.getsize(path) if os.path.isfile(path) else 0
+                if os.path.isdir(path) and not os.path.islink(path):
+                    size, _ = _dir_size(path)
+                    shutil.rmtree(path, ignore_errors=False)
+                else:
+                    os.remove(path)
+                removed += 1
+                freed += size
+            except Exception:
+                skipped += 1
+
+    msg = f"Cleared {removed} items, freeing about {_gb(freed)} gigabytes."
+    if skipped:
+        msg += f" {skipped} were in use and left alone."
+    print(f"[SYS] temp cleanup removed={removed} skipped={skipped} freed={freed}")
+    return {"success": True, "speak": True, "message": msg}
+
+
+def empty_recycle_bin(parameter: str = "") -> dict:
+    """SHEmptyRecycleBin with NOCONFIRMATION|NOPROGRESSUI|NOSOUND, since the
+    spoken confirmation already happened upstream."""
+    try:
+        flags = 0x1 | 0x2 | 0x4
+        res = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, flags)
+        # 0 = emptied, 0x80070091 = already empty (not an error worth reporting)
+        if res == 0:
+            return {"success": True, "message": "Recycle Bin emptied."}
+        if res in (0x80070091, -2147024751):
+            return {"success": True, "message": "The Recycle Bin was already empty."}
+        return {"success": False, "message": f"I couldn't empty the Recycle Bin (code {res})."}
+    except Exception as e:
+        return {"success": False, "message": f"I couldn't empty the Recycle Bin: {e}"}
+
+
+def run_disk_cleanup(parameter: str = "") -> dict:
+    """Launch the built-in cleanmgr rather than reimplementing its rules —
+    Windows already knows what is safe to delete."""
+    ok = _launch("cleanmgr.exe")
+    return {"success": ok,
+            "message": "Opening Disk Cleanup — pick the drive and it'll do the rest."
+                       if ok else "I couldn't start Disk Cleanup."}
+
+
+def clear_browser_cache(parameter: str = "") -> dict:
+    """Clear cache for the browser Sensei drives, via its own settings page.
+
+    Deliberately does NOT delete profile files directly: a running browser
+    holds them locked, and wiping the wrong profile directory would take
+    logins and sessions with it. Opening the native dialog keeps the user in
+    control of scope.
+    """
+    # Read the attribute off the module, not `from executor import ...` — the
+    # latter binds a COPY at call time and would miss a later browser switch.
+    import executor
+    name = (parameter or getattr(executor, "_last_browser_name", None)
+            or "chrome").strip().lower()
+    pages = {
+        "chrome": "chrome://settings/clearBrowserData",
+        "edge": "edge://settings/clearBrowserData",
+        "brave": "brave://settings/clearBrowserData",
+        "firefox": "about:preferences#privacy",
+    }
+    url = pages.get(name)
+    if not url:
+        return {"success": False,
+                "message": f"I don't know how to clear cache for '{name}'."}
+    try:
+        browser = executor.get_browser(name)
+        browser.execute_script("window.open(arguments[0], '_blank');", url)
+        return {"success": True,
+                "message": f"Opened {name.title()}'s clear-data dialog — "
+                           f"choose the range and confirm there."}
+    except Exception as e:
+        print(f"[SYS] browser cache page failed: {e}")
+        return {"success": False,
+                "message": f"I couldn't open {name.title()}'s clear-data page."}
+
+
+# ── Tier 2: power state ───────────────────────────────────────────────────────
+
+def hibernate_available() -> bool:
+    """HiberFilePresent from SYSTEM_POWER_CAPABILITIES.
+
+    Hibernate is disabled by default on many machines, so this is checked
+    BEFORE claiming to hibernate — 'shutdown /h' fails silently otherwise.
+    """
+    try:
+        # SYSTEM_POWER_CAPABILITIES is a large BOOLEAN-heavy struct; only the
+        # HiberFilePresent byte (offset 6) is needed here.
+        buf = ctypes.create_string_buffer(64)
+        # SystemPowerCapabilities = 4
+        rc = ctypes.windll.powrprof.CallNtPowerInformation(
+            4, None, 0, buf, ctypes.sizeof(buf))
+        if rc != 0:
+            print(f"[SYS] CallNtPowerInformation rc={rc}")
+            return False
+        return bool(buf.raw[6])
+    except Exception as e:
+        print(f"[SYS] hibernate check failed: {e}")
+        return False
+
+
+def sleep_pc(parameter: str = "") -> dict:
+    """Sleep via Application.SetSuspendState(Suspend).
+
+    powrprof's SetSuspendState(bHibernate=FALSE) HIBERNATES anyway whenever
+    hibernation is enabled, so it cannot be used for a real sleep. The
+    WinForms call maps to the correct S3 transition.
+    """
+    ok, out = _run(["powershell", "-NoProfile", "-Command",
+                    "Add-Type -AssemblyName System.Windows.Forms; "
+                    "[System.Windows.Forms.Application]::SetSuspendState("
+                    "[System.Windows.Forms.PowerState]::Suspend, $false, $false)"],
+                   timeout=15.0)
+    if ok:
+        return {"success": True, "message": "Going to sleep."}
+    print(f"[SYS] sleep failed: {out[:200]}")
+    return {"success": False, "message": "I couldn't put the PC to sleep."}
+
+
+def hibernate_pc(parameter: str = "") -> dict:
+    """Hibernate, but only after confirming it is actually enabled."""
+    if not hibernate_available():
+        return {"success": False,
+                "message": "Hibernate is turned off on this PC, so I can't use it. "
+                           "I can sleep or shut down instead."}
+    ok, out = _run(["shutdown", "/h"], timeout=15.0)
+    if ok:
+        return {"success": True, "message": "Hibernating."}
+    print(f"[SYS] hibernate failed: {out[:200]}")
+    return {"success": False, "message": "I couldn't hibernate this PC."}
+
+
+def sign_out(parameter: str = "") -> dict:
+    """ExitWindowsEx(EWX_LOGOFF). Not forced, so apps can still veto with
+    unsaved work — which is the safer default for a voice command."""
+    try:
+        ok = bool(ctypes.windll.user32.ExitWindowsEx(0, 0))
+        if ok:
+            return {"success": True, "message": "Signing you out."}
+        err = ctypes.windll.kernel32.GetLastError()
+        print(f"[SYS] ExitWindowsEx failed err={err}")
+        return {"success": False, "message": "I couldn't sign you out."}
+    except Exception as e:
+        return {"success": False, "message": f"I couldn't sign you out: {e}"}
+
+
+def shutdown_pc(parameter: str = "") -> dict:
+    ok, out = _run(["shutdown", "/s", "/t", "0"], timeout=15.0)
+    if not ok:
+        print(f"[SYS] shutdown failed: {out[:200]}")
+    return {"success": ok,
+            "message": "Shutting down." if ok else "I couldn't shut down."}
+
+
+def restart_pc(parameter: str = "") -> dict:
+    ok, out = _run(["shutdown", "/r", "/t", "0"], timeout=15.0)
+    if not ok:
+        print(f"[SYS] restart failed: {out[:200]}")
+    return {"success": ok,
+            "message": "Restarting." if ok else "I couldn't restart."}
+
+
+# ── Dispatch ──────────────────────────────────────────────────────────────────
+
+# Exported so executor's _ACTION_MAP and sensei's DANGEROUS_ACTIONS stay in
+# sync from ONE definition instead of three hand-maintained lists.
+TIER1_ACTIONS = {
+    "open_settings":      open_settings,
+    "open_folder":        open_folder,
+    "open_system_tool":   open_system_tool,
+    "toggle_wifi":        toggle_wifi,
+    "toggle_bluetooth":   toggle_bluetooth,
+    "lock_pc":            lock_pc,
+    "performance_stats":  performance_stats,
+}
+
+TIER2_ACTIONS = {
+    "clear_temp_files":     clear_temp_files,
+    "empty_recycle_bin":    empty_recycle_bin,
+    "clear_browser_cache":  clear_browser_cache,
+    "run_disk_cleanup":     run_disk_cleanup,
+    "sleep_pc":             sleep_pc,
+    "hibernate_pc":         hibernate_pc,
+    "sign_out":             sign_out,
+    "shutdown_pc":          shutdown_pc,
+    "restart_pc":           restart_pc,
+}
+
+ACTIONS = {**TIER1_ACTIONS, **TIER2_ACTIONS,
+           "preview_temp_cleanup": preview_temp_cleanup}

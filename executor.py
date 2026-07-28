@@ -37,6 +37,7 @@ from selenium.webdriver.firefox.options import Options as FirefoxOptions
 from pycaw.pycaw import AudioUtilities
 
 import image_flow
+import system_control as _system_control
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -266,6 +267,309 @@ def _ensure_akira_tab(driver) -> None:
         time.sleep(0.3)
 
 
+# ── Tab targeting & user activation ───────────────────────────────────────────
+#
+# ONE implementation of "make sure I am driving the right tab", replacing the
+# ad-hoc `switch_to.window(browser._akira_tab)` that was copy-pasted across the
+# control functions (each with its own silent `except: pass`, so a stale handle
+# produced commands executed against the wrong page while still reporting
+# success).
+#
+# Policy: never steal OS focus for ordinary DOM work. Only the handful of
+# actions the BROWSER itself refuses without user activation (fullscreen,
+# keyboard shortcuts) go through _with_user_activation.
+
+# Virtual key codes for the shortcuts we actually send. Chrome ignores
+# dispatchKeyEvent without a correct windowsVirtualKeyCode for non-text keys.
+_VK_CODES = {
+    'f': (0x46, 'KeyF', 'f'), 'm': (0x4D, 'KeyM', 'm'),
+    's': (0x53, 'KeyS', 's'), 't': (0x54, 'KeyT', 't'),
+    'c': (0x43, 'KeyC', 'c'), 'k': (0x4B, 'KeyK', 'k'),
+    'j': (0x4A, 'KeyJ', 'j'), 'l': (0x4C, 'KeyL', 'l'),
+    ' ': (0x20, 'Space', ' '),
+    'escape': (0x1B, 'Escape', ''), 'esc': (0x1B, 'Escape', ''),
+    'enter': (0x0D, 'Enter', '\r'),
+    'left': (0x25, 'ArrowLeft', ''), 'up': (0x26, 'ArrowUp', ''),
+    'right': (0x27, 'ArrowRight', ''), 'down': (0x28, 'ArrowDown', ''),
+}
+
+
+def _ensure_target_tab(browser) -> str | None:
+    """Point the driver at Akira's working tab and RETURN its url.
+
+    Re-resolves through _ensure_akira_tab when the stored handle has died, so
+    a closed tab degrades to "adopt/create another" instead of executing the
+    command against whatever tab happened to be active."""
+    try:
+        handles = browser.window_handles
+    except Exception as e:
+        print(f"[FOCUS] driver unreachable: {e}")
+        return None
+
+    target = getattr(browser, "_akira_tab", None)
+    if not target or target not in handles:
+        print(f"[FOCUS] stored tab {target!r} is stale — re-resolving")
+        try:
+            _ensure_akira_tab(browser)
+            target = getattr(browser, "_akira_tab", None)
+        except Exception as e:
+            print(f"[FOCUS] re-resolve failed: {e}")
+            target = None
+    if not target:
+        return None
+
+    try:
+        if browser.current_window_handle != target:
+            browser.switch_to.window(target)
+    except Exception:
+        try:
+            browser.switch_to.window(target)
+        except Exception as e:
+            print(f"[FOCUS] switch failed: {e}")
+            return None
+
+    try:
+        url = browser.current_url or ""
+    except Exception:
+        url = ""
+    print(f"[FOCUS] tab={target} url={url[:80]}")
+    return url
+
+
+def _activate_tab(browser) -> bool:
+    """Make the working tab the ACTIVE tab inside its own window.
+
+    Does not raise the window above other applications — a background tab
+    cannot receive key events or enter fullscreen, but foregrounding the whole
+    browser over the user's editor is a separate, more invasive step."""
+    ok = False
+    try:
+        browser.execute_cdp_cmd("Page.bringToFront", {})
+        ok = True
+    except Exception as e:
+        print(f"[FOCUS] bringToFront failed: {e}")
+    return ok
+
+
+def _browser_hwnd(browser) -> int | None:
+    """Top-level window handle of the browser showing our working tab.
+
+    Matched by the page TITLE rather than by pid: the pid on
+    driver.service.process is chromedriver's, not the browser's (the browser is
+    launched separately by _attach_cdp and merely attached to over CDP), so a
+    pid comparison would never match. The current tab's title is in the window
+    caption, which is a signal we actually have."""
+    try:
+        page_title = (browser.title or "").strip()
+    except Exception:
+        page_title = ""
+
+    candidates: list[int] = []
+    titled: list[int] = []
+
+    def _cb(hwnd, _):
+        try:
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            cls = win32gui.GetClassName(hwnd) or ""
+            title = win32gui.GetWindowText(hwnd) or ""
+            if "Chrome_WidgetWin" not in cls or not title:
+                return
+            candidates.append(hwnd)
+            if page_title and page_title[:40] in title:
+                titled.append(hwnd)
+        except Exception:
+            return
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception as e:
+        print(f"[FOCUS] EnumWindows failed: {e}")
+        return None
+    if titled:
+        return titled[0]
+    return candidates[0] if candidates else None
+
+
+def _is_browser_foreground(browser) -> bool:
+    """True when a browser window is the OS foreground window. Logged on every
+    activation attempt because "the click went to VS Code" is exactly the class
+    of bug this tells us about."""
+    try:
+        fg = win32gui.GetForegroundWindow()
+        cls = win32gui.GetClassName(fg) or ""
+        title = win32gui.GetWindowText(fg) or ""
+    except Exception:
+        return False
+    is_browser = "Chrome_WidgetWin" in cls
+    print(f"[FOCUS] foreground='{title[:40]}' class={cls} browser={is_browser}")
+    return is_browser
+
+
+def _with_user_activation(browser) -> bool:
+    """The ONLY path that raises the browser window over other apps.
+
+    Reserved for actions the browser refuses without a transient user
+    activation: requestFullscreen() and site keyboard shortcuts. Everything
+    else must use _ensure_target_tab/_activate_tab and leave focus alone."""
+    _activate_tab(browser)
+    if _is_browser_foreground(browser):
+        return True
+    hwnd = _browser_hwnd(browser)
+    if not hwnd:
+        print("[FOCUS] no browser hwnd found — cannot grant user activation")
+        return False
+    try:
+        win32gui.ShowWindow(hwnd, 5)          # SW_SHOW
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.25)
+        print(f"[FOCUS] raised browser hwnd={hwnd}")
+        return _is_browser_foreground(browser)
+    except Exception as e:
+        # SetForegroundWindow legitimately fails when the OS denies the
+        # foreground lock; report it rather than pretending the key landed.
+        print(f"[FOCUS] SetForegroundWindow failed: {e}")
+        return False
+
+
+def _send_trusted_key(browser, key: str, hold: float = 0.03) -> bool:
+    """Dispatch a key through CDP so it counts as REAL user input.
+
+    A JS `.click()` or send_keys on <body> is untrusted: `event.isTrusted` is
+    false and no user-activation window opens, so YouTube's/Netflix's handlers
+    for fullscreen silently no-op. Input.dispatchKeyEvent goes in at the
+    browser level and does carry activation."""
+    k = (key or '').lower()
+    vk, code, text = _VK_CODES.get(k, (0, '', key))
+    key_name = {'escape': 'Escape', 'esc': 'Escape', 'enter': 'Enter',
+                ' ': ' ', 'left': 'ArrowLeft', 'right': 'ArrowRight',
+                'up': 'ArrowUp', 'down': 'ArrowDown'}.get(k, key)
+    try:
+        down = {"type": "keyDown", "key": key_name, "code": code,
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+        if text:
+            down["text"] = text
+        browser.execute_cdp_cmd("Input.dispatchKeyEvent", down)
+        time.sleep(hold)
+        browser.execute_cdp_cmd("Input.dispatchKeyEvent", {
+            "type": "keyUp", "key": key_name, "code": code,
+            "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
+        print(f"[FOCUS] sent trusted key {key_name!r}")
+        return True
+    except Exception as e:
+        print(f"[FOCUS] trusted key {key!r} failed: {e}")
+        return False
+
+
+def _send_trusted_click(browser, selector: str) -> bool:
+    """Trusted mouse press/release at an element's centre, for controls that
+    (like fullscreen) require activation rather than a synthetic click."""
+    try:
+        box = browser.execute_script("""
+            const el = document.querySelector(arguments[0]);
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) return null;
+            return {x: r.left + r.width / 2, y: r.top + r.height / 2};
+        """, selector)
+    except Exception as e:
+        print(f"[FOCUS] trusted click probe failed: {e}")
+        return False
+    if not box:
+        print(f"[FOCUS] no element for trusted click: {selector}")
+        return False
+    try:
+        for kind in ("mousePressed", "mouseReleased"):
+            browser.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": kind, "x": box["x"], "y": box["y"],
+                "button": "left", "clickCount": 1})
+            time.sleep(0.02)
+        print(f"[FOCUS] trusted click at ({box['x']:.0f},{box['y']:.0f}) {selector}")
+        return True
+    except Exception as e:
+        print(f"[FOCUS] trusted click failed: {e}")
+        return False
+
+
+def _await_state(check, timeout: float = 2.0, interval: float = 0.1) -> bool:
+    """Poll a predicate until it holds. The single verify primitive shared by
+    fullscreen and seek — both settle asynchronously, so checking once
+    immediately after dispatch reports failure on a change that did land."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if check():
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    return False
+
+
+def _fullscreen_on(browser) -> bool:
+    try:
+        return bool(browser.execute_script(
+            "return !!(document.fullscreenElement || "
+            "document.webkitFullscreenElement);"))
+    except Exception:
+        return False
+
+
+def _set_fullscreen(browser, enter: bool, selectors: list[str],
+                    key: str | None = None) -> bool:
+    """Enter/exit fullscreen, then VERIFY document.fullscreenElement really
+    changed before the caller reports success.
+
+    requestFullscreen() requires a transient user activation, so a synthetic
+    .click() silently no-ops — that is why this goes through
+    _with_user_activation plus trusted input rather than JS clicks."""
+    if _fullscreen_on(browser) == enter:
+        print(f"[MEDIA] fullscreen already {'on' if enter else 'off'}")
+        return True
+    _with_user_activation(browser)
+    for sel in selectors:
+        if _send_trusted_click(browser, sel) and \
+                _await_state(lambda: _fullscreen_on(browser) == enter):
+            print(f"[MEDIA] fullscreen={enter} verified via {sel}")
+            return True
+    if key and _send_trusted_key(browser, key) and \
+            _await_state(lambda: _fullscreen_on(browser) == enter):
+        print(f"[MEDIA] fullscreen={enter} verified via key {key!r}")
+        return True
+    print(f"[MEDIA] fullscreen={enter} NOT verified — reporting failure")
+    return False
+
+
+def _video_time(browser) -> float | None:
+    try:
+        return browser.execute_script(
+            "const v = document.querySelector('video');"
+            "return v ? v.currentTime : null;")
+    except Exception:
+        return None
+
+
+def _verify_seek(browser, before: float | None, expect_delta: float) -> bool:
+    """Confirm currentTime actually moved in the intended direction by at
+    least half the requested amount (playback drift makes exact equality
+    unreliable), instead of assuming a dispatched key seeked."""
+    if before is None:
+        return False
+    need = abs(expect_delta) / 2.0
+
+    def moved():
+        now = _video_time(browser)
+        if now is None:
+            return False
+        shift = now - before
+        return shift >= need if expect_delta > 0 else shift <= -need
+
+    ok = _await_state(moved, timeout=3.0)
+    print(f"[MEDIA] seek {expect_delta:+.0f}s from {before:.1f} "
+          f"-> {_video_time(browser)} verified={ok}")
+    return ok
+
+
 def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
     binary_name = os.path.basename(binary_path).lower()
     if not _port_ready(port):
@@ -414,6 +718,66 @@ def _navigate(url: str) -> None:
     browser.get(url)
 
 
+_NAV_ALIASES = {
+    'back': 'back', 'go back': 'back', 'back button': 'back',
+    'previous page': 'back', 'go back a page': 'back',
+    'forward': 'forward', 'go forward': 'forward',
+    'forward button': 'forward', 'next page': 'forward',
+    'reload': 'reload', 'refresh': 'reload', 'reload page': 'reload',
+    'refresh page': 'reload', 'refresh the page': 'reload',
+    'reload the page': 'reload',
+}
+
+
+def browser_control(parameter: str) -> dict:
+    """Real browser history navigation: back / forward / reload.
+
+    Exists because there was previously NO nav handler at all, so "go back"
+    fell through to the click pipeline, missed in the DOM, and hit the
+    coordinate-guessing fallback — which once clicked the editor instead of
+    the browser. History navigation is never a DOM hunt.
+
+    Uses _ensure_target_tab (not _with_user_activation): navigation needs the
+    right TAB, not OS foreground, so this never steals focus from the user.
+    Verifies the URL actually changed before reporting success."""
+    key = (parameter or 'back').strip().lower()
+    op = _NAV_ALIASES.get(key)
+    if not op:
+        op = next((v for k, v in _NAV_ALIASES.items() if k in key), None)
+    if not op:
+        return {"success": False, "message": f"I don't know how to '{parameter}'."}
+
+    browser = get_browser(_last_browser_name)
+    before = _ensure_target_tab(browser)
+    if before is None:
+        return {"success": False, "message": "I couldn't reach a browser tab."}
+
+    try:
+        getattr(browser, {'back': 'back', 'forward': 'forward',
+                          'reload': 'refresh'}[op])()
+    except Exception as e:
+        print(f"[NAV] {op} failed: {e}")
+        return {"success": False, "message": f"Couldn't go {op}: {e}"}
+
+    # A reload lands on the SAME url, so settle on readyState instead.
+    if op == 'reload':
+        ok = _await_state(lambda: browser.execute_script(
+            "return document.readyState") == "complete", timeout=8.0)
+        print(f"[NAV] reload complete={ok} url={before[:60]}")
+        return {"success": ok,
+                "message": "Reloaded." if ok else "The page is still loading."}
+
+    changed = _await_state(
+        lambda: (browser.current_url or "") != before, timeout=5.0)
+    after = browser.current_url if changed else before
+    print(f"[NAV] {op}: {before[:50]} -> {after[:50]} changed={changed}")
+    if not changed:
+        end = "the start of" if op == 'back' else "the end of"
+        return {"success": False,
+                "message": f"Nothing to go {op} to — this is {end} the history."}
+    return {"success": True, "message": f"Went {op}."}
+
+
 def get_current_site(driver) -> str | None:
     try:
         domain = urllib.parse.urlparse(driver.current_url).netloc.replace("www.", "")
@@ -483,38 +847,28 @@ def get_all_tabs() -> list[dict]:
 from dom_extract import extract_interactive_elements, probe_element
 
 
-# ── Vision click ──────────────────────────────────────────────────────────────
+# ── No-match reporting ────────────────────────────────────────────────────────
 
-_vision_call_count = 0
+def _no_match_report(instruction: str, elements: list[dict], limit: int = 6) -> str:
+    """Honest failure for a DOM/structural miss: say so and list what IS here.
 
-def vision_click(browser, instruction: str) -> bool:
-    """Screenshot → Sonnet vision → JS click at coordinates. Returns success bool."""
-    global _vision_call_count
-    _vision_call_count += 1
-    print(f"[COST] vision_click call #{_vision_call_count} — instruction: '{instruction}'")
-    path = os.path.join(_screenshot_dir, f"akira_v_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
-    img = ImageGrab.grab()
-    if img.width > 1280:
-        ratio = 1280 / img.width
-        img = img.resize((1280, int(img.height * ratio)))
-    img.save(path)
-    try:
-        from claude_handler import vision_match
-        coords = vision_match(path, instruction)
-    finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
-
-    if not coords:
-        print(f"[DEBUG] vision_click: no match for '{instruction}'")
-        return False
-
-    x, y = coords
-    browser.execute_script(f"document.elementFromPoint({x},{y})?.click();")
-    print(f"[DEBUG] vision_click: clicked at ({x},{y}) for '{instruction}'")
-    return True
+    This replaces the old screenshot-and-guess-coordinates fallback, which
+    clicked whatever window happened to hold OS focus (it once hit the editor
+    instead of the browser). A miss is now reported, never guessed."""
+    print(f"[CLICK] no match for '{instruction}' — reporting candidates")
+    seen, names = set(), []
+    for el in elements:
+        text = (el.get('text') or '').strip()
+        if not text or text.lower() in seen or len(text) < 2:
+            continue
+        seen.add(text.lower())
+        names.append(text[:40])
+        if len(names) >= limit:
+            break
+    if not names:
+        return f"I couldn't find '{instruction}', and I don't see anything clickable on this page."
+    return (f"I couldn't find '{instruction}' on this page. "
+            f"I can see: {', '.join(names)}.")
 
 
 # ── Atomic click ──────────────────────────────────────────────────────────────
@@ -562,7 +916,8 @@ def click_element(driver, index: int, expected_text: str | None = None,
                   elements: list | None = None) -> dict:
     """
     Click element at index. Validates staleness, checks RISKY_KEYWORDS.
-    No vision fallback here - that's handled by caller.
+    A miss returns a failure for the caller to report — there is no
+    coordinate-guessing fallback anywhere in the click path.
 
     Staleness is checked with an O(1) single-node probe first — the old
     unconditional full-page re-extraction between match and click doubled
@@ -691,19 +1046,38 @@ def youtube_control(parameter: str) -> str:
         return "Video unmuted."
 
     if param in ("fullscreen", "full screen"):
-        browser.execute_script("document.querySelector('.ytp-fullscreen-button')?.click();")
-        return "Fullscreen."
+        # requestFullscreen() needs a real user activation, so the old
+        # synthetic .click() no-oped while still reporting "Fullscreen."
+        ok = _set_fullscreen(browser, True, ['.ytp-fullscreen-button'], key="f")
+        return "Fullscreen." if ok else \
+               "I pressed fullscreen but the player didn't enter it."
 
     if param in ("theatre mode", "theater mode", "theatre", "theater"):
-        browser.execute_script("document.querySelector('.ytp-size-button')?.click();")
-        return "Theatre mode."
+        # Theatre is a YouTube-side layout class, not the fullscreen API —
+        # verify the player's theater flag actually flipped.
+        def _theater():
+            return bool(browser.execute_script(
+                "const w = document.querySelector('ytd-watch-flexy');"
+                "return w ? w.hasAttribute('theater') : null;"))
+        if _theater():
+            return "Already in theatre mode."
+        _with_user_activation(browser)
+        _send_trusted_click(browser, '.ytp-size-button')
+        ok = _await_state(_theater)
+        return "Theatre mode." if ok else "I couldn't switch to theatre mode."
 
     if param in ("default view", "exit fullscreen", "exit theatre", "exit theater"):
-        browser.execute_script("""
-            if (document.fullscreenElement) document.exitFullscreen();
-            else document.querySelector('.ytp-size-button')?.click();
-        """)
-        return "Default view."
+        if _fullscreen_on(browser):
+            ok = _set_fullscreen(browser, False, ['.ytp-fullscreen-button'],
+                                 key="escape")
+            return "Default view." if ok else \
+                   "I couldn't get out of fullscreen."
+        _with_user_activation(browser)
+        _send_trusted_click(browser, '.ytp-size-button')
+        ok = _await_state(lambda: not browser.execute_script(
+            "const w = document.querySelector('ytd-watch-flexy');"
+            "return w ? w.hasAttribute('theater') : false;"))
+        return "Default view." if ok else "I couldn't restore the default view."
 
     if param.startswith("speed "):
         speeds = {"0.25": 0.25, "0.5": 0.5, "0.75": 0.75, "normal": 1, "1": 1,
@@ -733,18 +1107,23 @@ def youtube_control(parameter: str) -> str:
     if param.startswith("seek "):
         try:
             seconds = int(param.replace("seek", "").replace("s", "").strip())
-            browser.execute_script(f"var v=document.querySelector('video'); if(v) v.currentTime+={seconds};")
-            return f"Seeked {seconds}s."
         except ValueError:
             return "Give me seconds to seek."
+        before = _video_time(browser)
+        if before is None:
+            return "There's no video on this page to seek."
+        browser.execute_script(
+            "const v = document.querySelector('video');"
+            "if (v) v.currentTime += arguments[0];", seconds)
+        # Verify currentTime really moved: a live stream or an unbuffered
+        # region silently refuses the assignment.
+        if _verify_seek(browser, before, seconds):
+            return f"Seeked {seconds}s."
+        return "I couldn't seek this video."
 
-    if param == "go back":
-        browser.back()
-        return "Going back."
-
-    if param == "go forward":
-        browser.forward()
-        return "Going forward."
+    # Nav goes through the one history-navigation implementation.
+    if param in ("go back", "go forward"):
+        return browser_control(param)["message"]
 
     if param.startswith("search "):
         query = urllib.parse.quote(param.replace("search", "").strip())
@@ -754,13 +1133,24 @@ def youtube_control(parameter: str) -> str:
     if param.startswith("go to channel"):
         channel = param.replace("go to channel", "").strip()
         if not channel:
-            vision_click(browser, "channel name link below the video title")
-            return "Going to channel."
+            # The channel link under a watch-page title is a stable element —
+            # no reason to guess at screen coordinates for it.
+            clicked = browser.execute_script("""
+                for (const q of ['ytd-video-owner-renderer a[href]',
+                                 '#owner #channel-name a[href]',
+                                 'ytd-channel-name a[href]']) {
+                    const el = document.querySelector(q);
+                    if (el) { el.click(); return true; }
+                }
+                return false;
+            """)
+            return "Going to channel." if clicked else \
+                   "I can't see a channel link on this page."
         query = urllib.parse.quote(channel)
         browser.execute_script(f"window.location.href='https://www.youtube.com/results?search_query={query}+channel';")
         return f"Searching for {channel}'s channel."
 
-    # ── Group B: play video — DOM matching, NO vision ─────────────────────────
+    # ── Group B: play video — DOM matching only ───────────────────────────────
 
     if param.startswith("play video") or param.startswith("click video"):
         description = param.replace("play video", "").replace("click video", "").strip()
@@ -787,7 +1177,7 @@ def youtube_control(parameter: str) -> str:
 
     # ── Group C: common controls — DOM matching only ─────────────────────
 
-    # Map common commands to DOM selectors (no vision needed)
+    # Map common commands to DOM selectors
     simple_actions = {
         "like": ".ytp-like-button, button[aria-label*='like' i]",
         "dislike": ".ytp-dislike-button, button[aria-label*='dislike' i]",
@@ -899,17 +1289,6 @@ def _nfx_click_first(browser, selectors: list) -> str | None:
         """, selectors)
     except Exception:
         return None
-
-
-def _nfx_press_key(browser, key: str) -> bool:
-    """Send a real keyboard shortcut to the page (Netflix player supports:
-    space=play/pause, f=fullscreen, esc=exit, m=mute, s=skip intro,
-    left/right arrows=seek 10s, up/down=volume)."""
-    try:
-        browser.find_element(By.TAG_NAME, "body").send_keys(key)
-        return True
-    except Exception:
-        return False
 
 
 def _nfx_parse_seconds(text: str) -> int | None:
@@ -1101,6 +1480,9 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
       episodes|Episode 5
       back to browse
 
+    PROFILES:
+      switch profile|name     -> delegates to structural_ui (fuzzy name match)
+
     Returns {'success': bool, 'message': str}.
     """
     print(f"[netflix_control] called with action={action!r}, parameter={parameter!r}")
@@ -1122,6 +1504,13 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
 
     action = (action or "").strip().lower().replace("_", " ")
     on_watch_page = "/watch/" in current_url
+
+    # ── PROFILES ────────────────────────────────────────────────────────────
+    # Delegated so profile picking has ONE implementation (fuzzy name match
+    # over structurally-extracted profiles) shared with the generic click path.
+    if action in ("switch profile", "change profile", "profile"):
+        from structural_ui import resolve_structural
+        return resolve_structural(browser, ('profile', (parameter or "").strip()))
 
     # ── BROWSE / SEARCH actions (navigate, so they work from any page) ──────
     if action == "search":
@@ -1200,8 +1589,17 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
         if ok:
             return {"success": True, "message": f"{'Paused' if op == 'pause' else 'Playing'}."}
         # keyboard fallback (space toggles play/pause on the watch page)
-        if on_watch_page and _nfx_press_key(browser, " "):
-            return {"success": True, "message": f"Toggled playback."}
+        # Space toggles play/pause on the watch page; verify the paused state
+        # actually flipped rather than trusting the dispatch.
+        if on_watch_page:
+            was = browser.execute_script(
+                "const v = document.querySelector('video');"
+                "return v ? v.paused : null;")
+            if _send_trusted_key(browser, " ") and was is not None and \
+                    _await_state(lambda: browser.execute_script(
+                        "const v = document.querySelector('video');"
+                        "return v ? v.paused : null;") is not was):
+                return {"success": True, "message": "Toggled playback."}
         return {"success": False, "message": "No video is playing right now."}
 
     if action in ("mute", "unmute"):
@@ -1329,27 +1727,24 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     # ── PLAYER UI actions (stable data-uia selectors + keyboard fallback) ───
     if action == "fullscreen":
         _nfx_reveal_controls(browser)
-        if _nfx_click_first(browser, [
+        ok = _set_fullscreen(browser, True, [
             '[data-uia="control-fullscreen-enter"]',
             'button[aria-label="Full screen"]',
             'button[aria-label="Fullscreen"]',
-        ]):
-            return {"success": True, "message": "Fullscreen on."}
-        # F key is Netflix's fullscreen shortcut and carries user activation
-        if _nfx_press_key(browser, "f"):
-            return {"success": True, "message": "Fullscreen on."}
-        return {"success": False, "message": "Couldn't enter fullscreen."}
+        ], key="f")
+        return {"success": ok,
+                "message": "Fullscreen on." if ok else
+                           "I pressed fullscreen but the player didn't enter it."}
 
     if action == "exit fullscreen":
         _nfx_reveal_controls(browser)
-        if _nfx_click_first(browser, [
+        ok = _set_fullscreen(browser, False, [
             '[data-uia="control-fullscreen-exit"]',
             'button[aria-label="Exit full screen"]',
-        ]):
-            return {"success": True, "message": "Exited fullscreen."}
-        if _nfx_press_key(browser, "\ue00c"):  # ESC
-            return {"success": True, "message": "Exited fullscreen."}
-        return {"success": False, "message": "Couldn't exit fullscreen."}
+        ], key="escape")
+        return {"success": ok,
+                "message": "Exited fullscreen." if ok else
+                           "I couldn't get the player out of fullscreen."}
 
     if action == "next episode":
         _nfx_reveal_controls(browser)
@@ -1372,8 +1767,11 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
             'button[data-uia^="player-skip"]',
         ]):
             return {"success": True, "message": "Skipped."}
-        # S is Netflix's skip-intro shortcut
-        if _nfx_press_key(browser, "s"):
+        # S is Netflix's skip-intro shortcut. With no skip button present it is
+        # a no-op, so require a real forward jump (>5s, well beyond the ~0.3s
+        # of normal playback drift) before claiming we skipped anything.
+        before = _video_time(browser)
+        if _send_trusted_key(browser, "s") and _verify_seek(browser, before, 10):
             return {"success": True, "message": "Skipped."}
         return {"success": False, "message": "Nothing to skip right now."}
 
@@ -1495,7 +1893,7 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     return {"success": False, "message": f"Unknown netflix_control action: {action}"}
 
 
-# ── Amazon control ────────────────────────────────────���───────────────────────
+# ── Amazon control ────────────────────────────────────���──────────────��────────
 # SCOPE: search → product → cart → checkout → address confirmation.
 # HARD STOP before payment-method selection. No payment actions exist here.
 
@@ -1605,7 +2003,7 @@ def amazon_control(action: str, parameter: str | None = None) -> dict:
 
     if action in ("select variant", "variant", "select option"):
         # Category 2: variant widgets (twister) vary too much per product —
-        # reuse the existing generic click pipeline (vision fallback included).
+        # reuse the existing generic click pipeline.
         if not parameter:
             return {"success": False, "message": "Tell me which option, like size medium or color black."}
         result = _handle_click(parameter)
@@ -1850,7 +2248,7 @@ def flipkart_control(action: str, parameter: str | None = None) -> dict:
         return {"success": True, "message": f"Opened {pick['label'][:60]}."}
 
     if action in ("select variant", "variant", "select option"):
-        # Category 2: reuse the generic click pipeline (with vision fallback)
+        # Category 2: reuse the generic click pipeline
         if not parameter:
             return {"success": False, "message": "Tell me which option, like size large."}
         result = _handle_click(parameter)
@@ -2338,7 +2736,7 @@ def gmail_compose(action: str, parameter: str | None = None) -> dict:
          are send_keys to the To/Subject fields and a JS innerText set on the
          Body div, each located by a fixed allowlisted selector.
       2. There is NO .click() call, NO delegation to _handle_click /
-         atomic_click / vision_click, and NO selector that can match the
+         atomic_click, and NO selector that can match the
          Send button (its aria-label and tooltip contain "Send"; nothing
          here queries by aria-label except the exact strings below).
       3. NO keyboard chords are ever emitted — Gmail sends on Ctrl+Enter /
@@ -4179,24 +4577,8 @@ def screenshot() -> dict:
     return {"success": True, "path": path, "message": "Screenshot saved."}
 
 
-def lock_screen() -> str:
-    subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"])
-    return "Locking screen."
-
-
-def hibernate() -> str:
-    subprocess.Popen(["shutdown", "/h"])
-    return "Hibernating."
-
-
-def shutdown() -> str:
-    subprocess.Popen(["shutdown", "/s", "/t", "0", "/f"])
-    return "Shutting down."
-
-
-def restart() -> str:
-    subprocess.Popen(["shutdown", "/r", "/t", "0", "/f"])
-    return "Restarting."
+# lock_screen / hibernate / shutdown / restart now live in system_control.py
+# (see _ACTION_MAP aliases) so power handling has a single implementation.
 
 
 def _find_window(param: str):
@@ -4444,16 +4826,101 @@ def _handle_web_search(parameter: str) -> str:
     return f"Searching for {parameter}."
 
 
+# Search inputs, most specific first. A site's own box is always better than
+# a Google click-through, which is what unlisted domains used to get.
+_SEARCH_INPUT_JS = r"""
+    const q = arguments[0];
+    const sels = ['input[type="search"]', 'input[name="s"]', 'input[name="q"]',
+                  'input[name="query"]', 'input[name="keyword"]',
+                  'input[name="search"]', 'input[id*="search" i]',
+                  'input[placeholder*="search" i]',
+                  'input[aria-label*="search" i]', 'form[role="search"] input',
+                  'input[type="text"]'];
+    function visible(el) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 30 || r.height < 10) return false;
+        const s = getComputedStyle(el);
+        return s.visibility !== 'hidden' && s.display !== 'none';
+    }
+    for (const sel of sels) {
+        let el;
+        try { el = document.querySelector(sel); } catch (e) { continue; }
+        if (!el || !visible(el)) continue;
+        el.focus();
+        el.value = q;
+        el.dispatchEvent(new Event('input',  {bubbles: true}));
+        el.dispatchEvent(new Event('change', {bubbles: true}));
+        const form = el.closest('form');
+        if (form) {
+            if (form.requestSubmit) form.requestSubmit(); else form.submit();
+        } else {
+            for (const type of ['keydown', 'keypress', 'keyup']) {
+                el.dispatchEvent(new KeyboardEvent(type, {key: 'Enter',
+                    code: 'Enter', keyCode: 13, which: 13, bubbles: true}));
+            }
+        }
+        return sel;
+    }
+    return null;
+"""
+
+
+def _normalize_site(site: str) -> str:
+    """'mangafreak.me', 'www.mangafreak.me', 'MangaFreak' -> lookup key + host."""
+    s = (site or '').strip().lower().rstrip('/')
+    s = re.sub(r'^https?://', '', s)
+    s = re.sub(r'^www\.', '', s)
+    return s.split('/')[0]
+
+
 def _handle_site_search(parameter: str) -> str:
+    """Search a named site. Known sites use their direct search URL; ANY other
+    named domain is driven through its OWN search box, with a Google
+    `site:` query only as the final fallback.
+
+    Previously an unlisted domain went straight to a Google click-through,
+    which is why "search mangafreak.me for one piece" never searched the site.
+    """
     if not parameter or "|" not in parameter:
         return "I need a site and a query."
     site, query = parameter.split("|", 1)
-    site, query = site.strip().lower(), query.strip()
-    template = SEARCH_URL_MAP.get(site)
-    url = template.format(urllib.parse.quote(query)) if template else \
-          f"https://www.google.com/search?q={urllib.parse.quote(query)}+site:{site}.com"
-    _navigate(url)
-    return f"Searching {query} on {site}."
+    site, query = _normalize_site(site), query.strip()
+    if not query:
+        return "What should I search for?"
+    encoded = urllib.parse.quote(query)
+
+    # 1. Known site with a direct search URL.
+    template = SEARCH_URL_MAP.get(site) or SEARCH_URL_MAP.get(site.split('.')[0])
+    if template:
+        _navigate(template.format(encoded))
+        return f"Searching {query} on {site}."
+
+    # 2. Unlisted domain: drive the site's own search box.
+    host = site if '.' in site else f"{site}.com"
+    _navigate(f"https://{host}/")
+    browser = get_browser(_last_browser_name)
+    try:
+        WebDriverWait(browser, 8).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body")))
+    except Exception:
+        pass
+    try:
+        used = browser.execute_script(_SEARCH_INPUT_JS, query)
+    except Exception as e:
+        print(f"[SITESEARCH] {host} probe failed: {e}")
+        used = None
+    if used:
+        print(f"[SITESEARCH] {host} via own search input {used!r}")
+        # Confirm the submit actually navigated/queried before claiming it.
+        root = f"https://{host}/"
+        if _await_state(lambda: (browser.current_url or "") != root, timeout=6.0):
+            return f"Searching {query} on {host}."
+        print(f"[SITESEARCH] {host} submit did not navigate")
+
+    # 3. No usable search box — fall back to a scoped Google query.
+    print(f"[SITESEARCH] {host} has no search input, using Google site: query")
+    _navigate(f"https://www.google.com/search?q={encoded}+site:{host}")
+    return f"That site has no search box I could use, so I searched Google for {query} on {host}."
 
 
 def _handle_click(parameter: str) -> str | dict:
@@ -4462,6 +4929,17 @@ def _handle_click(parameter: str) -> str | dict:
         WebDriverWait(browser, 5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     except Exception:
         pass
+
+    # Structural controls and history nav are classified BEFORE any content
+    # matching. "go back" has no DOM element at all, and a tab/profile routed
+    # through the content matcher gets hijacked by role_intent.
+    from structural_ui import classify_structural_intent, resolve_structural
+    intent = classify_structural_intent(parameter)
+    if intent:
+        kind, value = intent
+        if kind == 'nav':
+            return browser_control(value)["message"]
+        return resolve_structural(browser, intent)["message"]
 
     elements = extract_interactive_elements(browser, max_elements=200)
     
@@ -4474,8 +4952,9 @@ def _handle_click(parameter: str) -> str | dict:
     print(f"[CLICK] Matched index={index} for '{parameter}'")
 
     if index is None or index >= len(elements):
-        print(f"[CLICK] DOM match failed, trying vision fallback")
-        return "Done." if vision_click(browser, parameter) else "Couldn't find that on the page."
+        # Report the failure and name what IS on the page. Guessing by screen
+        # coordinates used to click whatever window held OS focus.
+        return _no_match_report(parameter, elements)
 
     target = elements[index]
     print(f"[CLICK] Target: [{target['role']}] '{target['text'][:50]}'")
@@ -4523,6 +5002,7 @@ _ACTION_MAP = {
     "switch_tab":        switch_tab,
     "close_tab":         close_tab,
     "click":             _handle_click,
+    "browser_control":   browser_control,
     "youtube_control":   youtube_control,
     "netflix_control":   lambda p: netflix_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
     "amazon_control":    lambda p: amazon_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
@@ -4564,14 +5044,22 @@ _ACTION_MAP = {
     "adjust_volume":     adjust_volume,
     "adjust_brightness": adjust_brightness,
     "screenshot":        lambda _: screenshot(),
-    "lock_screen":       lambda _: lock_screen(),
-    "hibernate":         lambda _: hibernate(),
-    "shutdown":          lambda _: shutdown(),
-    "restart":           lambda _: restart(),
+    # Legacy action names kept as aliases onto the single system_control
+    # implementation — the old local copies used bare `shutdown /f`, which
+    # force-killed apps past unsaved work, and never checked whether
+    # hibernate was even enabled.
+    "lock_screen":       _system_control.lock_pc,
+    "hibernate":         _system_control.hibernate_pc,
+    "shutdown":          _system_control.shutdown_pc,
+    "restart":           _system_control.restart_pc,
     "switch_window":     switch_window,
     "maximize_window":   maximize_window,
     "minimize_window":   minimize_window,
     "bookmark_page":     lambda _: _bookmark(),
+    # Windows system/settings control. Imported as one dict so adding an
+    # action there needs no edit here. Tier 2 entries are confirmation-gated
+    # by sensei's existing safety net, not by anything in this map.
+    **_system_control.ACTIONS,
 }
 
 
