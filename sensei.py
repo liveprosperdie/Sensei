@@ -126,6 +126,28 @@ def _is_dangerous_step(step: dict) -> bool:
         return param in RISKY_WORKSPACE_PARAMS
     return False
 
+
+def _confirmation_prompt(unsafe: list[dict]) -> str:
+    """Confirmation wording for the safety net's own fallback.
+
+    Only used when the LLM failed to supply a confirmation_message. For
+    clear_temp_files the generic "are you sure?" is not good enough — the user
+    must hear WHICH folders are about to be emptied, so the read-only preview
+    is used to name them (and their real size) before anything is deleted.
+    """
+    if any(a.get("action") == "clear_temp_files" for a in unsafe):
+        try:
+            preview = system_control.preview_temp_cleanup()
+            if preview.get("success"):
+                return (preview["message"] +
+                        " Nothing in your documents, photos, or downloads is touched. Go ahead?")
+        except Exception as e:
+            print(f"[handle_response] temp preview failed: {e}")
+        return ("This clears only your Windows temp and prefetch folders — "
+                "nothing in your documents, photos, or downloads. Go ahead?")
+    return "Just confirming before I do that."
+
+
 FAILURE_PREFIXES = (
     "I couldn't find", "Couldn't click", "Couldn't find",
     "Skipped", "Something went wrong", "Unknown action",
@@ -366,7 +388,7 @@ def handle_response(response: dict) -> bool:
             response["actions"]               = safe
             response.pop("action", None)
             response.pop("parameter", None)
-            response["confirmation_message"]  = "Just confirming before I do that."
+            response["confirmation_message"]  = _confirmation_prompt(unsafe)
             # speak the question, not the LLM's premature "doing it now" text
             response["response"] = response["confirmation_message"]
         elif unsafe:
