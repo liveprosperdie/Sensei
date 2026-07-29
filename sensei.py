@@ -108,6 +108,19 @@ RISKY_WORKSPACE_PARAMS = frozenset({
     "delete",
 })
 
+# Desktop Office sub-actions that can lose the user's work — always gated.
+# open/new/type/read/save/next slide stay free-flowing: save writes to the
+# file the user already named, and typing is undoable inside the app.
+# "close" is gated even though the implementation saves first, because the
+# user may not expect the document to disappear mid-sentence.
+RISKY_OFFICE_PARAMS = frozenset({
+    "close", "close document", "close workbook", "close presentation",
+    "close without saving", "discard", "close discard",
+    "save as", "saveas", "overwrite", "save as overwrite",
+    "quit", "quit word", "quit excel", "quit powerpoint",
+    "close word", "close excel", "close powerpoint",
+})
+
 
 def _is_dangerous_step(step: dict) -> bool:
     """True if this action step must be confirmation-gated by the safety net."""
@@ -124,6 +137,9 @@ def _is_dangerous_step(step: dict) -> bool:
         return param in RISKY_CALENDAR_PARAMS
     if step.get("action") in ("slides_control", "docs_control", "sheets_control"):
         return param in RISKY_WORKSPACE_PARAMS
+    if step.get("action") in ("word_control", "excel_control",
+                              "powerpoint_control"):
+        return param in RISKY_OFFICE_PARAMS
     return False
 
 
