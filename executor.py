@@ -5029,6 +5029,8 @@ _ACTION_MAP = {
     "sheets_control":    lambda p: __import__("sheets_control").sheets_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "slides_control":    lambda p: __import__("slides_control").slides_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "gmail_control":     lambda p: __import__("gmail_control").gmail_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
+    # Microsoft Office via COM (lazy import: pywin32 COM only touched on use)
+    "office_control":    lambda p: __import__("office_control").office_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     # browser-side Gmail drafting — deliberately NOT the Gmail MCP (see gmail_compose docstring)
     "gmail_compose":     lambda p: gmail_compose(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "create_file":       create_file,
