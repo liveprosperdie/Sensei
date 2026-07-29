@@ -12,10 +12,28 @@ through here BEFORE anything executes, so no LLM output can violate:
   2. At most ONE download_image per chain. Batch-downloading result
      indices 1..N from a single instruction is never allowed.
 
+Both rules cover office_control's "insert image" sub-action too. It resolves
+a spoken pick through image_flow.download_image internally, so treating it as
+anything other than a download would have let "find a picture of X and put it
+in my document" bypass the pick step entirely via a different action name.
+
 Pure module — no imports beyond typing, testable anywhere.
 """
 
 from __future__ import annotations
+
+
+def _is_image_download(step: dict) -> bool:
+    """True for any step that downloads a picked image, under any action name."""
+    action = step.get("action")
+    if action == "download_image":
+        return True
+    if action == "office_control":
+        param = (step.get("parameter") or "").lower()
+        # "word|insert image|third" — the sub-action is the second field.
+        fields = [f.strip() for f in param.split("|")]
+        return len(fields) > 1 and fields[1].replace("_", " ") == "insert image"
+    return False
 
 
 def sanitize_actions(steps: list[dict]) -> tuple[list[dict], list[str]]:
@@ -43,9 +61,9 @@ def sanitize_actions(steps: list[dict]) -> tuple[list[dict], list[str]]:
                 dropped_ids.add(step["id"])
             continue
 
-        if action == "download_image":
+        if _is_image_download(step):
             if has_search:
-                print("[action_guard] BLOCKED download_image chained with "
+                print(f"[action_guard] BLOCKED {action} chained with "
                       "search_image — user must pick first")
                 notes.append("I've pulled up the candidates — tell me which "
                              "one you want and I'll download just that one.")
@@ -53,8 +71,8 @@ def sanitize_actions(steps: list[dict]) -> tuple[list[dict], list[str]]:
                     dropped_ids.add(step["id"])
                 continue
             if downloads_kept >= 1:
-                print("[action_guard] BLOCKED extra download_image — "
-                      "one download per turn")
+                print(f"[action_guard] BLOCKED extra {action} — "
+                      "one image download per turn")
                 if step.get("id"):
                     dropped_ids.add(step["id"])
                 continue

@@ -174,6 +174,91 @@ def _fields(parameter: str | None, count: int) -> list[str]:
     return parts + [""] * (count - len(parts))
 
 
+# ── Colour handling ───────────────────────────────────────────────────────────
+
+_COLORS = {
+    "black": (0, 0, 0), "white": (255, 255, 255), "red": (255, 0, 0),
+    "dark red": (192, 0, 0), "green": (0, 176, 80), "dark green": (0, 97, 0),
+    "blue": (0, 112, 192), "dark blue": (0, 32, 96), "light blue": (0, 176, 240),
+    "yellow": (255, 255, 0), "orange": (255, 153, 0), "purple": (112, 48, 160),
+    "pink": (255, 102, 204), "grey": (128, 128, 128), "gray": (128, 128, 128),
+    "light grey": (217, 217, 217), "light gray": (217, 217, 217),
+    "brown": (132, 60, 12), "teal": (0, 128, 128),
+}
+
+
+def _color(spec: str) -> int | None:
+    """Colour name, '#ff0000', or '255,0,0' -> the packed integer Office wants.
+
+    Office stores colours as &HBBGGRR (blue in the HIGH byte), NOT as HTML RGB.
+    Getting this backwards silently yields the wrong colour rather than an
+    error, so the byte order is inverted here in exactly one place and every
+    caller (Word font, Word shading, Excel fill) reuses it.
+    """
+    s = (spec or "").strip().lower()
+    if not s:
+        return None
+    rgb = _COLORS.get(s)
+    if rgb is None and s.startswith("#") and len(s) == 7:
+        try:
+            rgb = (int(s[1:3], 16), int(s[3:5], 16), int(s[5:7], 16))
+        except ValueError:
+            return None
+    if rgb is None and "," in s:
+        try:
+            parts = [int(p) for p in s.split(",")]
+        except ValueError:
+            return None
+        if len(parts) == 3 and all(0 <= p <= 255 for p in parts):
+            rgb = tuple(parts)  # type: ignore[assignment]
+    if rgb is None:
+        return None
+    r, g, b = rgb
+    return r + (g << 8) + (b << 16)
+
+
+# ── Image sourcing — REUSES the existing picker pipeline ──────────────────────
+
+def _resolve_image(spec: str) -> tuple[str | None, str | None]:
+    """Turn 'the third one' / a filename / a path into a local image path.
+
+    Deliberately does NOT search: image_flow already owns search -> local
+    numbered picker page -> strict pick resolution -> unique-filename download,
+    and duplicating any of that would mean two divergent image pipelines and
+    two safety-filter implementations. A spoken pick is handed straight to
+    image_flow.download_image, which resolves it against the candidates the
+    user actually saw and returns the saved path.
+    """
+    spec = (spec or "").strip().strip('"')
+    if not spec:
+        return None, ("Which image? Search for one first, then tell me which "
+                      "one to use.")
+
+    # An existing local file (or an explicit path) is used as-is — no network.
+    local = os.path.expandvars(os.path.expanduser(spec))
+    if os.path.isfile(local):
+        if os.path.splitext(local)[1].lower() not in _IMG_EXTS:
+            return None, f"{os.path.basename(local)} isn't an image file."
+        return os.path.abspath(local), None
+    if os.path.isabs(local) or os.sep in local:
+        return None, f"I couldn't find an image at '{spec}'."
+
+    try:
+        import image_flow
+    except Exception as e:                                    # pragma: no cover
+        return None, f"The image pipeline isn't available ({e})."
+
+    res = image_flow.download_image(spec)
+    if not res.get("success"):
+        # Pass image_flow's own wording through — it already explains the
+        # "search first" and "which one did you mean" cases precisely.
+        return None, res.get("message", "I couldn't get that image.")
+    return res.get("path"), None
+
+
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
+
+
 # ── Word ──────────────────────────────────────────────────────────────────────
 
 def _word(sub: str, parameter: str | None) -> dict:
@@ -265,7 +350,170 @@ def _word(sub: str, parameter: str | None) -> dict:
         snippet = text[:600] + ("..." if len(text) > 600 else "")
         return _ok(snippet, speak=True)
 
+    if sub in _WORD_FORMAT_SUBS:
+        return _word_format(app, doc, sub, parameter)
+
+    if sub in ("bullet list", "numbered list"):
+        try:
+            rng = _word_target(app, doc)[0]
+            lf = rng.ListFormat
+            # ApplyBulletDefault/ApplyNumberDefault use Word's own current
+            # gallery defaults, so the result matches what the ribbon buttons
+            # produce instead of a hand-built ListTemplate that ignores the
+            # user's template.
+            if sub == "bullet list":
+                lf.ApplyBulletDefault()
+            else:
+                lf.ApplyNumberDefault()
+            return _ok(f"Made that a {sub}.")
+        except Exception as e:
+            return _err(f"I couldn't apply the list: {e}")
+
+    if sub == "remove list":
+        try:
+            _word_target(app, doc)[0].ListFormat.RemoveNumbers()
+            return _ok("Removed the list formatting.")
+        except Exception as e:
+            return _err(f"I couldn't remove the list: {e}")
+
+    if sub in ("new paragraph", "line break"):
+        try:
+            sel = app.Selection
+            sel.Collapse(0)                                   # wdCollapseEnd
+            # A real paragraph mark vs. a soft wrap are different things in
+            # Word, and "new line" should not silently create a paragraph.
+            if sub == "new paragraph":
+                sel.TypeParagraph()
+            else:
+                sel.TypeText("\v")                            # vertical tab
+            return _ok("Done.")
+        except Exception as e:
+            return _err(f"I couldn't do that: {e}")
+
+    if sub == "insert image":
+        path, e = _resolve_image(parameter)
+        if e:
+            return _err(e)
+        try:
+            sel = app.Selection
+            sel.Collapse(0)
+            sel.InlineShapes.AddPicture(FileName=path, LinkToFile=False,
+                                        SaveWithDocument=True)
+            return _ok(f"Inserted {os.path.basename(path)} into the document.")
+        except Exception as ex:
+            return _err(f"I couldn't insert that image: {ex}")
+
+    if sub == "undo":
+        try:
+            # Word has NO Application.Undo — undo lives on the Document and
+            # returns False when the stack is empty (verified, not assumed).
+            times = _int_arg(parameter) or 1
+            if not doc.Undo(times):
+                return _err("There's nothing left to undo.")
+            return _ok("Undone." if times == 1 else f"Undid {times} steps.")
+        except Exception as e:
+            return _err(f"I couldn't undo that: {e}")
+
     return _err(f"I can't do '{sub}' in Word.")
+
+
+# Formatting sub-actions Word accepts directly, so "make that bold" maps to
+# office_control|word|bold rather than a nested format verb.
+_WORD_FORMAT_SUBS = frozenset({
+    "bold", "italic", "underline", "font", "font size", "text color",
+    "highlight", "align",
+})
+
+_WD_ALIGN = {"left": 0, "center": 1, "centre": 1, "right": 2,
+             "justify": 3, "justified": 3}
+
+# wdColorIndex values — Word's highlight takes an index, not an RGB value.
+_WD_HIGHLIGHT = {
+    "yellow": 7, "bright green": 4, "green": 11, "turquoise": 3, "cyan": 3,
+    "pink": 5, "magenta": 5, "blue": 2, "red": 6, "dark blue": 9,
+    "teal": 10, "violet": 12, "gray": 15, "grey": 15, "none": 0, "off": 0,
+}
+
+_OFF_WORDS = {"off", "no", "none", "remove", "clear", "false", "un"}
+
+
+def _word_target(app, doc):
+    """(range, scope_label) for a formatting command.
+
+    Formats the SELECTION when the user has highlighted something; falls back
+    to the whole document when the caret is just sitting somewhere, because
+    "make it bigger" with nothing selected means the document. The label is
+    returned so the spoken reply always states which one happened — silently
+    reformatting an entire document would be alarming.
+    """
+    try:
+        sel = app.Selection
+        # wdSelectionIP (1) == a collapsed caret, i.e. nothing is selected.
+        if int(sel.Type) != 1 and len(sel.Range.Text or "") > 0:
+            return sel.Range, "the selection"
+    except Exception:
+        pass
+    return doc.Content, "the whole document"
+
+
+def _int_arg(parameter: str | None) -> int | None:
+    digits = "".join(c for c in (parameter or "") if c.isdigit())
+    return int(digits) if digits else None
+
+
+def _word_format(app, doc, what: str, parameter: str | None) -> dict:
+    value = (parameter or "").strip()
+    low = value.lower()
+    try:
+        rng, scope = _word_target(app, doc)
+    except Exception as e:
+        return _err(f"I couldn't find what to format: {e}")
+
+    try:
+        if what in ("bold", "italic", "underline"):
+            on = low not in _OFF_WORDS
+            setattr(rng.Font, what.capitalize(), -1 if on else 0)
+            return _ok(f"{'Applied' if on else 'Removed'} {what} on {scope}.")
+
+        if what == "font":
+            if not value:
+                return _err("Which font?")
+            rng.Font.Name = value
+            return _ok(f"Set {scope} to {value}.")
+
+        if what == "font size":
+            size = _int_arg(value)
+            if not size or not 1 <= size <= 1638:      # Word's own valid range
+                return _err("What size? Word allows 1 to 1638 point.")
+            rng.Font.Size = size
+            return _ok(f"Set {scope} to {size} point.")
+
+        if what == "text color":
+            c = _color(value)
+            if c is None:
+                return _err(f"I don't know the colour '{value}'.")
+            rng.Font.Color = c
+            return _ok(f"Coloured {scope} {value}.")
+
+        if what == "highlight":
+            idx = _WD_HIGHLIGHT.get(low)
+            if idx is None:
+                return _err(f"I can't highlight in '{value}'. "
+                            "Try yellow, green, pink, or turquoise.")
+            rng.HighlightColorIndex = idx
+            return _ok(f"Removed the highlight from {scope}." if idx == 0
+                       else f"Highlighted {scope} {value}.")
+
+        if what == "align":
+            a = _WD_ALIGN.get(low)
+            if a is None:
+                return _err("Left, center, right, or justify?")
+            rng.ParagraphFormat.Alignment = a
+            return _ok(f"Aligned {scope} {low}.")
+    except Exception as e:
+        return _err(f"I couldn't apply that formatting: {e}")
+
+    return _err(f"I can't apply '{what}' in Word.")
 
 
 # ── Excel ─────────────────────────────────────────────────────────────────────
@@ -365,7 +613,191 @@ def _excel(sub: str, parameter: str | None) -> dict:
         except Exception as e:
             return _err(f"I couldn't close it: {e}")
 
+    if sub == "formula":
+        # "formula|A1|=SUM(B1:B10)" or "formula|=SUM(B1:B10)" for the selection.
+        cell, expr = _fields(parameter, 2)
+        if not expr:
+            cell, expr = "", cell
+        if not expr:
+            return _err("Which formula should I enter?")
+        if not expr.startswith("="):
+            expr = "=" + expr
+        try:
+            sheet = wb.ActiveSheet
+            target = sheet.Range(cell) if cell else app.Selection
+            target.Formula = expr
+            where = cell or target.Address(False, False)
+            # Read the computed result back and speak it: a formula that lands
+            # as #REF! or #DIV/0! must not be reported as a success.
+            val = target.Value
+            shown = "empty" if val in (None, "") else _fmt(val)
+            if isinstance(shown, str) and shown.startswith("#"):
+                return _err(f"{where} came back as {shown} — "
+                            "the formula doesn't work on that data.")
+            return _ok(f"{where} is {shown}.", speak=True)
+        except Exception as e:
+            return _err(f"I couldn't enter that formula: {e}")
+
+    if sub in _XL_FORMAT_SUBS:
+        return _excel_format(app, wb, sub, parameter)
+
+    if sub == "chart":
+        return _excel_chart(app, wb, parameter)
+
+    if sub == "undo":
+        try:
+            # Excel DOES expose Application.Undo (unlike Word). It only undoes
+            # the last action and cannot be repeated reliably, so no count.
+            app.Undo()
+            return _ok("Undone.")
+        except Exception as e:
+            return _err(f"I couldn't undo that: {e}")
+
     return _err(f"I can't do '{sub}' in Excel.")
+
+
+_XL_FORMAT_SUBS = frozenset({"bold", "italic", "font size", "fill color",
+                             "text color", "number format"})
+
+# Spoken format names -> Excel format codes. Raw codes pass through untouched.
+_XL_NUMBER_FORMATS = {
+    "currency": "$#,##0.00", "money": "$#,##0.00", "dollars": "$#,##0.00",
+    "pounds": "£#,##0.00", "euros": "€#,##0.00",
+    "percent": "0.00%", "percentage": "0.00%",
+    "date": "yyyy-mm-dd", "short date": "m/d/yyyy", "time": "h:mm AM/PM",
+    "number": "#,##0.00", "integer": "#,##0", "whole number": "#,##0",
+    "text": "@", "general": "General", "accounting": "_($* #,##0.00_)",
+}
+
+# Chart types. "bar" colloquially means vertical columns, so it maps to
+# xlColumnClustered (51); a true horizontal bar needs xlBarClustered (57).
+_XL_CHART_TYPES = {
+    "bar": 51, "column": 51, "vertical bar": 51, "horizontal bar": 57,
+    "line": 4, "pie": 5, "doughnut": -4120, "area": 1,
+    "scatter": -4169, "xy": -4169, "radar": -4151,
+}
+
+_A1_RE = None
+
+
+def _looks_like_ref(s: str) -> bool:
+    """True for 'B7', 'A1:D20', 'Sheet1!A1:B5' — used to tell an optional
+    leading range argument apart from a value argument."""
+    global _A1_RE
+    if _A1_RE is None:
+        import re
+        _A1_RE = re.compile(
+            r"^(?:[^!]{1,31}!)?\$?[A-Za-z]{1,3}\$?\d{1,7}"
+            r"(?::\$?[A-Za-z]{1,3}\$?\d{1,7})?$")
+    return bool(_A1_RE.match(s.strip()))
+
+
+def _xl_target(app, wb, parameter: str | None) -> tuple[object, str, str]:
+    """(range, remaining_value, label) for '<range>|<value>' or '<value>'.
+
+    The range is optional in speech ("make it bold"), so a leading field is
+    only treated as a range when it actually looks like one.
+    """
+    first, rest = _fields(parameter, 2)
+    sheet = wb.ActiveSheet
+    if first and _looks_like_ref(first):
+        sheet_name, _, cells = first.rpartition("!")
+        if sheet_name:
+            sheet = wb.Worksheets(sheet_name)
+        rng = sheet.Range(cells or first)
+        return rng, rest, first
+    value = (first + ("|" + rest if rest else "")).strip()
+    rng = app.Selection
+    try:
+        label = str(rng.Address(False, False))
+    except Exception:
+        label = "the selection"
+    return rng, value, label
+
+
+def _excel_format(app, wb, what: str, parameter: str | None) -> dict:
+    try:
+        rng, value, label = _xl_target(app, wb, parameter)
+    except Exception as e:
+        return _err(f"That isn't a range I can format: {e}")
+    low = value.strip().lower()
+
+    try:
+        if what in ("bold", "italic"):
+            on = low not in _OFF_WORDS
+            setattr(rng.Font, what.capitalize(), on)
+            return _ok(f"{'Applied' if on else 'Removed'} {what} on {label}.")
+
+        if what == "font size":
+            size = _int_arg(value)
+            if not size or not 1 <= size <= 409:      # Excel's own valid range
+                return _err("What size? Excel allows 1 to 409 point.")
+            rng.Font.Size = size
+            return _ok(f"Set {label} to {size} point.")
+
+        if what in ("fill color", "text color"):
+            c = _color(value)
+            if c is None:
+                return _err(f"I don't know the colour '{value}'.")
+            if what == "fill color":
+                rng.Interior.Color = c
+            else:
+                rng.Font.Color = c
+            return _ok(f"Set {label} {what.replace('color', 'colour')} to {value}.")
+
+        if what == "number format":
+            if not low:
+                return _err("Which format? Currency, percent, or date?")
+            code = _XL_NUMBER_FORMATS.get(low, value)
+            rng.NumberFormat = code
+            return _ok(f"Formatted {label} as {low}.")
+    except Exception as e:
+        return _err(f"I couldn't apply that formatting: {e}")
+
+    return _err(f"I can't apply '{what}' in Excel.")
+
+
+def _excel_chart(app, wb, parameter: str | None) -> dict:
+    """chart|<type>|<range> — e.g. chart|bar|A1:B10.
+
+    Uses Shapes.AddChart2 (verified as the current path; ChartObjects.Add is
+    obsolete and demands hard-coded pixel dimensions) and falls back to the
+    older AddChart on pre-2013 builds. SetSourceData lives on the Chart, not
+    on the Shape.
+    """
+    first, second = _fields(parameter, 2)
+    # Tolerate "A1:B10|bar" as well as "bar|A1:B10". The range keeps its
+    # original casing so it reads back correctly in the spoken reply.
+    if first and _looks_like_ref(first) and second:
+        kind, ref = second.strip().lower(), first
+    else:
+        kind, ref = first.strip().lower(), second
+    ctype = _XL_CHART_TYPES.get(kind)
+    if ctype is None:
+        return _err(f"I can't make a '{kind or 'that'}' chart. "
+                    "I can do bar, line, pie, area, or scatter.")
+    if not ref.strip():
+        return _err("Which range should the chart use?")
+
+    try:
+        sheet = wb.ActiveSheet
+        sheet_name, _, cells = ref.rpartition("!")
+        if sheet_name:
+            sheet = wb.Worksheets(sheet_name)
+        source = sheet.Range(cells or ref)
+    except Exception:
+        return _err(f"'{ref}' isn't a range I can chart.")
+
+    try:
+        try:
+            shape = sheet.Shapes.AddChart2(-1, ctype)
+        except Exception:
+            shape = sheet.Shapes.AddChart(ctype)
+        chart = shape.Chart
+        chart.SetSourceData(Source=source)
+        return _ok(f"Added a {kind} chart from {ref}.")
+    except Exception as e:
+        return _err(f"I couldn't create the chart: {e}")
 
 
 def _coerce(value: str):
@@ -518,7 +950,158 @@ def _powerpoint(sub: str, parameter: str | None) -> dict:
         except Exception as e:
             return _err(f"I couldn't close it: {e}")
 
+    if sub == "new slide":
+        return _add_slide(app, pres, parameter)
+
+    if sub == "delete slide":
+        try:
+            total = int(pres.Slides.Count)
+            if total <= 0:
+                return _err("There are no slides to delete.")
+            n = _slide_number(parameter, pres) if (parameter or "").strip() \
+                else _current_slide(app, pres)
+            if n is None:
+                return _err("Which slide should I delete?")
+            if not 1 <= n <= total:
+                return _err(f"There are only {total} slides.")
+            pres.Slides(n).Delete()
+            return _ok(f"Deleted slide {n}. {total - 1} left.")
+        except Exception as e:
+            return _err(f"I couldn't delete that slide: {e}")
+
+    if sub in ("set title", "set content"):
+        text = (parameter or "").strip()
+        if not text:
+            return _err("What should it say?")
+        try:
+            slide = pres.Slides(_current_slide(app, pres) or 1)
+        except Exception as e:
+            return _err(f"I couldn't find the slide: {e}")
+        return _set_placeholder(slide, sub == "set title", text)
+
+    if sub == "insert image":
+        path, e = _resolve_image(parameter)
+        if e:
+            return _err(e)
+        try:
+            slide = pres.Slides(_current_slide(app, pres) or 1)
+        except Exception as ex:
+            return _err(f"I couldn't find the slide: {ex}")
+        return _add_slide_picture(pres, slide, path)
+
     return _err(f"I can't do '{sub}' in PowerPoint.")
+
+
+# ppLayout constants. ppLayoutText (2) is the ordinary title+content slide;
+# ppLayoutBlank (12) has no placeholders at all.
+_PP_LAYOUTS = {
+    "title": 1, "title slide": 1, "title only": 11,
+    "content": 2, "title and content": 2, "text": 2, "bullets": 2,
+    "two content": 3, "comparison": 3, "blank": 12, "empty": 12,
+}
+
+
+def _current_slide(app, pres) -> int | None:
+    """Index of the slide in view, whether presenting or editing."""
+    try:
+        show = pres.SlideShowWindow
+        if show is not None:
+            return int(show.View.Slide.SlideIndex)
+    except Exception:
+        pass
+    try:
+        return int(app.ActiveWindow.View.Slide.SlideIndex)
+    except Exception:
+        try:
+            return int(pres.Slides.Count) or None
+        except Exception:
+            return None
+
+
+def _add_slide(app, pres, parameter: str | None) -> dict:
+    layout_name = (parameter or "").strip().lower() or "content"
+    layout = _PP_LAYOUTS.get(layout_name)
+    if layout is None:
+        return _err(f"I don't know the '{layout_name}' layout. Try title, "
+                    "title and content, or blank.")
+    try:
+        index = int(pres.Slides.Count) + 1
+        slide = pres.Slides.Add(index, layout)
+        try:
+            # Follow the new slide in the editor so the user sees what they
+            # just made — otherwise the view stays on the old slide and any
+            # follow-up "set title" looks like it did nothing.
+            app.ActiveWindow.View.GotoSlide(index)
+        except Exception:
+            pass
+        return _ok(f"Added slide {slide.SlideIndex} ({layout_name}).")
+    except Exception as e:
+        return _err(f"I couldn't add a slide: {e}")
+
+
+def _set_placeholder(slide, is_title: bool, text: str) -> dict:
+    """Write into the title or the body placeholder.
+
+    Placeholders(1) is not reliably the title on every layout, so the title
+    goes through Shapes.Title (which Office resolves correctly) and the body
+    is found by scanning for the first non-title placeholder.
+    """
+    try:
+        if is_title:
+            try:
+                slide.Shapes.Title.TextFrame.TextRange.Text = text
+                return _ok("Set the slide title.")
+            except Exception:
+                return _err("This slide has no title placeholder — "
+                            "add a title layout slide first.")
+        for i in range(1, int(slide.Shapes.Placeholders.Count) + 1):
+            ph = slide.Shapes.Placeholders(i)
+            try:
+                if ph.Name and "title" in str(ph.Name).lower():
+                    continue
+                if not ph.HasTextFrame:
+                    continue
+            except Exception:
+                continue
+            ph.TextFrame.TextRange.Text = text
+            return _ok("Added the text to the slide.")
+        return _err("This slide has no content placeholder — "
+                    "try a title and content layout.")
+    except Exception as e:
+        return _err(f"I couldn't set that text: {e}")
+
+
+def _add_slide_picture(pres, slide, path: str) -> dict:
+    """AddPicture, then scale-to-fit and centre.
+
+    A phone-resolution photo dropped in at native size lands far larger than
+    the slide, so it is fitted to 90% of the slide and centred — otherwise the
+    insert "works" while the picture hangs off the canvas invisibly.
+    """
+    try:
+        try:
+            shape = slide.Shapes.AddPicture(
+                FileName=path, LinkToFile=False, SaveWithDocument=True,
+                Left=0, Top=0)
+        except Exception:
+            # Some builds insist on explicit dimensions; -1 keeps native size.
+            shape = slide.Shapes.AddPicture(
+                FileName=path, LinkToFile=False, SaveWithDocument=True,
+                Left=0, Top=0, Width=-1, Height=-1)
+        try:
+            sw = float(pres.PageSetup.SlideWidth)
+            sh = float(pres.PageSetup.SlideHeight)
+            w, h = float(shape.Width), float(shape.Height)
+            scale = min((sw * 0.9) / w, (sh * 0.9) / h, 1.0)
+            if scale < 1.0:
+                shape.Width, shape.Height = w * scale, h * scale
+            shape.Left = (sw - float(shape.Width)) / 2
+            shape.Top = (sh - float(shape.Height)) / 2
+        except Exception as e:
+            print(f"[OFFICE] picture fit/centre skipped: {e}")
+        return _ok(f"Added {os.path.basename(path)} to the slide.")
+    except Exception as e:
+        return _err(f"I couldn't add that image: {e}")
 
 
 def _navigate(app, pres, sub: str, parameter: str | None) -> dict:
@@ -671,6 +1254,42 @@ _ALIASES = {
     "exit slideshow": "end slideshow", "stop slideshow": "end slideshow",
     "close document": "close", "close workbook": "close",
     "close presentation": "close",
+    # formatting
+    "make bold": "bold", "embolden": "bold", "make italic": "italic",
+    "italics": "italic", "underline text": "underline",
+    "size": "font size", "text size": "font size", "font name": "font",
+    "typeface": "font", "set font": "font",
+    "color": "text color", "colour": "text color", "font color": "text color",
+    "text colour": "text color", "fill": "fill color",
+    "cell color": "fill color", "background color": "fill color",
+    "fill colour": "fill color", "shade": "fill color",
+    "highlight text": "highlight", "alignment": "align", "align text": "align",
+    "center": "align", "centre": "align",
+    "format": "number format", "format cells": "number format",
+    "number style": "number format", "currency": "number format",
+    # lists & paragraphs
+    "bullets": "bullet list", "bullet points": "bullet list",
+    "bulleted list": "bullet list", "numbered": "numbered list",
+    "number list": "numbered list", "ordered list": "numbered list",
+    "paragraph": "new paragraph", "new line": "line break",
+    "newline": "line break", "break": "line break",
+    # images
+    "add image": "insert image", "insert picture": "insert image",
+    "add picture": "insert image", "insert photo": "insert image",
+    "add photo": "insert image", "put image": "insert image",
+    # formulas & charts
+    "enter formula": "formula", "add formula": "formula",
+    "set formula": "formula", "sum": "formula", "calculate": "formula",
+    "insert chart": "chart", "add chart": "chart", "create chart": "chart",
+    "make chart": "chart", "graph": "chart", "insert graph": "chart",
+    # slides
+    "add slide": "new slide", "insert slide": "new slide",
+    "create slide": "new slide", "remove slide": "delete slide",
+    "title": "set title", "set heading": "set title",
+    "slide title": "set title", "content": "set content",
+    "set body": "set content", "slide text": "set content",
+    # undo
+    "undo that": "undo", "revert": "undo", "take that back": "undo",
 }
 
 _HANDLERS = {"word": _word, "excel": _excel,
@@ -687,7 +1306,30 @@ _APP_ALIASES = {
 # Sub-actions that can lose work. Gated by sensei's existing
 # confirmation_required safety net — this module holds NO confirmation logic,
 # exactly like system_control's Tier 2.
-RISKY_OFFICE_PARAMS = frozenset({"close", "save as"})
+# Deliberately NOT gated: formatting, lists, formulas, charts, image inserts
+# and slide adds are all reversible (undo exists for exactly this) and gating
+# them would make normal dictation a confirmation slog. Only actions that
+# destroy work or overwrite a file are listed.
+RISKY_OFFICE_PARAMS = frozenset({"close", "save as", "delete slide"})
+
+
+def _canonical_sub(parameter: str | None) -> str:
+    """The canonical sub-action for an "app|sub|args" parameter.
+
+    Alias resolution MUST happen before any risk check. "remove slide",
+    "close document" and "rename" are aliases of delete slide / close /
+    save as, so a risk check against the raw spoken word silently let the
+    destructive forms through the confirmation gate unconfirmed.
+    """
+    fields = (parameter or "").split("|")
+    sub = (fields[1] if len(fields) > 1 else "").lower().replace("_", " ").strip()
+    return _ALIASES.get(sub, sub)
+
+
+def is_risky_parameter(parameter: str | None) -> bool:
+    """Does this office_control parameter need confirmation? Single source of
+    truth, consumed by sensei's confirmation_required gate."""
+    return _canonical_sub(parameter) in RISKY_OFFICE_PARAMS
 
 
 def office_control(action: str, parameter: str | None = None) -> dict:
