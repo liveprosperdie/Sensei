@@ -17,6 +17,7 @@ import openwakeword
 import claude_handler
 import action_guard
 import system_control
+import office_control
 from groq import Groq
 import soundfile as sf
 from executor import execute, get_all_tabs, get_pc_context
@@ -108,6 +109,13 @@ RISKY_WORKSPACE_PARAMS = frozenset({
     "delete",
 })
 
+# Office sub-actions that can lose work — closing a document (unsaved edits)
+# and save-as (can overwrite an existing file). Pulled from office_control so
+# the gate list cannot drift from the implementation, same as TIER2_ACTIONS.
+# NOTE: office_control's parameter is "app|sub|args", so the sub-action is the
+# SECOND field, not the first — _is_dangerous_step handles that below.
+RISKY_OFFICE_PARAMS = office_control.RISKY_OFFICE_PARAMS
+
 
 def _is_dangerous_step(step: dict) -> bool:
     """True if this action step must be confirmation-gated by the safety net."""
@@ -124,6 +132,12 @@ def _is_dangerous_step(step: dict) -> bool:
         return param in RISKY_CALENDAR_PARAMS
     if step.get("action") in ("slides_control", "docs_control", "sheets_control"):
         return param in RISKY_WORKSPACE_PARAMS
+    if step.get("action") == "office_control":
+        # "word|close" / "excel|save as|Budget" — field 0 is the app, field 1
+        # is the sub-action being risked.
+        fields = (step.get("parameter") or "").split("|")
+        sub = (fields[1] if len(fields) > 1 else "").strip().lower().replace("_", " ")
+        return sub in RISKY_OFFICE_PARAMS
     return False
 
 
