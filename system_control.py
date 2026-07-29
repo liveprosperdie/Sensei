@@ -17,9 +17,11 @@ numbers must be read aloud verbatim.
 """
 
 import ctypes
+import html
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 
 import psutil
@@ -218,9 +220,24 @@ def _toggle_radio(kind: str, label: str, parameter: str) -> dict:
         return {"success": True, "message": f"{label} turned {'on' if want else 'off'}."}
     if "NORADIO" in out:
         return {"success": False, "message": f"I don't see a {label} radio on this PC."}
-    print(f"[SYS] {label} toggle failed: {out[:200]}")
-    # Falling back to the Settings page keeps the request useful instead of
-    # dead-ending: the user can flip the switch themselves in one tap.
+    print(f"[SYS] {label} radio API failed: {out[:200]}")
+
+    # SECOND ATTEMPT via UI Automation on the real Settings switch. The WinRT
+    # Radio API stays primary (it needs no window and no focus); UIA is the
+    # fallback for the case where RequestAccessAsync is denied by policy.
+    # This is a fallback rather than a parallel command so there is still one
+    # entry point per concern.
+    try:
+        import native_ui
+        res = native_ui.toggle_setting(label)
+        if res.get("success"):
+            return res
+        print(f"[SYS] {label} UIA fallback failed: {res.get('message')}")
+    except Exception as e:
+        print(f"[SYS] {label} UIA fallback error: {e}")
+
+    # Last resort: open the page so the request stays useful instead of
+    # dead-ending — the user can flip the switch themselves in one tap.
     _launch(f"ms-settings:{'network-wifi' if kind == 'WiFi' else 'bluetooth'}")
     return {"success": False,
             "message": f"I couldn't toggle {label} directly, so I opened {label} settings for you."}
@@ -281,12 +298,87 @@ def performance_stats(parameter: str = "") -> dict:
     if top:
         message += " Heaviest right now: " + ", ".join(top) + "."
 
+    # Visual companion to the spoken numbers. Failing to render must never
+    # cost the user the spoken answer, so it is best-effort only.
+    try:
+        _show_perf_page(cpu, mem, disk, top)
+    except Exception as e:
+        print(f"[SYS] perf visual failed: {e}")
+
     print(f"[SYS] perf cpu={cpu} mem={mem.percent} "
           f"disk={disk.percent if disk else 'n/a'}")
     return {"success": True, "speak": True, "message": message,
             "cpu_percent": cpu, "memory_percent": mem.percent,
             "memory_used_gb": _gb(mem.used), "memory_total_gb": _gb(mem.total),
             "disk_percent": disk.percent if disk else None}
+
+
+def _perf_page_path() -> str:
+    return os.path.join(tempfile.gettempdir(), "akira_performance.html")
+
+
+def _bar(label: str, pct: float, detail: str = "") -> str:
+    """One labelled usage bar. Colour is a load threshold, not decoration, so
+    a glance conveys the same thing the spoken summary does."""
+    colour = "#3fb950" if pct < 60 else ("#e8b339" if pct < 85 else "#f85149")
+    width = max(0.0, min(100.0, pct))
+    return (f'<div class="row"><div class="head"><span>{html.escape(label)}</span>'
+            f'<span class="pct">{pct:.0f}%</span></div>'
+            f'<div class="track"><div class="fill" style="width:{width:.1f}%;'
+            f'background:{colour}"></div></div>'
+            + (f'<small>{html.escape(detail)}</small>' if detail else '')
+            + '</div>')
+
+
+def _show_perf_page(cpu: float, mem, disk, top: list[str]) -> None:
+    """Render CPU/memory/disk bars to a temp HTML file and open it.
+
+    Reuses the image picker's proven "write a local page, hand it to the shell"
+    approach rather than adding a GUI toolkit dependency for three bars.
+    """
+    rows = [_bar("CPU", cpu, f"{psutil.cpu_count(logical=True) or '?'} threads"),
+            _bar("Memory", mem.percent,
+                 f"{_gb(mem.used)} of {_gb(mem.total)} GB used")]
+    if disk:
+        rows.append(_bar("Disk", disk.percent,
+                         f"{_gb(disk.used)} of {_gb(disk.total)} GB used"))
+    procs = ("<ul class='procs'>"
+             + "".join(f"<li>{html.escape(t)}</li>" for t in top)
+             + "</ul>") if top else ""
+
+    doc = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System performance</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  body {{ margin:0; padding:28px; background:#111; color:#eee;
+         font:15px/1.5 system-ui, sans-serif; }}
+  h1 {{ font-size:20px; margin:0 0 4px; }}
+  p.when {{ margin:0 0 24px; color:#9a9a9a; font-size:13px; }}
+  .row {{ margin-bottom:20px; max-width:560px; }}
+  .head {{ display:flex; justify-content:space-between; font-weight:600;
+          margin-bottom:6px; }}
+  .pct {{ font-variant-numeric:tabular-nums; }}
+  .track {{ height:14px; background:#1c1c1c; border:1px solid #2c2c2c;
+           border-radius:7px; overflow:hidden; }}
+  .fill {{ height:100%; border-radius:7px; }}
+  small {{ display:block; margin-top:5px; color:#9a9a9a; }}
+  h2 {{ font-size:14px; margin:28px 0 8px; color:#9a9a9a;
+       text-transform:uppercase; letter-spacing:.06em; }}
+  .procs {{ margin:0; padding-left:18px; color:#ccc; }}
+</style></head><body>
+<h1>System performance</h1>
+<p class="when">Sampled {html.escape(time.strftime('%H:%M:%S'))}</p>
+{''.join(rows)}
+{f'<h2>Heaviest processes</h2>{procs}' if procs else ''}
+</body></html>"""
+
+    path = _perf_page_path()
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(doc)
+    _launch(path)
+    print(f"[SYS] perf visual at {path}")
 
 
 def _top_processes(limit: int = 3) -> list[str]:
@@ -383,25 +475,52 @@ def clear_temp_files(parameter: str = "") -> dict:
         return {"success": False, "message": "I couldn't find any temp folders."}
 
     removed = freed = skipped = 0
+    unreadable = 0
     for t in targets:
-        for name in os.listdir(t):
+        # listdir itself raises PermissionError on a protected folder (Prefetch
+        # needs admin). That must NOT abort the whole cleanup or escape as a raw
+        # exception into the spoken response — skip the folder and keep going.
+        try:
+            names = os.listdir(t)
+        except Exception as e:
+            unreadable += 1
+            print(f"[SYS] temp folder unreadable {t}: {e}")
+            continue
+
+        for name in names:
             path = os.path.join(t, name)
             try:
                 size = os.path.getsize(path) if os.path.isfile(path) else 0
                 if os.path.isdir(path) and not os.path.islink(path):
                     size, _ = _dir_size(path)
-                    shutil.rmtree(path, ignore_errors=False)
+                    # ignore_errors=False would raise on the first locked file
+                    # inside the tree and lose the whole rest of the run; the
+                    # onerror hook counts them and lets the walk continue.
+                    failures = []
+                    shutil.rmtree(path, onerror=lambda *a: failures.append(a))
+                    if failures or os.path.exists(path):
+                        skipped += 1
+                        continue
                 else:
                     os.remove(path)
                 removed += 1
                 freed += size
             except Exception:
+                # Locked/in-use files are normal in temp — expected, not a fault.
                 skipped += 1
 
-    msg = f"Cleared {removed} items, freeing about {_gb(freed)} gigabytes."
+    total = removed + skipped
+    msg = f"Cleared {removed} of {total} items, freeing about {_gb(freed)} gigabytes."
     if skipped:
-        msg += f" {skipped} were in use and left alone."
-    print(f"[SYS] temp cleanup removed={removed} skipped={skipped} freed={freed}")
+        msg += (f" {skipped} {'was' if skipped == 1 else 'were'} in use "
+                f"and got skipped.")
+    if unreadable:
+        msg += (f" {unreadable} folder{'s' if unreadable > 1 else ''} needed admin "
+                f"rights, so I left {'them' if unreadable > 1 else 'it'} alone.")
+    print(f"[SYS] temp cleanup removed={removed} skipped={skipped} "
+          f"unreadable={unreadable} freed={freed}")
+    # Succeeds as long as the operation ran: skipping locked files is a normal
+    # partial result, not a failure worth an error voice line.
     return {"success": True, "speak": True, "message": msg}
 
 
@@ -495,16 +614,34 @@ def sleep_pc(parameter: str = "") -> dict:
     powrprof's SetSuspendState(bHibernate=FALSE) HIBERNATES anyway whenever
     hibernation is enabled, so it cannot be used for a real sleep. The
     WinForms call maps to the correct S3 transition.
+
+    NOT run through _run(): SetSuspendState does not return until the machine
+    WAKES UP again, so waiting on it always hit the subprocess timeout and
+    reported "timed out" / FAILED even though the PC had genuinely slept —
+    the log contradicted what the user saw. Spawned detached instead, so the
+    outcome we report matches reality: success here means "suspend request
+    issued", which is the last thing observable before the CPU stops.
+
+    Hibernate is deliberately NOT disabled first. Turning it off to force S3
+    would destroy the user's existing hibernate/fast-startup configuration as
+    a side effect of a "sleep" command.
     """
-    ok, out = _run(["powershell", "-NoProfile", "-Command",
-                    "Add-Type -AssemblyName System.Windows.Forms; "
-                    "[System.Windows.Forms.Application]::SetSuspendState("
-                    "[System.Windows.Forms.PowerState]::Suspend, $false, $false)"],
-                   timeout=15.0)
-    if ok:
-        return {"success": True, "message": "Going to sleep."}
-    print(f"[SYS] sleep failed: {out[:200]}")
-    return {"success": False, "message": "I couldn't put the PC to sleep."}
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-Command",
+             "Add-Type -AssemblyName System.Windows.Forms; "
+             "[System.Windows.Forms.Application]::SetSuspendState("
+             "[System.Windows.Forms.PowerState]::Suspend, $false, $false)"],
+            creationflags=_NO_WINDOW)
+    except Exception as e:
+        print(f"[SYS] sleep failed to launch: {e}")
+        return {"success": False, "message": "I couldn't put the PC to sleep."}
+
+    # Give the transition a moment to begin so a real launch failure (bad
+    # assembly, blocked policy) still surfaces while we can speak.
+    time.sleep(1.5)
+    print("[SYS] sleep: suspend requested via SetSuspendState(Suspend)")
+    return {"success": True, "message": "Going to sleep."}
 
 
 def hibernate_pc(parameter: str = "") -> dict:

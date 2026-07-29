@@ -4924,6 +4924,19 @@ def _handle_site_search(parameter: str) -> str:
 
 
 def _handle_click(parameter: str) -> str | dict:
+    # NATIVE-APP ROUTING FIRST. structural_ui's selectors are browser-DOM-only
+    # (role="tab", href, aria), so "click the Performance tab in Task Manager"
+    # can never resolve there — it previously reported "0 tab candidates",
+    # which reads as a bug rather than the real answer. A named native app is
+    # either driven through UI Automation or honestly declined, and neither
+    # path should start a browser.
+    import native_ui
+    native_app = native_ui.detect_native_target(parameter)
+    if native_app:
+        if not native_ui.is_supported(native_app):
+            return native_ui.unsupported_reason(native_app, parameter)
+        return native_ui.click_native(parameter)
+
     browser = get_browser(_last_browser_name)
     try:
         WebDriverWait(browser, 5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
