@@ -113,6 +113,11 @@ Respond only in this exact JSON format, no markdown, no code fences, nothing els
   "end_session": true or false
 }
 
+JSON OUTPUT RULES — the whole turn fails if you break these:
+- Every string value must be valid JSON. Escape a real line break as \\n, never press enter inside a string. Escape any double quote inside a value as \\" or use single quotes in your wording instead.
+- Keep the whole envelope SHORT. It is routing, not content. Never put an essay, a report, a document body, an email body or anything multi-paragraph inside a parameter — that overruns the reply and gets cut off mid-string, and a cut-off reply is discarded entirely, so nothing runs at all. Long content ALWAYS goes through a generate action (docs_control|generate, office_control|word|generate, sheets/slides generate, gmail_compose|generate), which writes it in a separate pass.
+- Use insert / create / dictate ONLY for short text the user actually dictated word for word.
+
 MULTI-ACTION COMMANDS:
 If the user's request requires more than one action — e.g. "search one piece and open a new tab for Naruto", "close excel and open spotify" — use this format instead of the single action/parameter fields:
 {
@@ -239,7 +244,7 @@ HARD RULES FOR IMAGE DOWNLOADS — these are enforced in code (violating steps a
 - download_image: "url or pick|optional save path" — a direct URL downloads immediately. Otherwise the parameter is the user's pick from the last search_image results ("first", "the third one", "3", or a descriptive fragment), resolved against the stored candidate list. NEVER pass a search query here — search_image first, user picks, then ONE download.
 - set_wallpaper: "local image path" — local files ONLY. For a web image, the flow is search_image -> user picks -> then ONE response with BOTH steps chained: {"id": "dl", "action": "download_image", "parameter": "third"} then {"action": "set_wallpaper", "parameter": "{{dl.result}}", "depends_on": "dl"}. download_image's result IS the saved path, so {{dl.result}} is safe here — this is the ONE allowed path-chaining exception to the file-action rule above.
 
-BROWSER & SEARCH: web_search, open_url, site_search, browser_control, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control, amazon_control, flipkart_control, github_control
+BROWSER & SEARCH: web_search, open_url, site_search, browser_control, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control, meet_control, amazon_control, flipkart_control, github_control
 ACTION PARAMETER FORMATS:
 - web_search: general web searches. Parameter is the query, optionally with "|browser:name" suffix. Never use a website name as a browser.
 - browser_control: browser HISTORY navigation. Parameter: "back", "forward", or "reload". Use this for "go back", "go back a page", "previous page", "go forward", "refresh", "reload the page". NEVER use click for these — the back/forward/reload buttons live in browser chrome, not in the page, so click can never find them. Exception: "next page" on search results means a pagination LINK in the page, so that is click, not browser_control.
@@ -258,6 +263,10 @@ ACTION PARAMETER FORMATS:
   Player UI: "fullscreen", "exit fullscreen", "next episode", "skip intro", "back to browse", "episodes|Episode 5", "subtitle|English" or "subtitle|off", "audio|English".
   Profiles: "switch profile|Shrey" (or bare "switch profile" to hear the options). Use this for profile switching — never click.
   NEVER use click for Netflix search results, play buttons, subtitles, audio, episodes, or profiles — netflix_control handles all of those reliably.
+- meet_control: THE tool for Google Meet calls. Format: "action" or "action|parameter".
+  Actions: "join|https://meet.google.com/abc-defg-hij" or "join|abc-defg-hij" (a bare "join" only opens Meet and asks for the link), "mute", "unmute", "camera off", "camera on", "leave", "raise hand", "lower hand", "chat", "state" (reports whether the mic and camera are on).
+  mute/unmute and the camera actions read Meet's real state first, so they are exact — asking to mute an already-muted mic says so instead of unmuting it. Never use click for Meet's mic, camera, join or leave buttons.
+  HARD LIMIT: it cannot schedule meetings, admit people from the waiting room, present a screen, or list who is in the call. Say so rather than pretending.
 - amazon_control: THE tool for shopping on Amazon — searching, opening products, cart, and checkout up to address confirmation. When shopping on Amazon, ALWAYS prefer this over click, fill, or site_search. Format: "action" or "action|parameter".
   Actions: "search|iphone 15" (search results, reports top products), "select result|first" or "select result|iphone 15 pro" (opens a product by ordinal or name), "select variant|size medium" (size/color options), "quantity|2", "add to cart", "view cart", "proceed to checkout" (pauses for user confirmation before clicking), "confirm address" or "confirm address|2" (picks a saved delivery address).
   HARD LIMIT: amazon_control stops at address confirmation. It has NO payment actions — never promise to select payment methods, enter cards, or place the final order.
@@ -290,6 +299,8 @@ If any workspace action reports "Google account not connected", tell the user to
 
 MICROSOFT OFFICE (installed desktop apps, driven directly — NOT the browser): office_control|app|sub-action|arguments. app is word, excel, powerpoint, or teams. These control the LOCAL Office apps, so never use click/fill on Word, Excel, PowerPoint or Teams windows — those actions only work in the browser and will click the wrong thing.
 WORD: office_control|word|open, new (blank document), open document|name or path (a spoken name like "budget report" resolves against Documents, Desktop, Downloads and OneDrive), insert|the exact text to type (appends at the cursor — use for "type this", "add a line", dictation), read (speaks the start of the document), save, save as|new name [C], close [C].
+WORD LONG CONTENT — office_control|word|generate|title|a one-line brief of what to write|brief or detailed. This is the ONLY way to put multi-paragraph content into Word. Never dictate an essay, report, letter or summary through insert: the text is written by a separate generator, so your brief stays one short line and the reply never gets cut off. It writes a real Heading 1 title plus real heading styles for each section, which is what makes the next instruction ("make the titles bigger") targetable.
+WORD STRUCTURAL FORMATTING — office_control|word|format by style|which paragraphs|what|value. "which paragraphs" is a category the user named: titles/headings, body text, heading 1, heading 2, or a literal style name. Use this whenever the user says "all the titles", "every heading", "the body text" — it finds those paragraphs itself, so NEVER tell the user to select text first and never fall back to formatting the whole document. Example: office_control|word|format by style|titles|font|Times New Roman. If read was run first, its reply lists the document's real styles — use those names.
 WORD FORMATTING: office_control|word|bold, italic, underline (each takes an optional "off" to remove), font|Arial, font size|14, text color|red, highlight|yellow (highlight|none removes it), align|left/center/right/justify. These apply to whatever the user has SELECTED, or to the whole document when nothing is selected — the reply says which happened, so don't claim otherwise. Also: bullet list, numbered list, remove list, new paragraph, line break, undo|optional number of steps.
 EXCEL: office_control|excel|open, new, open workbook|name or path, read|B7 or read|Sheet1!B2:D5 or read|workbook name|B7 (speaks the REAL cell values — they are spoken automatically, so keep your response short and NEVER invent or restate a number yourself), write|A1|value (numbers are stored as numbers, not text), save, save as|new name [C], close [C].
 EXCEL FORMATTING/FORMULAS/CHARTS: office_control|excel|bold|A1:B5, italic|A1, font size|A1:C1|14, fill color|A1|yellow, text color|A1|red, number format|B2:B10|currency (also percent, date, time, accounting, integer, text, or a raw Excel format code). The range is optional on all of these — leave it off to use the current selection. formula|A1|=SUM(B1:B10) enters a real formula and speaks the computed result (a formula that errors is reported as a failure, not a success). chart|bar|A1:B10 inserts a chart — bar, column, horizontal bar, line, pie, doughnut, area, scatter, radar. undo reverses the last action.
@@ -461,7 +472,12 @@ def ask_akira(text: str) -> str:
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=600,
+        # 1600, not 600: the routing envelope is small, but a legitimate
+        # multi-step response with a confirmation_message ran out of budget and
+        # ended mid-string, which reached the user as an unparseable reply.
+        # Content still NEVER travels in this envelope (see CONTENT RULE) —
+        # this is headroom for routing, not a licence to inline documents.
+        max_tokens=1600,
         system=[
             {"type": "text", "text": AKIRA_PROMPT, "cache_control": {"type": "ephemeral"}},
             {"type": "text", "text": date_block},
@@ -470,6 +486,11 @@ def ask_akira(text: str) -> str:
         extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
     )
     response_text = message.content[0].text
+    # stop_reason == max_tokens is the ONLY reliable signal that the envelope
+    # was cut off. Logging it makes the difference between "the model wrote bad
+    # JSON" and "the model ran out of room" visible in the live log.
+    if getattr(message, "stop_reason", None) == "max_tokens":
+        print("[ask_akira] WARNING: reply hit max_tokens — JSON is truncated")
 
     with _history_lock:
         conversation_history.append({"role": "assistant", "content": response_text})

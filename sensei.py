@@ -6,7 +6,6 @@ Handles wake word detection, VAD, recording, transcription, and action execution
 import os
 import re
 import time
-import json
 import torch
 import pyaudio
 import tempfile
@@ -15,6 +14,7 @@ import threading
 import numpy as np
 import openwakeword
 import claude_handler
+import llm_json
 import action_guard
 import system_control
 import office_control
@@ -596,15 +596,31 @@ def get_akira_response(text: str) -> dict | None:
             # fall through to normal LLM call (user said something else)
 
     try:
-        raw = claude_handler.ask_akira(text).replace("```json", "").replace("```", "").strip()
-        if not raw:
+        raw = claude_handler.ask_akira(text)
+        if not (raw or "").strip():
             return {"mode": "conversation",
                     "response": "Having trouble connecting right now.", "end_session": False}
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        print(f"[get_akira_response] JSONDecodeError: {e!r} | raw: {raw!r}")
-        return {"mode": "conversation",
-                "response": "Something went wrong on my end. Say that again.", "end_session": False}
+        # Tolerant parse: the model emits raw newlines and bare quotes inside
+        # string values, and a long parameter can end the reply mid-string.
+        # llm_json repairs the first and REPORTS the second.
+        response, info = llm_json.parse(raw)
+        if response is None:
+            print(f"[get_akira_response] unparseable reply: {raw[:400]!r}")
+            return {"mode": "conversation",
+                    "response": "Something went wrong on my end. Say that again.",
+                    "end_session": False}
+        if info["truncated"]:
+            # A cut-off string means the last value is INCOMPLETE. Acting on it
+            # would type half a paragraph into the user's document, so refuse
+            # and say why instead of silently doing something wrong.
+            print("[get_akira_response] reply was truncated mid-string — "
+                  "refusing to execute the actions in it")
+            return {"mode": "conversation",
+                    "response": "That answer came back cut off, so I didn't run it. "
+                                "If you want long content written, ask me to generate "
+                                "it and I'll write it properly.",
+                    "end_session": False}
+        return response
     except Exception as e:
         print(f"[get_akira_response] unexpected error: {e!r}")
         return {"mode": "conversation",
