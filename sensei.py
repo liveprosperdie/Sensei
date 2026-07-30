@@ -33,17 +33,7 @@ openwakeword.utils.download_models()
 WAKE_THRESHOLD = float(os.getenv("SENSEI_WAKE_THRESHOLD", "0.2"))
 WAKE_DEBUG     = os.getenv("SENSEI_WAKE_DEBUG", "") not in ("", "0", "false")
 
-# Resolve the wake model next to THIS file, not against the current working
-# directory — launching from a shortcut or any other folder otherwise fails.
-_WAKE_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "sensei.onnx")
-if not os.path.isfile(_WAKE_MODEL):
-    raise SystemExit(
-        f"Wake model not found: {_WAKE_MODEL}\n"
-        "sensei.onnx is gitignored, so a fresh clone won't have it — copy your "
-        "trained model into the project folder."
-    )
-oww_model = WakeModel(wakeword_models=[_WAKE_MODEL], inference_framework="onnx")
+oww_model = WakeModel(wakeword_models=["sensei.onnx"], inference_framework="onnx")
 
 # openwakeword's predict() returns {model_label: score} for EVERY loaded model.
 # Reading position [0] out of that dict assumed one model and a stable order;
@@ -52,7 +42,7 @@ oww_model = WakeModel(wakeword_models=[_WAKE_MODEL], inference_framework="onnx")
 # once, here, and fail loudly if it can't be determined.
 _WAKE_KEY = next(iter(oww_model.models.keys()), None)
 if _WAKE_KEY is None:
-    raise SystemExit(f"Wake model {_WAKE_MODEL} loaded no usable model.")
+    raise SystemExit(f"Wake model loaded but has no usable model inside.")
 print(f"[wake] model '{_WAKE_KEY}' loaded, threshold {WAKE_THRESHOLD}")
 
 mic = pyaudio.PyAudio()
