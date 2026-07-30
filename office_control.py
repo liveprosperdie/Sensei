@@ -246,6 +246,15 @@ def _resolve_image(spec: str) -> tuple[str | None, str | None]:
     if os.path.isabs(local) or os.sep in local:
         return None, f"I couldn't find an image at '{spec}'."
 
+    # A bare filename that does NOT exist is the model inventing a plausible
+    # path ("images.jpg", "image.images.jpg" — both seen live) while a picker
+    # full of real numbered candidates is open. Handing that to resolve_pick
+    # risks a fuzzy title match on the WRONG candidate, so refuse it outright
+    # and ask for the number instead.
+    if os.path.splitext(spec)[1].lower() in _IMG_EXTS:
+        return None, (f"There's no file called {spec} — say the NUMBER of the "
+                      f"image you want from the ones on your screen.")
+
     try:
         import image_flow
     except Exception as e:                                    # pragma: no cover
@@ -283,6 +292,7 @@ def _image_pass_prompt(advance_first: bool) -> str:
     cur = doc_image_plan.advance() if advance_first else doc_image_plan.current()
     while cur:
         for query in doc_image_plan.query_candidates(cur["heading"],
+                                                     cur["subject"],
                                                      cur["doc_title"]):
             try:
                 res = image_flow.search_image(query)
@@ -916,7 +926,9 @@ def _word_generate(app, doc, parameter: str | None) -> dict:
     # MANDATORY, NOT OPTIONAL: every generated document gets an image pass over
     # its sections once ALL the text exists. Batched at the end deliberately —
     # interleaving picks between sections broke the flow of the writing.
-    if doc_image_plan.begin("word", title, headings):
+    # `brief` (what the USER asked for) anchors the image queries — the
+    # generated headings are written for prose and search terribly on their own.
+    if doc_image_plan.begin("word", title, headings, brief):
         prompt = _image_pass_prompt(False)
         if prompt:
             return _ok(f"{written} Now the images. {prompt}", speak=True)
