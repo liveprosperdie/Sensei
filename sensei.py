@@ -109,12 +109,9 @@ RISKY_WORKSPACE_PARAMS = frozenset({
     "delete",
 })
 
-# Office sub-actions that can lose work — closing a document (unsaved edits)
-# and save-as (can overwrite an existing file). Pulled from office_control so
-# the gate list cannot drift from the implementation, same as TIER2_ACTIONS.
-# NOTE: office_control's parameter is "app|sub|args", so the sub-action is the
-# SECOND field, not the first — _is_dangerous_step handles that below.
-RISKY_OFFICE_PARAMS = office_control.RISKY_OFFICE_PARAMS
+# Office risk lives in office_control.is_risky_parameter() rather than a list
+# mirrored here: it must resolve spoken aliases ("remove slide" -> delete
+# slide) before checking, and only office_control owns that alias table.
 
 
 def _is_dangerous_step(step: dict) -> bool:
@@ -133,11 +130,11 @@ def _is_dangerous_step(step: dict) -> bool:
     if step.get("action") in ("slides_control", "docs_control", "sheets_control"):
         return param in RISKY_WORKSPACE_PARAMS
     if step.get("action") == "office_control":
-        # "word|close" / "excel|save as|Budget" — field 0 is the app, field 1
-        # is the sub-action being risked.
-        fields = (step.get("parameter") or "").split("|")
-        sub = (fields[1] if len(fields) > 1 else "").strip().lower().replace("_", " ")
-        return sub in RISKY_OFFICE_PARAMS
+        # Delegated because office_control's parameter is "app|sub|args" (the
+        # sub-action is field 1, not 0) AND the sub-action may be an alias:
+        # "remove slide" and "close document" must gate exactly like
+        # "delete slide" and "close". office_control resolves both.
+        return office_control.is_risky_parameter(step.get("parameter"))
     return False
 
 
@@ -374,7 +371,7 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
     return results
 
 
-# ── Response handling ─────────────────────────────────────────────────────────
+# ── Response handling ────────────────────────────────────────────────��────────
 
 def handle_response(response: dict) -> bool:
     """
