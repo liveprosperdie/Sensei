@@ -16,6 +16,11 @@ independent causes, both real:
      bare " inside string values instead of \\n and \\". This is recoverable
      and is exactly what the repair pass below fixes.
 
+  3. TWO COMPLETE OBJECTS IN ONE REPLY, with the model second-guessing itself
+     in prose between them. NOT a repair case — the prompt forbids it — but the
+     parser still takes the first complete object so a self-correcting reply
+     can never be stitched into an action nobody asked for.
+
 So parsing is deliberately two-stage: strict json.loads first (the normal
 path, zero risk), then ONE repair pass that re-escapes what the model got
 wrong and closes what the model never finished. The repair reports whether it
@@ -171,6 +176,22 @@ def parse(raw: str) -> tuple[dict | None, dict]:
         return (obj if isinstance(obj, dict) else None), info
     except json.JSONDecodeError as first:
         print(f"[llm_json] strict parse failed: {first}")
+
+    # TWO COMPLETE OBJECTS IN ONE REPLY (live bug, 2026-07): the model emitted a
+    # full object, then prose second-guessing itself, then another full object.
+    # That is a GENERATION problem — AKIRA_PROMPT now forbids it outright — but
+    # the repair pass below must never see it: re-escaping and closing a
+    # two-object document can merge them into a plausible-looking envelope that
+    # runs an action nobody chose. So take the FIRST complete object and drop
+    # the rest, before any repair. raw_decode stops at the end of object one.
+    try:
+        obj, end = json.JSONDecoder().raw_decode(text)
+        if isinstance(obj, dict):
+            print(f"[llm_json] took the first complete object, discarded "
+                  f"{len(text) - end} trailing chars (self-correcting reply)")
+            return obj, info
+    except json.JSONDecodeError:
+        pass
 
     repaired, truncated = _repair(text)
     info["truncated"] = truncated
