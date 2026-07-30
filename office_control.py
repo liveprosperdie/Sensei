@@ -478,6 +478,13 @@ def _int_arg(parameter: str | None) -> int | None:
     return int(digits) if digits else None
 
 
+def _sentence(text: str) -> str:
+    """Capitalise only the FIRST letter. str.capitalize() would lowercase the
+    rest and turn "Times New Roman" into "times new roman" in the spoken reply.
+    """
+    return text[:1].upper() + text[1:] if text else text
+
+
 def _apply_word_format(rng, what: str, value: str) -> tuple[str | None, str]:
     """Apply ONE formatting change to a Word range.
 
@@ -544,7 +551,7 @@ def _word_format(app, doc, what: str, parameter: str | None) -> dict:
     err, described = _apply_word_format(rng, what, parameter or "")
     if err:
         return _err(err)
-    return _ok(f"{described.capitalize()} on {scope}.")
+    return _ok(f"{_sentence(described)} on {scope}.")
 
 
 # ── Word structure: paragraph styles, style-targeted formatting, generation ───
@@ -681,7 +688,7 @@ def _word_format_by_style(doc, parameter: str | None) -> dict:
 
     names = ", ".join(dict.fromkeys(s for _p, s in targets))
     count = len(targets)
-    return _ok(f"{described.capitalize()} on {count} "
+    return _ok(f"{_sentence(described)} on {count} "
                f"{'paragraph' if count == 1 else 'paragraphs'} "
                f"styled {names}.")
 
@@ -782,7 +789,7 @@ def _word_generate(app, doc, parameter: str | None) -> dict:
                f"{'section' if headings == 1 else 'sections'}.")
 
 
-# ── Excel ─────────────────────────────────────────────────────────────────────
+# ── Excel ────────────────────────────────────────────────────────────��────────
 
 def _excel(sub: str, parameter: str | None) -> dict:
     app, err = _app("excel", create=sub != "close")
