@@ -37,6 +37,8 @@ exactly ONE confirmation mechanism.
 import os
 import re as _re
 
+import doc_image_plan
+
 # pywin32 is Windows-only. Probing once at import keeps this module importable
 # on any platform (and keeps `import executor` working in CI/sandbox) — every
 # entry point checks _COM_ERROR before touching COM. Same guard shape as
@@ -260,6 +262,94 @@ def _resolve_image(spec: str) -> tuple[str | None, str | None]:
 _IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
 
 
+# ── Mandatory batch image pass after generation ───────────────────────────────
+
+def _image_pass_prompt(advance_first: bool) -> str:
+    """Search images for the current (or next) section of the active plan and
+    return the spoken prompt for it. Empty string once the pass is finished.
+
+    Reuses image_flow.search_image untouched, so the user sees the SAME local
+    numbered picker page as any other image search. Broader queries are tried
+    automatically when a heading is too specific to return anything, and a
+    section with no usable results is skipped rather than deadlocking the pass.
+    """
+    try:
+        import image_flow
+    except Exception as e:                                    # pragma: no cover
+        print(f"[OFFICE] image pass unavailable ({e})")
+        doc_image_plan.clear()
+        return ""
+
+    cur = doc_image_plan.advance() if advance_first else doc_image_plan.current()
+    while cur:
+        for query in doc_image_plan.query_candidates(cur["heading"],
+                                                     cur["doc_title"]):
+            try:
+                res = image_flow.search_image(query)
+            except Exception as e:
+                print(f"[OFFICE] image search failed for {query!r}: {e}")
+                continue
+            if res.get("success"):
+                return (f"Section {cur['index']} of {cur['total']}, "
+                        f"{cur['heading']}. {res.get('message', '')} "
+                        "Say a number to use one, or say skip.")
+            print(f"[OFFICE] no results for {query!r} — broadening")
+        print(f"[OFFICE] skipping images for section {cur['heading']!r}")
+        cur = doc_image_plan.advance()
+    return ""
+
+
+def _word_insert_picture_after_heading(doc, heading: str, path: str) -> str | None:
+    """Put the picture in its own centred paragraph directly under `heading`.
+    Returns an error string, or None on success."""
+    want = doc_image_plan.clean_heading(heading).lower()
+    target = None
+    try:
+        for p in doc.Paragraphs:
+            style, text, level = _para_info(p)
+            if not text:
+                continue
+            is_heading = level != _WD_BODY_TEXT or style.lower().startswith("heading")
+            if is_heading and doc_image_plan.clean_heading(text).lower() == want:
+                target = p
+                break
+    except Exception as e:
+        return f"couldn't read the document ({e})"
+    if target is None:
+        return f"couldn't find the '{heading}' heading"
+
+    try:
+        target.Range.InsertParagraphAfter()
+        holder = target.Next()
+        if holder is None:
+            return "couldn't make room under that heading"
+        normal = _word_style(doc, "normal")
+        if normal is not None:
+            try:
+                holder.Style = normal
+            except Exception as e:
+                print(f"[OFFICE] image paragraph style failed: {e}")
+        try:
+            holder.Alignment = 1                              # wdAlignParagraphCenter
+        except Exception:
+            pass
+        shape = holder.Range.InlineShapes.AddPicture(
+            FileName=path, LinkToFile=False, SaveWithDocument=True)
+    except Exception as e:
+        return f"couldn't insert the picture ({e})"
+
+    # Keep the picture inside the text column — Word does not scale it down.
+    try:
+        setup = doc.PageSetup
+        max_w = setup.PageWidth - setup.LeftMargin - setup.RightMargin
+        if shape.Width > max_w:
+            shape.LockAspectRatio = -1                        # msoTrue
+            shape.Width = max_w
+    except Exception as e:
+        print(f"[OFFICE] picture resize skipped: {e}")
+    return None
+
+
 # ── Word ──────────────────────────────────────────────────────────────────────
 
 def _word(sub: str, parameter: str | None) -> dict:
@@ -336,6 +426,7 @@ def _word(sub: str, parameter: str | None) -> dict:
             saved = bool(doc.Saved)
             name = doc.Name
             doc.Close(SaveChanges=-1 if not saved else 0)   # wdSaveChanges
+            doc_image_plan.clear()      # the pass belonged to THAT document
             return _ok(f"Closed {name}." if saved
                        else f"Saved and closed {name}.")
         except Exception as e:
@@ -407,10 +498,44 @@ def _word(sub: str, parameter: str | None) -> dict:
         except Exception as e:
             return _err(f"I couldn't do that: {e}")
 
+    if sub == "skip image":
+        cur = doc_image_plan.current() if doc_image_plan.is_active("word") else None
+        if not cur:
+            return _err("There's no image pass running right now.")
+        nxt = _image_pass_prompt(True)
+        if nxt:
+            return _ok(f"Skipping the image for {cur['heading']}. {nxt}",
+                       speak=True)
+        return _ok("Skipped that one. That's every section covered.")
+
     if sub == "insert image":
         path, e = _resolve_image(parameter)
         if e:
             return _err(e)
+
+        # Inside a batch image pass the picture belongs UNDER its section
+        # heading, not wherever the caret happens to be sitting.
+        cur = doc_image_plan.current() if doc_image_plan.is_active("word") else None
+        if cur:
+            err = _word_insert_picture_after_heading(doc, cur["heading"], path)
+            if err:
+                print(f"[OFFICE] section insert failed ({err}) — using the caret")
+            placed = (f"Added that image under {cur['heading']}." if not err
+                      else f"I couldn't place it under {cur['heading']} — "
+                           f"{err}, so it went in at the cursor instead.")
+            if err:
+                try:
+                    sel = app.Selection
+                    sel.Collapse(0)
+                    sel.InlineShapes.AddPicture(FileName=path, LinkToFile=False,
+                                                SaveWithDocument=True)
+                except Exception as ex:
+                    return _err(f"I couldn't insert that image: {ex}")
+            nxt = _image_pass_prompt(True)
+            if nxt:
+                return _ok(f"{placed} {nxt}", speak=True)
+            return _ok(f"{placed} That's every section covered.")
+
         try:
             sel = app.Selection
             sel.Collapse(0)
@@ -784,12 +909,21 @@ def _word_generate(app, doc, parameter: str | None) -> dict:
     if err:
         return _err(f"I couldn't write it into the document: {err}")
 
-    headings = sum(1 for style, _t in blocks if style.startswith("heading")) - 1
-    return _ok(f"Wrote {title} into the document with {headings} "
-               f"{'section' if headings == 1 else 'sections'}.")
+    headings = [text for style, text in blocks[1:] if style.startswith("heading")]
+    written = (f"Wrote {title} into the document with {len(headings)} "
+               f"{'section' if len(headings) == 1 else 'sections'}.")
+
+    # MANDATORY, NOT OPTIONAL: every generated document gets an image pass over
+    # its sections once ALL the text exists. Batched at the end deliberately —
+    # interleaving picks between sections broke the flow of the writing.
+    if doc_image_plan.begin("word", title, headings):
+        prompt = _image_pass_prompt(False)
+        if prompt:
+            return _ok(f"{written} Now the images. {prompt}", speak=True)
+    return _ok(written)
 
 
-# ── Excel ────────────────────────────────────────────────────────────��────────
+# ── Excel ──────────────────────────────────────────────���─────────────��────────
 
 def _excel(sub: str, parameter: str | None) -> dict:
     app, err = _app("excel", create=sub != "close")
@@ -1557,6 +1691,10 @@ _ALIASES = {
     "add image": "insert image", "insert picture": "insert image",
     "add picture": "insert image", "insert photo": "insert image",
     "add photo": "insert image", "put image": "insert image",
+    # batch image pass: moving past a section without an image
+    "skip": "skip image", "no image": "skip image",
+    "skip section": "skip image", "skip picture": "skip image",
+    "next section": "skip image",
     # formulas & charts
     "enter formula": "formula", "add formula": "formula",
     "set formula": "formula", "sum": "formula", "calculate": "formula",
