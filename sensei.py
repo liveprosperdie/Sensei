@@ -27,7 +27,33 @@ from openwakeword import Model as WakeModel
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 openwakeword.utils.download_models()
-oww_model = WakeModel(wakeword_models=["sensei.onnx"], inference_framework="onnx")
+
+# Score above which "Sensei" counts as heard. Defined here because the startup
+# banner reports it — set SENSEI_WAKE_DEBUG=1 to print live scores and tune it.
+WAKE_THRESHOLD = float(os.getenv("SENSEI_WAKE_THRESHOLD", "0.2"))
+WAKE_DEBUG     = os.getenv("SENSEI_WAKE_DEBUG", "") not in ("", "0", "false")
+
+# Resolve the wake model next to THIS file, not against the current working
+# directory — launching from a shortcut or any other folder otherwise fails.
+_WAKE_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "sensei.onnx")
+if not os.path.isfile(_WAKE_MODEL):
+    raise SystemExit(
+        f"Wake model not found: {_WAKE_MODEL}\n"
+        "sensei.onnx is gitignored, so a fresh clone won't have it — copy your "
+        "trained model into the project folder."
+    )
+oww_model = WakeModel(wakeword_models=[_WAKE_MODEL], inference_framework="onnx")
+
+# openwakeword's predict() returns {model_label: score} for EVERY loaded model.
+# Reading position [0] out of that dict assumed one model and a stable order;
+# after an openwakeword upgrade it can silently return a different label's
+# score, so the wake word never fires and nothing is logged. Bind the real key
+# once, here, and fail loudly if it can't be determined.
+_WAKE_KEY = next(iter(oww_model.models.keys()), None)
+if _WAKE_KEY is None:
+    raise SystemExit(f"Wake model {_WAKE_MODEL} loaded no usable model.")
+print(f"[wake] model '{_WAKE_KEY}' loaded, threshold {WAKE_THRESHOLD}")
 
 mic = pyaudio.PyAudio()
 stream = mic.open(format=pyaudio.paInt16, channels=1, rate=16000,
@@ -371,7 +397,7 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
     return results
 
 
-# ── Response handling ────────────────────────────────────────────────��────────
+# ── Response handling ────────────────────────────────���───────────────��────────
 
 def handle_response(response: dict) -> bool:
     """
@@ -663,10 +689,21 @@ while True:
             session_active = False
             chunk    = stream.read(1280, exception_on_overflow=False)
             audio_np = np.frombuffer(chunk, dtype=np.int16)
-            score    = list(oww_model.predict(audio_np).values())[0]
+            # Look the score up by the model's real key. Positional access
+            # returned whichever model the dict happened to order first.
+            scores   = oww_model.predict(audio_np)
+            score    = scores.get(_WAKE_KEY, 0.0)
+
+            if WAKE_DEBUG:
+                # Peak amplitude proves the mic is actually delivering audio —
+                # a flat 0 here means the input device is wrong or muted, which
+                # looks identical to "wake word not working" from the outside.
+                peak = int(np.abs(audio_np).max()) if audio_np.size else 0
+                print(f"[wake] score={score:.3f} peak={peak:5d} "
+                      f"keys={list(scores)}")
 
             current_time = time.time()
-            if score > 0.2 and (current_time - last_activation_time) > COOLDOWN_TIME:
+            if score > WAKE_THRESHOLD and (current_time - last_activation_time) > COOLDOWN_TIME:
                 print("Wake word detected!")
                 winsound.Beep(1000, 200)
                 last_activation_time = current_time
