@@ -113,6 +113,11 @@ Respond only in this exact JSON format, no markdown, no code fences, nothing els
   "end_session": true or false
 }
 
+JSON OUTPUT RULES — the whole turn fails if you break these:
+- Every string value must be valid JSON. Escape a real line break as \\n, never press enter inside a string. Escape any double quote inside a value as \\" or use single quotes in your wording instead.
+- Keep the whole envelope SHORT. It is routing, not content. Never put an essay, a report, a document body, an email body or anything multi-paragraph inside a parameter — that overruns the reply and gets cut off mid-string, and a cut-off reply is discarded entirely, so nothing runs at all. Long content ALWAYS goes through a generate action (docs_control|generate, office_control|word|generate, sheets/slides generate, gmail_compose|generate), which writes it in a separate pass.
+- Use insert / create / dictate ONLY for short text the user actually dictated word for word.
+
 MULTI-ACTION COMMANDS:
 If the user's request requires more than one action — e.g. "search one piece and open a new tab for Naruto", "close excel and open spotify" — use this format instead of the single action/parameter fields:
 {
@@ -461,7 +466,12 @@ def ask_akira(text: str) -> str:
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=600,
+        # 1600, not 600: the routing envelope is small, but a legitimate
+        # multi-step response with a confirmation_message ran out of budget and
+        # ended mid-string, which reached the user as an unparseable reply.
+        # Content still NEVER travels in this envelope (see CONTENT RULE) —
+        # this is headroom for routing, not a licence to inline documents.
+        max_tokens=1600,
         system=[
             {"type": "text", "text": AKIRA_PROMPT, "cache_control": {"type": "ephemeral"}},
             {"type": "text", "text": date_block},
@@ -470,6 +480,11 @@ def ask_akira(text: str) -> str:
         extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
     )
     response_text = message.content[0].text
+    # stop_reason == max_tokens is the ONLY reliable signal that the envelope
+    # was cut off. Logging it makes the difference between "the model wrote bad
+    # JSON" and "the model ran out of room" visible in the live log.
+    if getattr(message, "stop_reason", None) == "max_tokens":
+        print("[ask_akira] WARNING: reply hit max_tokens — JSON is truncated")
 
     with _history_lock:
         conversation_history.append({"role": "assistant", "content": response_text})

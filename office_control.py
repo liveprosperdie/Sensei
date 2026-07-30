@@ -35,6 +35,7 @@ exactly ONE confirmation mechanism.
 """
 
 import os
+import re as _re
 
 # pywin32 is Windows-only. Probing once at import keeps this module importable
 # on any platform (and keeps `import executor` working in CI/sandbox) — every
@@ -348,7 +349,23 @@ def _word(sub: str, parameter: str | None) -> dict:
         if not text:
             return _ok("That document is empty.")
         snippet = text[:600] + ("..." if len(text) > 600 else "")
+        # 'detail' carries the paragraph STRUCTURE (style name + text) so the
+        # next turn can target formatting by structural category instead of
+        # asking the user to select text by hand. 'message' stays the short
+        # spoken form — record_action_results prefers detail for the LLM.
+        paras = _word_paragraphs(doc)
+        if paras:
+            outline = " | ".join(f"[{style}] {ptext[:100]}"
+                                 for style, ptext in paras[:60])
+            return _ok(snippet, speak=True,
+                       detail=f"Document structure: {outline}")
         return _ok(snippet, speak=True)
+
+    if sub == "generate":
+        return _word_generate(app, doc, parameter)
+
+    if sub == "format by style":
+        return _word_format_by_style(doc, parameter)
 
     if sub in _WORD_FORMAT_SUBS:
         return _word_format(app, doc, sub, parameter)
@@ -461,59 +478,308 @@ def _int_arg(parameter: str | None) -> int | None:
     return int(digits) if digits else None
 
 
-def _word_format(app, doc, what: str, parameter: str | None) -> dict:
-    value = (parameter or "").strip()
+def _apply_word_format(rng, what: str, value: str) -> tuple[str | None, str]:
+    """Apply ONE formatting change to a Word range.
+
+    Returns (error_message, description). Split out of _word_format so the
+    selection path and the format-by-style path share exactly one
+    implementation of every property — the alternative was a second copy that
+    would drift on the first added property.
+    """
+    value = (value or "").strip()
     low = value.lower()
+    try:
+        if what in ("bold", "italic", "underline"):
+            on = low not in _OFF_WORDS
+            setattr(rng.Font, what.capitalize(), -1 if on else 0)
+            return None, f"{'applied' if on else 'removed'} {what}"
+
+        if what == "font":
+            if not value:
+                return "Which font?", ""
+            rng.Font.Name = value
+            return None, f"set to {value}"
+
+        if what == "font size":
+            size = _int_arg(value)
+            if not size or not 1 <= size <= 1638:      # Word's own valid range
+                return "What size? Word allows 1 to 1638 point.", ""
+            rng.Font.Size = size
+            return None, f"set to {size} point"
+
+        if what == "text color":
+            c = _color(value)
+            if c is None:
+                return f"I don't know the colour '{value}'.", ""
+            rng.Font.Color = c
+            return None, f"coloured {value}"
+
+        if what == "highlight":
+            idx = _WD_HIGHLIGHT.get(low)
+            if idx is None:
+                return (f"I can't highlight in '{value}'. "
+                        "Try yellow, green, pink, or turquoise."), ""
+            rng.HighlightColorIndex = idx
+            return None, ("highlight removed" if idx == 0
+                          else f"highlighted {value}")
+
+        if what == "align":
+            a = _WD_ALIGN.get(low)
+            if a is None:
+                return "Left, center, right, or justify?", ""
+            rng.ParagraphFormat.Alignment = a
+            return None, f"aligned {low}"
+    except Exception as e:
+        return f"I couldn't apply that formatting: {e}", ""
+
+    return f"I can't apply '{what}' in Word.", ""
+
+
+def _word_format(app, doc, what: str, parameter: str | None) -> dict:
     try:
         rng, scope = _word_target(app, doc)
     except Exception as e:
         return _err(f"I couldn't find what to format: {e}")
 
+    err, described = _apply_word_format(rng, what, parameter or "")
+    if err:
+        return _err(err)
+    return _ok(f"{described.capitalize()} on {scope}.")
+
+
+# ── Word structure: paragraph styles, style-targeted formatting, generation ───
+
+# Word's NEGATIVE built-in style indices. Using these instead of the English
+# names is deliberate: Styles("Heading 1") raises on a non-English Word (it is
+# "Titre 1" in French, "Überschrift 1" in German), while the built-in index is
+# identical in every language pack.
+_WD_BUILTIN_STYLES = {
+    "normal": -1, "heading 1": -2, "heading 2": -3, "heading 3": -4,
+    "heading 4": -5, "heading 5": -6, "title": -63,
+}
+
+# wdOutlineLevelBodyText — every non-heading paragraph reports this.
+_WD_BODY_TEXT = 10
+
+
+def _word_style(doc, key: str):
+    """A Style object for a canonical key, or None if Word has neither form."""
+    idx = _WD_BUILTIN_STYLES.get(key)
+    if idx is not None:
+        try:
+            return doc.Styles(idx)
+        except Exception:
+            pass
     try:
-        if what in ("bold", "italic", "underline"):
-            on = low not in _OFF_WORDS
-            setattr(rng.Font, what.capitalize(), -1 if on else 0)
-            return _ok(f"{'Applied' if on else 'Removed'} {what} on {scope}.")
+        return doc.Styles(key.title())
+    except Exception:
+        return None
 
-        if what == "font":
-            if not value:
-                return _err("Which font?")
-            rng.Font.Name = value
-            return _ok(f"Set {scope} to {value}.")
 
-        if what == "font size":
-            size = _int_arg(value)
-            if not size or not 1 <= size <= 1638:      # Word's own valid range
-                return _err("What size? Word allows 1 to 1638 point.")
-            rng.Font.Size = size
-            return _ok(f"Set {scope} to {size} point.")
+def _para_info(p) -> tuple[str, str, int]:
+    """(style name, text, outline level) for one paragraph.
 
-        if what == "text color":
-            c = _color(value)
-            if c is None:
-                return _err(f"I don't know the colour '{value}'.")
-            rng.Font.Color = c
-            return _ok(f"Coloured {scope} {value}.")
+    Outline level is carried alongside the NAME because the name is localised
+    and the level is not — structural matching uses the level, the spoken reply
+    uses the name.
+    """
+    try:
+        style = str(p.Style.NameLocal)
+    except Exception:
+        style = "Normal"
+    try:
+        text = (p.Range.Text or "").replace("\r", "").replace("\x07", "").strip()
+    except Exception:
+        text = ""
+    try:
+        level = int(p.OutlineLevel)
+    except Exception:
+        level = _WD_BODY_TEXT
+    return style, text, level
 
-        if what == "highlight":
-            idx = _WD_HIGHLIGHT.get(low)
-            if idx is None:
-                return _err(f"I can't highlight in '{value}'. "
-                            "Try yellow, green, pink, or turquoise.")
-            rng.HighlightColorIndex = idx
-            return _ok(f"Removed the highlight from {scope}." if idx == 0
-                       else f"Highlighted {scope} {value}.")
 
-        if what == "align":
-            a = _WD_ALIGN.get(low)
-            if a is None:
-                return _err("Left, center, right, or justify?")
-            rng.ParagraphFormat.Alignment = a
-            return _ok(f"Aligned {scope} {low}.")
+def _word_paragraphs(doc) -> list[tuple[str, str]]:
+    """[(style name, text)] for every non-empty paragraph."""
+    out = []
+    try:
+        for p in doc.Paragraphs:
+            style, text, _ = _para_info(p)
+            if text:
+                out.append((style, text))
     except Exception as e:
-        return _err(f"I couldn't apply that formatting: {e}")
+        print(f"[OFFICE] paragraph walk failed: {e}")
+    return out
 
-    return _err(f"I can't apply '{what}' in Word.")
+
+def _style_spec_matches(spec: str, style: str, level: int) -> bool:
+    """Does a paragraph belong to the structural category the user named?
+
+    Spoken instructions name a CATEGORY ("the titles", "body text"), not a
+    style id, so headings are matched by outline level — that is the one
+    property that survives localisation, custom style names and templates.
+    """
+    spec = (spec or "").strip().lower()
+    style_low = style.lower()
+    is_heading = level != _WD_BODY_TEXT or style_low.startswith("heading")
+
+    if spec in ("heading", "headings", "header", "headers", "title", "titles",
+                "section title", "section titles", "section heading",
+                "section headings"):
+        return is_heading or style_low == "title"
+    if spec in ("body", "body text", "paragraph", "paragraphs", "normal",
+                "text", "content"):
+        return not is_heading and style_low != "title"
+    m = _re.match(r"^heading\s*(\d)$", spec)
+    if m:
+        want = int(m.group(1))
+        return level == want or style_low in (f"heading {want}",)
+    # Anything else is treated as a style name (exact, then partial).
+    return style_low == spec or spec in style_low
+
+
+def _word_format_by_style(doc, parameter: str | None) -> dict:
+    """format_by_style|<style or category>|<what>|<value>
+
+    Exists so "make all the titles Times New Roman" resolves structurally
+    instead of asking the user to select each heading by hand.
+    """
+    spec, what, value = _fields(parameter, 3)
+    what = what.lower().replace("_", " ").strip()
+    what = _ALIASES.get(what, what)
+    if not spec:
+        return _err("Which style — headings, or body text?")
+    if what not in _WORD_FORMAT_SUBS:
+        return _err(f"I can't apply '{what or 'that'}' to a style. "
+                    "I can do font, font size, bold, italic, underline, "
+                    "text color, highlight, or align.")
+
+    try:
+        paragraphs = list(doc.Paragraphs)
+    except Exception as e:
+        return _err(f"I couldn't read the document: {e}")
+
+    targets, seen_styles = [], []
+    for p in paragraphs:
+        style, text, level = _para_info(p)
+        if not text:
+            continue
+        if style not in seen_styles:
+            seen_styles.append(style)
+        if _style_spec_matches(spec, style, level):
+            targets.append((p, style))
+
+    if not targets:
+        have = ", ".join(seen_styles[:6]) or "nothing"
+        return _err(f"I couldn't find any '{spec}' paragraphs. "
+                    f"This document uses: {have}.")
+
+    described = ""
+    for p, _style in targets:
+        err, described = _apply_word_format(p.Range, what, value)
+        if err:
+            return _err(err)
+
+    names = ", ".join(dict.fromkeys(s for _p, s in targets))
+    count = len(targets)
+    return _ok(f"{described.capitalize()} on {count} "
+               f"{'paragraph' if count == 1 else 'paragraphs'} "
+               f"styled {names}.")
+
+
+# Gemini is asked for markdown-style heading markers and NOTHING else, so the
+# heading structure survives the trip as plain text and becomes real Word
+# styles here. Bold text would look similar and be structurally useless (no
+# navigation pane, no table of contents, no format_by_style targeting).
+_GEN_FORMAT_INSTRUCTIONS = (
+    "Write it as a structured document. Start each section with its heading on "
+    "its own line prefixed by '## '. Everything else is a normal body "
+    "paragraph. Do not write a document title, it already exists. Use NO other "
+    "markdown at all: no asterisks, no bold, no bullet characters, no "
+    "backticks, no tables."
+)
+
+_GEN_LENGTHS = {"brief": "short", "short": "short", "detailed": "detailed",
+                "long": "detailed", "full": "detailed", "": "short"}
+
+
+def _parse_generated_blocks(text: str) -> list[tuple[str, str]]:
+    """Generated plain text -> [(style key, paragraph text)]."""
+    blocks: list[tuple[str, str]] = []
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("### "):
+            blocks.append(("heading 3", line[4:].strip()))
+        elif line.startswith("## "):
+            blocks.append(("heading 2", line[3:].strip()))
+        elif line.startswith("# "):
+            blocks.append(("heading 1", line[2:].strip()))
+        else:
+            # A stray asterisk or bullet glyph would be read aloud and printed
+            # literally, so strip the markdown the model was told not to use.
+            blocks.append(("normal", line.strip("*• ").strip()))
+    return [(style, body) for style, body in blocks if body]
+
+
+def _word_write_blocks(app, doc, blocks: list[tuple[str, str]]) -> str | None:
+    """Type styled paragraphs at the end of the document. Returns an error."""
+    try:
+        sel = app.Selection
+        sel.EndKey(6)                                     # wdStory
+        if (doc.Content.Text or "").strip():
+            sel.TypeParagraph()                           # never join onto text
+        for style_key, text in blocks:
+            style = _word_style(doc, style_key)
+            if style is not None:
+                try:
+                    sel.Style = style
+                except Exception as e:
+                    print(f"[OFFICE] style {style_key!r} failed: {e}")
+            sel.TypeText(text)
+            sel.TypeParagraph()
+        # Leave the caret in body style so the next dictation isn't a heading.
+        normal = _word_style(doc, "normal")
+        if normal is not None:
+            try:
+                sel.Style = normal
+            except Exception:
+                pass
+        return None
+    except Exception as e:
+        return str(e)
+
+
+def _word_generate(app, doc, parameter: str | None) -> dict:
+    """generate|<title>|<topic or instructions>|<brief or detailed>
+
+    Content comes from gemini_content — the SAME generator docs_control uses.
+    It deliberately never travels inside the routing JSON: that is what used to
+    truncate the reply mid-string and kill the whole turn.
+    """
+    title, brief, length = _fields(parameter, 3)
+    if not title or not brief:
+        return _err("Generating needs a title and a short brief of what to write.")
+
+    try:
+        import gemini_content
+    except Exception as e:                                # pragma: no cover
+        return _err(f"The content generator isn't available ({e}).")
+
+    gen = gemini_content.generate(
+        brief, _GEN_FORMAT_INSTRUCTIONS,
+        _GEN_LENGTHS.get(length.lower().strip(), "short"))
+    if not gen.get("success"):
+        return _err(gen.get("message", "I couldn't generate that content."))
+
+    blocks = [("heading 1", title)] + _parse_generated_blocks(gen["text"])
+    err = _word_write_blocks(app, doc, blocks)
+    if err:
+        return _err(f"I couldn't write it into the document: {err}")
+
+    headings = sum(1 for style, _t in blocks if style.startswith("heading")) - 1
+    return _ok(f"Wrote {title} into the document with {headings} "
+               f"{'section' if headings == 1 else 'sections'}.")
 
 
 # ── Excel ─────────────────────────────────────────────────────────────────────
@@ -1242,6 +1508,13 @@ _ALIASES = {
     "open spreadsheet": "open workbook", "open sheet": "open workbook",
     "open deck": "open presentation", "open ppt": "open presentation",
     "type": "insert", "write text": "insert", "insert text": "insert",
+    # long-form generation (Word) — same verb docs_control uses
+    "write document": "generate", "write doc": "generate",
+    "generate content": "generate", "generate document": "generate",
+    "compose": "generate", "draft": "generate",
+    # structural formatting
+    "format style": "format by style",
+    "style format": "format by style", "format headings": "format by style",
     "read cell": "read", "read range": "read", "get cell": "read",
     "enter": "write", "enter data": "write", "set cell": "write",
     "write cell": "write", "put": "write",

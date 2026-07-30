@@ -112,6 +112,7 @@ TOP_SITES_MAP = {
     "figma": "https://figma.com", "drive": "https://drive.google.com",
     "docs": "https://docs.google.com", "sheets": "https://sheets.google.com",
     "maps": "https://maps.google.com", "translate": "https://translate.google.com",
+    "meet": "https://meet.google.com", "google meet": "https://meet.google.com",
 }
 
 def resolve_site_url(name: str) -> str:
@@ -286,6 +287,8 @@ _VK_CODES = {
     's': (0x53, 'KeyS', 's'), 't': (0x54, 'KeyT', 't'),
     'c': (0x43, 'KeyC', 'c'), 'k': (0x4B, 'KeyK', 'k'),
     'j': (0x4A, 'KeyJ', 'j'), 'l': (0x4C, 'KeyL', 'l'),
+    # d / e: Google Meet's own mic and camera shortcuts (ctrl+d, ctrl+e)
+    'd': (0x44, 'KeyD', 'd'), 'e': (0x45, 'KeyE', 'e'),
     ' ': (0x20, 'Space', ' '),
     'escape': (0x1B, 'Escape', ''), 'esc': (0x1B, 'Escape', ''),
     'enter': (0x0D, 'Enter', '\r'),
@@ -432,7 +435,8 @@ def _with_user_activation(browser) -> bool:
         return False
 
 
-def _send_trusted_key(browser, key: str, hold: float = 0.03) -> bool:
+def _send_trusted_key(browser, key: str, hold: float = 0.03,
+                      modifiers: int = 0) -> bool:
     """Dispatch a key through CDP so it counts as REAL user input.
 
     A JS `.click()` or send_keys on <body> is untrusted: `event.isTrusted` is
@@ -446,15 +450,20 @@ def _send_trusted_key(browser, key: str, hold: float = 0.03) -> bool:
                 'up': 'ArrowUp', 'down': 'ArrowDown'}.get(k, key)
     try:
         down = {"type": "keyDown", "key": key_name, "code": code,
-                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
-        if text:
+                "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
+                "modifiers": modifiers}
+        # With a modifier held the event is a SHORTCUT, not text input —
+        # sending "text" makes Chrome treat it as a character and the site's
+        # ctrl+key handler never fires.
+        if text and not modifiers:
             down["text"] = text
         browser.execute_cdp_cmd("Input.dispatchKeyEvent", down)
         time.sleep(hold)
         browser.execute_cdp_cmd("Input.dispatchKeyEvent", {
             "type": "keyUp", "key": key_name, "code": code,
-            "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk})
-        print(f"[FOCUS] sent trusted key {key_name!r}")
+            "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk,
+            "modifiers": modifiers})
+        print(f"[FOCUS] sent trusted key {key_name!r} modifiers={modifiers}")
         return True
     except Exception as e:
         print(f"[FOCUS] trusted key {key!r} failed: {e}")
@@ -1891,6 +1900,268 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
         return {"success": False, "message": f"Couldn't find '{parameter}' in the episodes list."}
 
     return {"success": False, "message": f"Unknown netflix_control action: {action}"}
+
+
+# ── Google Meet control ───────────────────────────────────────────────────────
+# Meet is a WEB app, so it rides the SAME browser pipeline as Netflix/YouTube:
+# the driver's working tab, aria-label based element resolution, and CDP for
+# trusted input. No vision clicking, no new automation layer.
+#
+# WHY ARIA-LABELS AND data-is-muted, AND NOTHING ELSE: Meet's class names and
+# jsname attributes are compiled and rotate constantly, but every control in
+# the bottom bar is a real button with a stateful aria-label ("Turn off
+# microphone" / "Turn on microphone", "Leave call") and the mic and camera
+# buttons additionally carry data-is-muted="true|false". That attribute is the
+# only way to know the CURRENT state, which is what makes "mute" idempotent
+# instead of a blind toggle that unmutes an already-muted mic.
+#
+# HONEST LIMITS: this joins, mutes, unmutes, toggles the camera, leaves,
+# raises/lowers the hand and opens the chat panel. It does not schedule
+# meetings, admit participants, present a screen, or read the roster.
+
+_MEET_STATE_JS = r"""
+    function visible(el) {
+        try {
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) return false;
+            const s = window.getComputedStyle(el);
+            return s.visibility !== 'hidden' && s.display !== 'none';
+        } catch (e) { return false; }
+    }
+    const out = { mic_muted: null, cam_off: null, labels: [], in_call: false };
+    const btns = document.querySelectorAll(
+        'button[aria-label], [role="button"][aria-label]');
+    for (const b of btns) {
+        if (!visible(b)) continue;
+        const label = (b.getAttribute('aria-label') || '').trim();
+        if (label) out.labels.push(label.slice(0, 60));
+        const low = label.toLowerCase();
+        const muted = b.getAttribute('data-is-muted');
+        if (muted !== null) {
+            if (low.indexOf('microphone') !== -1 || low.indexOf('mic') !== -1)
+                out.mic_muted = (muted === 'true');
+            else if (low.indexOf('camera') !== -1 || low.indexOf('video') !== -1)
+                out.cam_off = (muted === 'true');
+        }
+        if (low.indexOf('leave call') !== -1 || low.indexOf('leave the call') !== -1)
+            out.in_call = true;
+    }
+    return out;
+"""
+
+_MEET_CLICK_JS = r"""
+    const wants = arguments[0].map(s => String(s).toLowerCase());
+    const btns = Array.prototype.slice.call(document.querySelectorAll(
+        'button[aria-label], [role="button"][aria-label], button, [role="button"]'));
+    function visible(el) {
+        try {
+            const r = el.getBoundingClientRect();
+            if (r.width < 2 || r.height < 2) return false;
+            const s = window.getComputedStyle(el);
+            return s.visibility !== 'hidden' && s.display !== 'none';
+        } catch (e) { return false; }
+    }
+    // Wants are tried IN ORDER so the caller controls priority, e.g. prefer
+    // 'turn off microphone' over the looser 'microphone'.
+    for (const w of wants) {
+        for (const b of btns) {
+            if (!visible(b)) continue;
+            const label = ((b.getAttribute('aria-label') || '') + ' ' +
+                           (b.textContent || '')).toLowerCase();
+            if (label.indexOf(w) !== -1) {
+                try { b.scrollIntoView({ block: 'center' }); } catch (e) {}
+                b.click();
+                return (b.getAttribute('aria-label') ||
+                        (b.textContent || '').trim()).slice(0, 60);
+            }
+        }
+    }
+    return null;
+"""
+
+# A Meet code is three-four-three letters, which is how users read a link out.
+_MEET_CODE = re.compile(r"\b([a-z]{3}-[a-z]{4}-[a-z]{3})\b", re.IGNORECASE)
+
+
+def _meet_state(browser) -> dict:
+    try:
+        return browser.execute_script(_MEET_STATE_JS) or {}
+    except Exception as e:
+        print(f"[meet_control] state read failed: {e}")
+        return {}
+
+
+def _meet_click(browser, wants: list) -> str | None:
+    try:
+        return browser.execute_script(_MEET_CLICK_JS, wants)
+    except Exception as e:
+        print(f"[meet_control] click failed: {e}")
+        return None
+
+
+def _meet_toggle(browser, device: str, want_off: bool) -> dict:
+    """Set mic or camera to an exact state and VERIFY it landed.
+
+    Order: read state (already right -> say so), click the labelled button,
+    re-read, then fall back to Meet's own ctrl+d / ctrl+e shortcut through CDP.
+    A blind toggle is never used — that is how "mute me" ends up unmuting.
+    """
+    key = "mic_muted" if device == "microphone" else "cam_off"
+    state = _meet_state(browser)
+    if not state:
+        return {"success": False,
+                "message": "I can't see the Meet controls. Is the meeting open?"}
+    current = state.get(key)
+    noun = "microphone" if device == "microphone" else "camera"
+    if current is want_off and current is not None:
+        return {"success": True,
+                "message": (f"Your {noun} is already "
+                            f"{'off' if want_off else 'on'}.")}
+
+    verb = "turn off" if want_off else "turn on"
+    wants = [f"{verb} {noun}"]
+    if noun == "microphone":
+        wants.append(f"{verb} mic")
+    label = _meet_click(browser, wants)
+    if label:
+        if _await_state(lambda: _meet_state(browser).get(key) is want_off, 2.0):
+            return {"success": True,
+                    "message": f"{noun.capitalize()} {'off' if want_off else 'on'}."}
+
+    # Meet's documented shortcuts, dispatched as REAL input (modifier 2 = ctrl).
+    shortcut = "d" if device == "microphone" else "e"
+    if _send_trusted_key(browser, shortcut, modifiers=2):
+        if _await_state(lambda: _meet_state(browser).get(key) is want_off, 2.0):
+            return {"success": True,
+                    "message": f"{noun.capitalize()} {'off' if want_off else 'on'}."}
+
+    return {"success": False,
+            "message": (f"I couldn't change the {noun} — Meet didn't report the "
+                        "change, so I'm not claiming it worked.")}
+
+
+def meet_control(action: str, parameter: str | None = None) -> dict:
+    """
+    Google Meet automation over the existing browser pipeline.
+
+      join|<link, meeting code, or nothing>  -> open and join (or ask to join)
+      mute / unmute                          -> microphone, state-verified
+      camera off / camera on                 -> camera, state-verified
+      leave                                  -> leave the call
+      raise hand / lower hand
+      chat                                   -> open the chat panel
+      state                                  -> report mic/camera/in-call
+
+    Returns {'success': bool, 'message': str}.
+    """
+    print(f"[meet_control] action={action!r} parameter={parameter!r}")
+    browser = get_browser(_last_browser_name)
+    try:
+        browser.switch_to.window(browser._akira_tab)
+    except Exception:
+        return {"success": False, "message": "Lost track of my working tab."}
+
+    action = (action or "").strip().lower().replace("_", " ")
+    try:
+        current_url = browser.current_url or ""
+    except Exception:
+        current_url = ""
+
+    if action in ("join", "join meeting", "open", "start"):
+        target = (parameter or "").strip()
+        if target:
+            code = _MEET_CODE.search(target)
+            if target.startswith("http"):
+                url = target
+            elif code:
+                url = "https://meet.google.com/" + code.group(1).lower()
+            else:
+                url = "https://meet.google.com/" + urllib.parse.quote(
+                    target.replace(" ", ""))
+            browser.get(url)
+        elif "meet.google.com" not in current_url:
+            browser.get("https://meet.google.com/")
+            return {"success": False,
+                    "message": ("Meet is open. Give me the meeting link or code "
+                                "and I'll join it.")}
+        # The green-room join button only renders after devices initialise.
+        label = None
+        deadline = time.time() + 12
+        while time.time() < deadline and not label:
+            label = _meet_click(browser, ["join now", "ask to join",
+                                          "join meeting", "switch here"])
+            if not label:
+                time.sleep(0.6)
+        if not label:
+            state = _meet_state(browser)
+            if state.get("in_call"):
+                return {"success": True, "message": "You're already in the meeting."}
+            return {"success": False,
+                    "message": ("I opened Meet but couldn't find the join button. "
+                                "It may still be loading, or it needs you to sign in.")}
+        joined = _await_state(lambda: _meet_state(browser).get("in_call"), 8.0)
+        if "ask" in label.lower():
+            return {"success": True,
+                    "message": "I asked to join. Waiting on the host to let you in."}
+        return {"success": True,
+                "message": ("You're in the meeting." if joined
+                            else "Clicked join. It's still connecting.")}
+
+    if "meet.google.com" not in current_url:
+        return {"success": False,
+                "message": "That's not a Meet tab. Tell me the meeting link first."}
+
+    if action in ("mute", "mute mic", "mute microphone", "microphone off",
+                  "mic off"):
+        return _meet_toggle(browser, "microphone", True)
+    if action in ("unmute", "unmute mic", "unmute microphone",
+                  "microphone on", "mic on"):
+        return _meet_toggle(browser, "microphone", False)
+    if action in ("camera off", "video off", "turn off camera", "stop video"):
+        return _meet_toggle(browser, "camera", True)
+    if action in ("camera on", "video on", "turn on camera", "start video"):
+        return _meet_toggle(browser, "camera", False)
+
+    if action in ("leave", "leave call", "leave meeting", "hang up", "end call"):
+        label = _meet_click(browser, ["leave call", "leave the call", "hang up"])
+        if not label:
+            return {"success": False,
+                    "message": "I couldn't find the leave button on this page."}
+        return {"success": True, "message": "Left the meeting."}
+
+    if action in ("raise hand", "raise my hand", "hand up"):
+        if _meet_click(browser, ["raise hand"]):
+            return {"success": True, "message": "Hand raised."}
+        return {"success": False, "message": "I couldn't find the raise hand button."}
+
+    if action in ("lower hand", "lower my hand", "hand down"):
+        if _meet_click(browser, ["lower hand"]):
+            return {"success": True, "message": "Hand lowered."}
+        return {"success": False, "message": "Your hand doesn't look raised."}
+
+    if action in ("chat", "open chat", "show chat", "chat panel"):
+        if _meet_click(browser, ["chat with everyone", "open chat", "chat"]):
+            return {"success": True, "message": "Chat panel is open."}
+        return {"success": False, "message": "I couldn't open the chat panel."}
+
+    if action in ("state", "status", "am i muted"):
+        state = _meet_state(browser)
+        if not state:
+            return {"success": False, "message": "I can't read the Meet controls."}
+        mic = state.get("mic_muted")
+        cam = state.get("cam_off")
+        parts = []
+        if mic is not None:
+            parts.append("mic is " + ("muted" if mic else "live"))
+        if cam is not None:
+            parts.append("camera is " + ("off" if cam else "on"))
+        if not parts:
+            return {"success": False,
+                    "message": "I can see Meet but not the mic or camera state."}
+        prefix = "You're in a meeting, " if state.get("in_call") else ""
+        return {"success": True, "message": prefix + " and ".join(parts) + "."}
+
+    return {"success": False, "message": f"Unknown meet_control action: {action}"}
 
 
 # ── Amazon control ────────────────────────────────────���──────────────��────────
@@ -5018,6 +5289,7 @@ _ACTION_MAP = {
     "browser_control":   browser_control,
     "youtube_control":   youtube_control,
     "netflix_control":   lambda p: netflix_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
+    "meet_control":      lambda p: meet_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "amazon_control":    lambda p: amazon_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
     "flipkart_control":  lambda p: flipkart_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
     "github_control":    lambda p: github_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
