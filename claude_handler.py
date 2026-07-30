@@ -216,7 +216,7 @@ ACTION PARAMETER FORMATS (fields split with |; relative names resolve against th
 - search_file: "name or partial name|optional folder" — folder can be a spoken name like pictures or downloads. Defaults to the session folder or home.
 - open_file: "path" — opens with the default app for that file type. If it's actually a folder, it opens in File Explorer.
 - copy_files: "files/folders or pattern|destination" — e.g. "copy_files|*.png|D:\\backup" or "copy_files|Document 4.pdf|desktop". Handles FOLDERS too (copied recursively). Destination can be a spoken name (desktop, downloads). Non-destructive. This copies items ON DISK, not text.
-- compress_files: "files/folders or pattern|optional folder or archive name" ������� creates a new zip next to the sources, originals untouched. Folders are zipped with their contents. Second field may be the folder the files live in OR the zip name — both work.
+- compress_files: "files/folders or pattern|optional folder or archive name" — creates a new zip next to the sources, originals untouched. Folders are zipped with their contents. Second field may be the folder the files live in OR the zip name — both work.
 - extract_files: "archive name or path|optional destination" — extracts into a new folder named after the archive. Archive resolves by name in the session folder.
 - write_file[C]: "path|content" — overwrites the whole file, always pauses for confirmation.
 - edit_file[C]: "path|find text|replace text" — if the text isn't found or appears more than once, it stops and asks rather than guessing.
