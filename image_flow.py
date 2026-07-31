@@ -5,8 +5,10 @@ Extracted from executor.py so the flow is OS-independent and testable
 headlessly (executor.py imports winreg/win32 and cannot load off Windows).
 
 Flow contract (enforced here AND by action_guard.py at the chain level):
-  1. search_image  — queries safe image APIs (Unsplash keyed -> Openverse
-     keyless), stores the candidates, renders a LOCAL numbered picker page
+  1. search_image  — queries every available safe image API (Wikimedia
+     Commons and Openverse keyless; Unsplash and Pinterest only when their
+     token is configured) and INTERLEAVES the results, stores the candidates,
+     renders a LOCAL numbered picker page
      with real thumbnails, and navigates the browser to it. Downloads NOTHING.
   2. The user picks one candidate by position or name (a real user turn).
   3. download_image — resolves the pick against the STORED candidate list
@@ -93,51 +95,150 @@ def _is_safe_image_result(url: str, title: str = "") -> bool:
 
 # ── Provider search (Unsplash keyed -> Openverse keyless) ─────────────────────
 
-def _search_image_urls(query: str, limit: int = 6) -> tuple[list, str | None]:
-    """Up to `limit` safe image results. Each: {url, title, source_domain}.
-    Returns (results, error)."""
-    unsplash_key = os.environ.get("UNSPLASH_ACCESS_KEY")
-    if unsplash_key:
-        try:
-            resp = requests.get(
-                "https://api.unsplash.com/search/photos",
-                params={"query": query, "per_page": limit * 2, "content_filter": "high"},
-                headers={"Authorization": f"Client-ID {unsplash_key}"}, timeout=10)
-            resp.raise_for_status()
-            out = []
-            for r in resp.json().get("results", []):
-                url = r.get("urls", {}).get("full") or r.get("urls", {}).get("regular")
-                title = (r.get("description") or r.get("alt_description") or "").strip()
-                if url and _is_safe_image_result(url, title):
-                    out.append({"url": url, "title": title,
-                                "source_domain": "unsplash.com"})
-                if len(out) >= limit:
-                    break
-            if out:
-                return out, None
-            print("[search_image] Unsplash empty — falling back to Openverse")
-        except requests.RequestException as e:
-            print(f"[search_image] Unsplash failed ({e}) — falling back to Openverse")
-    try:
-        resp = requests.get(
-            "https://api.openverse.org/v1/images/",
-            params={"q": query, "page_size": limit * 3, "mature": "false"},
-            headers={"User-Agent": "AkiraAssistant/1.0"}, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        return [], f"Image search failed: {e}"
-    out, seen = [], set()
-    for r in resp.json().get("results", []):
-        url, title = r.get("url"), (r.get("title") or "").strip()
-        if not url or url in seen:
+def _commons(query: str, limit: int) -> list[dict]:
+    """Wikimedia Commons — keyless, and the only source in the pool that
+    reliably returns LABELLED reference material (anatomy plates, diagrams,
+    maps) rather than stock photography. Ranked first for that reason.
+
+    SVG results are dropped: Word's AddPicture and the Content-Type→extension
+    mapping in download_image both expect a raster file.
+    """
+    resp = requests.get(
+        "https://commons.wikimedia.org/w/api.php",
+        params={"action": "query", "generator": "search", "gsrsearch": query,
+                "gsrnamespace": "6", "gsrlimit": str(limit * 3),
+                "prop": "imageinfo", "iiprop": "url|mime",
+                "iiurlwidth": "1600", "format": "json"},
+        headers={"User-Agent": "AkiraAssistant/1.0"}, timeout=15)
+    resp.raise_for_status()
+    out = []
+    for page in (resp.json().get("query", {}).get("pages", {}) or {}).values():
+        info = (page.get("imageinfo") or [{}])[0]
+        mime = info.get("mime") or ""
+        if not mime.startswith("image/") or "svg" in mime:
             continue
-        seen.add(url)
-        if not _is_safe_image_result(url, title):
-            continue
-        out.append({"url": url, "title": title,
-                    "source_domain": urllib.parse.urlparse(url).netloc})
+        # thumburl is a scaled JPEG/PNG; full-size originals can be 50 MB+.
+        url = info.get("thumburl") or info.get("url")
+        title = _re_sub_file_prefix(page.get("title") or "")
+        if url and _is_safe_image_result(url, title):
+            out.append({"url": url, "title": title,
+                        "source_domain": "commons.wikimedia.org"})
         if len(out) >= limit:
             break
+    return out
+
+
+def _re_sub_file_prefix(title: str) -> str:
+    """'File:Human skeleton front.png' -> 'Human skeleton front'."""
+    return os.path.splitext(re.sub(r"^File:", "", title.strip()))[0]
+
+
+def _pinterest(query: str, limit: int) -> list[dict]:
+    """Pinterest, via the OFFICIAL v5 /search/partner/pins endpoint.
+
+    Only runs when PINTEREST_ACCESS_TOKEN is set: that endpoint is a gated
+    beta needing OAuth plus partner approval, and the unofficial scrapers are
+    fragile and against Pinterest's terms, so there is deliberately no
+    keyless path here. With no token this is a silent no-op and the rest of
+    the pool answers.
+    """
+    token = os.environ.get("PINTEREST_ACCESS_TOKEN")
+    if not token:
+        return []
+    resp = requests.get(
+        "https://api.pinterest.com/v5/search/partner/pins",
+        params={"term": query, "country_code": os.environ.get("PINTEREST_COUNTRY", "US"),
+                "limit": str(limit * 2)},
+        headers={"Authorization": f"Bearer {token}"}, timeout=15)
+    resp.raise_for_status()
+    out = []
+    for pin in resp.json().get("items", []):
+        images = (pin.get("media") or {}).get("images") or {}
+        best = images.get("1200x") or images.get("600x") or images.get("originals")
+        url = (best or {}).get("url")
+        title = (pin.get("title") or pin.get("alt_text") or "").strip()
+        if url and _is_safe_image_result(url, title):
+            out.append({"url": url, "title": title,
+                        "source_domain": "pinterest.com"})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _unsplash(query: str, limit: int) -> list[dict]:
+    key = os.environ.get("UNSPLASH_ACCESS_KEY")
+    if not key:
+        return []
+    resp = requests.get(
+        "https://api.unsplash.com/search/photos",
+        params={"query": query, "per_page": limit * 2, "content_filter": "high"},
+        headers={"Authorization": f"Client-ID {key}"}, timeout=10)
+    resp.raise_for_status()
+    out = []
+    for r in resp.json().get("results", []):
+        url = r.get("urls", {}).get("full") or r.get("urls", {}).get("regular")
+        title = (r.get("description") or r.get("alt_description") or "").strip()
+        if url and _is_safe_image_result(url, title):
+            out.append({"url": url, "title": title,
+                        "source_domain": "unsplash.com"})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _openverse(query: str, limit: int) -> list[dict]:
+    resp = requests.get(
+        "https://api.openverse.org/v1/images/",
+        params={"q": query, "page_size": limit * 3, "mature": "false"},
+        headers={"User-Agent": "AkiraAssistant/1.0"}, timeout=15)
+    resp.raise_for_status()
+    out = []
+    for r in resp.json().get("results", []):
+        url, title = r.get("url"), (r.get("title") or "").strip()
+        if url and _is_safe_image_result(url, title):
+            out.append({"url": url, "title": title,
+                        "source_domain": urllib.parse.urlparse(url).netloc})
+        if len(out) >= limit:
+            break
+    return out
+
+
+# Order = ranking. Commons leads because document illustrations want labelled
+# reference images; the stock sources fill in when a topic has no reference art.
+_PROVIDERS = (("Pinterest", _pinterest), ("Commons", _commons),
+              ("Unsplash", _unsplash), ("Openverse", _openverse))
+
+
+def _search_image_urls(query: str, limit: int = 6) -> tuple[list, str | None]:
+    """Up to `limit` safe image results. Each: {url, title, source_domain}.
+
+    EVERY available provider is queried and the results are INTERLEAVED rather
+    than stopping at the first that answers, so one source having a bad day
+    can't wreck a picker — and the user always sees a mix to choose from.
+    Returns (results, error).
+    """
+    pools: list[list[dict]] = []
+    for name, fn in _PROVIDERS:
+        try:
+            got = fn(query, limit)
+        except requests.RequestException as e:
+            print(f"[search_image] {name} failed ({e}) — skipping")
+            continue
+        except Exception as e:                                # malformed payload
+            print(f"[search_image] {name} returned something unusable ({e})")
+            continue
+        if got:
+            print(f"[search_image] {name}: {len(got)} results")
+            pools.append(got)
+
+    out, seen = [], set()
+    for row in range(limit):
+        for pool in pools:
+            if row < len(pool) and pool[row]["url"] not in seen:
+                seen.add(pool[row]["url"])
+                out.append(pool[row])
+                if len(out) >= limit:
+                    return out, None
     if not out:
         return [], f"No image results for '{query}'."
     return out, None
