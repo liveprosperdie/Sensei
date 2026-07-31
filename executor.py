@@ -658,6 +658,38 @@ def _get_default_browser() -> str:
     return "edge"
 
 
+_chromedriver_path: str | None = None
+
+
+def _chromedriver() -> str:
+    """Path to a chromedriver binary MATCHING the installed browser.
+
+    Always resolved through webdriver-manager so a Chrome/Brave auto-update
+    can't strand us on a stale driver ("only supports Chrome version 149,
+    current browser version is 151..." — the live failure this replaced, which
+    came from a hand-dropped chromedriver.exe next to this file being
+    preferred over the manager). The bundled exe is now only a LAST-RESORT
+    fallback for when the manager itself can't run, e.g. no network.
+
+    Cached per process: install() is a network/disk check and get_browser()
+    can be called on every action.
+    """
+    global _chromedriver_path
+    if _chromedriver_path:
+        return _chromedriver_path
+    try:
+        _chromedriver_path = ChromeDriverManager().install()
+        print(f"[BROWSER] chromedriver resolved: {_chromedriver_path}")
+    except Exception as e:
+        local = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
+        if not os.path.exists(local):
+            raise
+        print(f"[BROWSER] webdriver-manager failed ({e}); falling back to "
+              f"the bundled driver, which may not match your browser version")
+        _chromedriver_path = local
+    return _chromedriver_path
+
+
 def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.Chrome:
     global _browsers, _last_browser_name
     name = (name or _get_default_browser()).lower().strip()
@@ -676,8 +708,7 @@ def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.C
 
     # create new driver
     if name == "brave":
-        svc_path = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
-        svc = Service(svc_path if os.path.exists(svc_path) else ChromeDriverManager().install())
+        svc = Service(_chromedriver())
         if incognito:
             opt = Options()
             opt.binary_location = BRAVE_PATH
@@ -687,7 +718,7 @@ def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.C
             driver = _attach_cdp(BRAVE_PATH, 9222, svc)
 
     elif name == "chrome":
-        svc = Service(ChromeDriverManager().install())
+        svc = Service(_chromedriver())
         if incognito:
             opt = Options()
             opt.binary_location = CHROME_PATH
@@ -711,7 +742,7 @@ def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.C
         else:
             driver = _attach_cdp_edge(9224)
     else:
-        svc = Service(ChromeDriverManager().install())
+        svc = Service(_chromedriver())
         driver = _attach_cdp(CHROME_PATH, 9223, svc)
 
     _ensure_akira_tab(driver)
@@ -936,7 +967,7 @@ def click_element(driver, index: int, expected_text: str | None = None,
     probe = probe_element(driver, index)
     # href is the strongest identity signal (probe text can legitimately
     # differ from extraction text for image anchors, whose extraction text
-    # prefers the img alt attribute) — compare text only when there's no href.
+    # prefers the img alt attribute) �� compare text only when there's no href.
     stale = probe is None or (
         (expected_href is not None and probe.get("href") != expected_href) or
         (expected_href is None and expected_text is not None and
@@ -4097,7 +4128,7 @@ def write_clipboard(parameter: str | None = None) -> dict:
         return {"success": True, "message": f"Copied to clipboard ({len(parameter)} chars), but I couldn't verify it: {e}"}
 
 
-# ── Spotify ────────────────���──────────────────────────────────────────────────
+# ── Spotify ────────────────���───────────────────────────────────��──────────────
 # HYBRID control, priority order (never ask the user which):
 #   1. Desktop app installed -> Web API against it (launch + poll if not running)
 #   2. No app -> web player via Web API (open open.spotify.com, poll for device)
