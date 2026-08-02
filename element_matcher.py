@@ -276,7 +276,7 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
         + (f" (url:{el['href'][:50]})" if el.get("href") else "")
         for el in subset)
     try:
-        from claude_handler import client
+        from claude_handler import client, response_text
         message = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=20,
@@ -285,7 +285,7 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
             messages=[{"role": "user",
                        "content": f"Elements:\n{elements_text}\n\nFind: {instruction}"}],
         )
-        result = message.content[0].text.strip()
+        result = response_text(message).strip()
         print(f"[LLM] Returned: {result}")
         if "NONE" in result.upper():
             return None
