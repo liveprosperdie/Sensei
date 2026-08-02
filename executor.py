@@ -5334,6 +5334,10 @@ _ACTION_MAP = {
     "gmail_control":     lambda p: __import__("gmail_control").gmail_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     # Microsoft Office via COM (lazy import: pywin32 COM only touched on use)
     "office_control":    lambda p: __import__("office_control").office_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
+    # Obsidian via the Local REST API plugin (lazy: no network touched until used).
+    # REST, not the plugin's MCP server — see obsidian_api's module docstring for
+    # why (stdio-only MCP client, no tool-loop, and the safety gates live here).
+    "obsidian_control":  lambda p: __import__("obsidian_control").obsidian_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     # browser-side Gmail drafting — deliberately NOT the Gmail MCP (see gmail_compose docstring)
     "gmail_compose":     lambda p: gmail_compose(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "create_file":       create_file,

@@ -1,8 +1,143 @@
 # Sensei/Akira — Obsidian Focus Mode v1 Implementation Plan
 
-**Document Version:** 1.0  
-**Status:** PLANNING-ONLY (No implementation yet)  
-**Last Updated:** August 1, 2026  
+**Document Version:** 1.1  
+**Status:** PHASE 1 IMPLEMENTED  
+**Last Updated:** August 2, 2026  
+
+> **v1.1 revision note:** Three claims in v1.0 were unverified and two of them were
+> wrong. All three were re-checked against the live plugin repo, its README, and its
+> GitHub release history on 2026-08-02. See
+> **[§0 Verified Corrections](#0-verified-corrections-v11)** for what changed and why.
+> Where §0 conflicts with anything later in this document, **§0 wins** — the older
+> passages are left in place only so the delta stays auditable.
+
+---
+
+## 0. Verified Corrections (v1.1)
+
+### 0.1 Repo name — CORRECTED
+
+v1.0 cited `covenantlabs/obsidian-local-rest-api`. That org does not own this plugin.
+
+**Verified correct source:** [`coddingtonbear/obsidian-local-rest-api`](https://github.com/coddingtonbear/obsidian-local-rest-api)
+(author Adam Coddington; community listing "Local REST API with MCP"). Every
+reference in this document, in code comments, and in the SETUP guide now uses that name.
+
+### 0.2 Ports — CORRECTED
+
+v1.0 assumed a single plain-HTTP port `27123`. The plugin's actual defaults:
+
+| Transport | URL | Enabled by default? |
+|---|---|---|
+| **HTTPS** (self-signed cert) | `https://127.0.0.1:27124` | **Yes — this is the default** |
+| HTTP | `http://127.0.0.1:27123` | **No** — opt-in via *Settings → Local REST API → Enable HTTP server* |
+
+Two consequences v1.0 missed entirely:
+
+1. **HTTPS-first, with a self-signed certificate.** A stock `requests` call to
+   `https://127.0.0.1:27124` raises `SSLError` until the cert is trusted. The cert is
+   downloadable from `https://127.0.0.1:27124/obsidian-local-rest-api.crt`. Sensei pins
+   that cert as its CA when present and only falls back to unverified localhost TLS
+   otherwise.
+2. **Authentication is mandatory.** Every endpoint except `GET /` is gated behind
+   `Authorization: Bearer <api-key>` (key is in the plugin's settings pane). v1.0's
+   endpoint appendix showed no auth header at all, so as written none of its calls
+   would have returned anything but `401`.
+
+### 0.3 Version stability — CONFIRMED, AND WORSE THAN REPORTED
+
+The reported 5.0.0/5.0.1 breakage is real, and the *same regression has already
+recurred in the current latest release*:
+
+| Version | Released | `minAppVersion` | Installable on stable Obsidian? |
+|---|---|---|---|
+| **5.1.0** (latest) | 2026-08-01 | **1.13.1** | **NO — Catalyst early-access only** |
+| **5.0.3** | 2026-07-30 | 1.8.7 | **YES — recommended pin** |
+| 5.0.2 | 2026-07-24 | 1.8.7 | Yes |
+| 5.0.1 | 2026-07-24 | **1.13.1** | **NO** |
+| 5.0.0 | 2026-07-24 | **1.13.1** | **NO** |
+| 4.1.7 | 2026-07-11 | 1.4.0 | Yes — but no MCP, older PATCH engine |
+
+5.0.2's own release notes confirm the history: *"The 5.0.0/5.0.1 releases required
+Obsidian 1.13.1, which remains a Catalyst-only early-access release — leaving all
+community-directory users pinned to plugin 4.1.7."* 5.1.0 then re-raised
+`minAppVersion` to 1.13.1 to adopt Obsidian 1.13's declarative settings framework.
+
+**Decision: pin `5.0.3`.** It is the newest release that is installable on
+stable-channel Obsidian, and it carries the Markdown Patch 2.0 engine, the built-in
+MCP server, and the `anyOf` heading-target fix. **"Install latest" is explicitly
+wrong advice for this plugin** and the SETUP guide says so in a warning box.
+
+Sensei enforces this at runtime rather than trusting the docs: `obsidian_api.py`
+reads the reported plugin version from `GET /` and warns on a version outside the
+known-good range instead of failing an opaque call later.
+
+### 0.4 Architecture decision — REST, not MCP
+
+This was the real open question, and the answer is **REST**, decisively. The plugin's
+built-in MCP server is genuinely good and the maintainer is right that it obsoletes
+third-party Obsidian MCP servers — but it does not fit *Sensei's* shape, for four
+reasons found by reading the existing code rather than by preference:
+
+1. **Transport mismatch.** `mcp_client.MCPServer` speaks JSON-RPC over **stdio to a
+   child process** (`subprocess.Popen`, `stdin.write`/`stdout.readline`). The plugin's
+   MCP server is **Streamable HTTP** inside an already-running Obsidian. Sensei has no
+   HTTP MCP transport, so MCP means either writing one, or shelling out to the
+   `mcp-remote` Node bridge — a third moving part, plus `npx`, plus the same
+   self-signed-cert problem, to reach a server that also exposes plain REST.
+2. **Sensei is not a tool-loop agent.** `claude_handler.AKIRA_PROMPT` mandates
+   *"Your entire output is exactly ONE JSON object"*, and `executor._ACTION_MAP`
+   dispatches `action|parameter` strings deterministically. MCP's value is handing a
+   tool catalogue to a model that loops over tool calls. Sensei has no such loop;
+   adding one to support notes would be a rewrite of the core control flow, not an
+   integration.
+3. **Safety model would regress.** Every gate in this codebase is *code-level at the
+   dispatch layer* — `google_mcp.DENYLIST`, `sensei.DANGEROUS_ACTIONS`, the
+   `RISKY_*_PARAMS` sets — precisely because of the documented lesson that
+   prompt-level-only gates fail. The plugin's MCP surface includes `command_execute`
+   (arbitrary command-palette execution), `vault_delete`, and `vault_write` (whole-file
+   overwrite). Exposing that catalogue to the model would put destructive vault
+   operations behind prompt instructions alone. REST lets Sensei expose exactly five
+   verbs and never wire the dangerous ones.
+4. **Zero new dependencies.** REST needs `requests`, already in `requirements.txt`.
+   No `requirements.txt` change is needed for Phase 1 at all.
+
+**However — one genuine v1.0 error that the MCP question surfaced:** v1.0 planned to
+*hand-roll* note editing (§1.4: "Parse Markdown heading structure to find insertion
+point... Write back to vault"). That is a read-modify-write over the whole file, and it
+is both fragile and a lost-update race. The plugin exposes a purpose-built
+`PATCH /vault/{path}` instruction engine (Markdown Patch 2.0) that appends under a
+named heading server-side, creates the heading if missing
+(`Create-Target-If-Missing`), owns whitespace canonicalisation, and supports
+`If-Match` optimistic concurrency. **Sensei uses that instead of parsing Markdown
+itself.** So the corrected approach is "REST, but using the plugin's real capabilities
+rather than the naive endpoints v1.0 imagined" — which is where most of the MCP
+robustness argument actually lived.
+
+Superseded by this section: §1.2's `GET /vault/search?query=` (real endpoint is
+`POST /search/simple/?query=`), §1.4's markdown-parsing write path, and
+Appendix C in full.
+
+### 0.5 Corrected endpoint reference
+
+Replaces Appendix C. All calls carry `Authorization: Bearer <api-key>`; base is
+`https://127.0.0.1:27124`.
+
+```
+GET    /                                 Status + version + auth check (no auth required)
+POST   /search/simple/?query=<terms>     Fuzzy search -> [{filename, score, matches[]}]
+POST   /search/                          JsonLogic structured search over metadata
+GET    /vault/{path}                     Read a note
+GET    /vault/{path}/heading/{h}         Read just one heading's content
+GET    /active/                          Read the note currently open in Obsidian
+PUT    /vault/{path}                     Create / overwrite a note
+PATCH  /vault/{path}                     Targeted edit (heading/block/frontmatter)
+GET    /tags/                            All vault tags with usage counts
+POST   /open/{path}                      Open a note in the Obsidian UI
+```
+
+`GET /active/` is the important addition — it answers "which note is the user looking
+at right now" directly, which v1.0's §1.1 could only guess at by asking the user.
 
 ---
 
@@ -77,8 +212,9 @@ Session State Snapshot (at session start):
 3. **Ambiguous?** Multiple plausible notes? → Ask clarifying question (see Part 3)
 
 **Implementation Detail:**
-- Obsidian **Local REST API plugin** (required user installation) exposes `POST /vault/` and file-search endpoints
-- Query endpoint: `GET http://localhost:27123/vault/search?query=<term>` (assuming default port)
+- Obsidian **Local REST API plugin** (required user installation) exposes `PUT/PATCH /vault/{path}` and search endpoints
+- Query endpoint: `POST https://127.0.0.1:27124/search/simple/?query=<term>`
+  (corrected in §0.5 — the `GET /vault/search` form below never existed)
 - Returns list of matching notes with file paths
 - Akira picks the most-recently-edited or highest-scoring match
 
@@ -105,11 +241,29 @@ Format as a bullet-pointed summary suitable for Obsidian.
 #### 1.4 Obsidian Write Mechanism
 **New module method:** `obsidian_update_note(note_name: str, content: str, section: str, prepend: bool) -> dict`
 
-**Via Local REST API:**
+**Via Local REST API — CORRECTED in v1.1 (§0.4):** do NOT read-modify-write. The
+read-parse-rewrite loop below is fragile and races against the user editing the same
+note in Obsidian. Use the plugin's server-side patch engine instead — one request,
+no local Markdown parsing:
+
+```
+PATCH /vault/{path}
+Authorization: Bearer <api-key>
+Content-Type: application/json
+Create-Target-If-Missing: true
+
+{"targetType":"heading","target":["Progress Log"],
+ "operation":"append","content":"- ..."}
+```
+
+<details><summary>Superseded v1.0 approach (kept for auditing)</summary>
+
 - Fetch current note content
 - Parse Markdown heading structure to find insertion point (e.g., `## Progress Log`)
 - Inject content with timestamp (optional)
 - Write back to vault
+
+</details>
 
 **Alternative (if REST API unavailable):**
 - Fallback to clipboard: write content to clipboard, open Obsidian, navigate to note (via quick switcher), paste
@@ -141,9 +295,17 @@ Format as a bullet-pointed summary suitable for Obsidian.
   - Map `obsidian_control` action to new control module
 
 ### Plugin Dependency (REQUIRED USER SETUP)
-**Obsidian Local REST API Plugin** (https://github.com/covenantlabs/obsidian-local-rest-api)
-- Default port: 27123
-- Provides RESTful access to vault read/write operations
+> **Corrected in v1.1 — see [§0](#0-verified-corrections-v11).** The original repo name,
+> port, and "install latest" guidance below were all wrong.
+
+**Local REST API with MCP** (https://github.com/coddingtonbear/obsidian-local-rest-api)
+- **Pin version 5.0.3** — not latest. 5.1.0 and 5.0.0/5.0.1 require Catalyst-only
+  early-access Obsidian (§0.3).
+- Default endpoint: `https://127.0.0.1:27124` (HTTPS, self-signed cert). Plain HTTP on
+  `27123` is opt-in, not default.
+- Requires `Authorization: Bearer <api-key>` on every endpoint except `GET /`.
+- Provides RESTful access to vault read/write operations, including targeted
+  heading-level PATCH.
 - **User must install:** Obsidian Settings → Community Plugins → "Local REST API"
 - **Safety:** Localhost-only by default; no external network exposure
 
@@ -599,10 +761,13 @@ User sees result (next note refresh)
 ## Plugin & Setup Dependencies
 
 ### REQUIRED (MUST-INSTALL)
-- **Obsidian Local REST API** (`covenantlabs/obsidian-local-rest-api`)
-  - Port: 27123 (default)
+- **Local REST API with MCP** (`coddingtonbear/obsidian-local-rest-api`) — **pin 5.0.3**
+  - Endpoint: `https://127.0.0.1:27124` (HTTPS default); `http://127.0.0.1:27123` opt-in
+  - Auth: `Authorization: Bearer <api-key>` from the plugin's settings pane, read by
+    Sensei from `OBSIDIAN_API_KEY`
   - Installation: Obsidian Settings → Community Plugins → Search "Local REST API" → Install & Enable
   - Fallback needed: If plugin not running, fail gracefully (suggest enabling)
+  - See `SETUP_OBSIDIAN_FOCUS_MODE.md` for the version-pinning warning
 
 ### RECOMMENDED (ENHANCE UX)
 - **Mermaid** — usually built-in to Obsidian v1.6+; optional upgrade
@@ -756,6 +921,10 @@ in this session. Want me to link this new note to those?"
 ---
 
 ## Appendix C: REST API Endpoints (Local REST API Plugin)
+
+> **SUPERSEDED — do not implement against this.** None of the endpoints below exist in
+> the shape shown (wrong paths, wrong methods, no auth header). Use
+> [§0.5](#05-corrected-endpoint-reference) instead. Kept only for delta auditing.
 
 ```
 GET /vault/search?query=<term>         # Search notes

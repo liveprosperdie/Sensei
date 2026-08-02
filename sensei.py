@@ -18,6 +18,7 @@ import llm_json
 import action_guard
 import system_control
 import office_control
+import obsidian_context
 from groq import Groq
 import soundfile as sf
 from executor import execute, get_all_tabs, get_pc_context
@@ -518,11 +519,17 @@ def handle_response(response: dict) -> bool:
     if response.get("end_session"):
         flush_stream()
         claude_handler.clear_history()
+        # drop the focus note / mentioned notes with the conversation history,
+        # so the next session doesn't inherit a stale note target
+        obsidian_context.reset()
         return False
 
     flush_stream()
     time.sleep(0.4)
     session_start_time = time.time()
+    # feeds the flow-rate heuristic that suppresses clarifying questions
+    # during a rapid back-and-forth (obsidian_context.should_ask_clarification)
+    obsidian_context.record_turn(session_start_time)
     return True
 
 
@@ -635,10 +642,17 @@ def _build_session_context() -> str:
         tabs_str    = ", ".join(f"{t['title']}" for t in tabs[:6]) or "none"
         windows_str = ", ".join(ctx["open_windows"][:5]) or "none"
         url_str     = ctx.get("current_url") or "none"
+        # Which note is open in Obsidian, so "add this to my notes" has a
+        # default target and Akira doesn't have to ask. Costs one localhost
+        # request at session start only, never per-turn, and yields "" for
+        # anyone without the plugin — see obsidian_context.session_line().
+        note_str = obsidian_context.session_line()
         return (
             f"[SESSION START] Open tabs: {tabs_str} | "
             f"Current page: {url_str} | "
-            f"Windows: {windows_str}\n\n"
+            f"Windows: {windows_str}"
+            + (f" | {note_str}" if note_str else "")
+            + "\n\n"
         )
     except Exception:
         return ""
@@ -657,6 +671,11 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
         return True
 
     if inject_context:
+        # A brand-new session starts with no note state. Clearing HERE rather
+        # than only on end_session also covers a session that simply timed out,
+        # which never runs the end_session path — otherwise the next session
+        # would inherit a stale focus note and quietly write to the wrong file.
+        obsidian_context.reset()
         print("[v0] building session context (browser)...")
         text = _build_session_context() + text
         print("[v0] session context done")
