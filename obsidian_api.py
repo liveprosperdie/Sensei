@@ -1,7 +1,8 @@
 """Transport layer for the Obsidian "Local REST API with MCP" plugin.
 
     Plugin: https://github.com/coddingtonbear/obsidian-local-rest-api
-    PIN VERSION 5.0.3 — NOT latest. See SETUP_OBSIDIAN_FOCUS_MODE.md.
+    Requires plugin >= 5.0.2 on Obsidian >= 1.13.1. Latest is fine (and
+    preferred). See SETUP_OBSIDIAN_FOCUS_MODE.md.
 
 WHY REST AND NOT THE PLUGIN'S BUILT-IN MCP SERVER
 -------------------------------------------------
@@ -66,12 +67,18 @@ load_dotenv()
 HTTPS_BASE = "https://127.0.0.1:27124"
 HTTP_BASE = "http://127.0.0.1:27123"
 
-# Version guard. 5.0.3 is the newest release installable on stable-channel
-# Obsidian: 5.0.0/5.0.1 and 5.1.0 all set minAppVersion 1.13.1, a Catalyst-only
-# early-access build. We warn rather than refuse — a user on Catalyst running
-# 5.1.0 is fine, they just get no support promise from us.
-PINNED_VERSION = "5.0.3"
-KNOWN_GOOD_VERSIONS = ("5.0.2", "5.0.3")
+# Minimum plugin version, checked as a floor rather than an allowlist.
+#
+# History: 5.0.0/5.0.1 and 5.1.0 set minAppVersion 1.13.1, which was
+# Catalyst-only early access at the time, so this used to pin an exact 5.0.3.
+# Obsidian 1.13 is now public stable (1.13.4), so newer plugin releases are
+# fine — and 5.1.0+ is preferable, since it fixes a stale-read-after-write bug
+# that affects exactly the read-after-PATCH pattern used here.
+#
+# A floor, not an allowlist: an allowlist warns on every future release, which
+# trains users to ignore the warning. 5.0.2 is the floor because that is where
+# the Markdown Patch 2.0 heading-target behaviour we rely on settled.
+MIN_VERSION = "5.0.2"
 
 _TIMEOUT = 10.0  # localhost; anything slower than this is a hung plugin
 
@@ -162,12 +169,36 @@ def _connect() -> tuple[requests.Session, str] | tuple[None, None]:
     return None, None
 
 
-def _check_version(session: requests.Session, base: str) -> None:
-    """Warn once if the running plugin is outside the known-good range.
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """Parse a dotted version into ints for comparison.
 
-    Cheap insurance against the recurring minAppVersion regression: 5.0.0/5.0.1
-    shipped broken for stable Obsidian, 5.0.2 fixed it, and 5.1.0 broke it
-    again. A clear warning here beats an opaque failure three calls later.
+    Trailing non-numeric junk (e.g. "5.1.0-beta.1") stops the parse rather than
+    raising, so a prerelease compares equal to its base version instead of
+    triggering a spurious warning.
+    """
+    parts: list[int] = []
+    for chunk in version.split("."):
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+        # A chunk with trailing non-digits ends the version proper, so stop
+        # rather than letting the next chunk append. Without this,
+        # "5.1.0-beta.1" would parse as (5,1,0,1) — i.e. *newer* than (5,1,0).
+        if digits != chunk:
+            break
+    return tuple(parts)
+
+
+def _check_version(session: requests.Session, base: str) -> None:
+    """Warn once if the running plugin is older than MIN_VERSION.
+
+    A clear warning here beats an opaque PATCH failure three calls later, which
+    is what an out-of-date plugin actually looks like from the user's side.
     """
     global _version_warned
     if _version_warned:
@@ -181,10 +212,14 @@ def _check_version(session: requests.Session, base: str) -> None:
                   or data.get("version") or "").strip()
     if not version:
         return
-    if version not in KNOWN_GOOD_VERSIONS:
-        print(f"[obsidian_api] WARNING: plugin version {version} is untested with "
-              f"Sensei (pinned: {PINNED_VERSION}). If notes misbehave, see "
-              f"SETUP_OBSIDIAN_FOCUS_MODE.md — do NOT just install latest.")
+    parsed = _version_tuple(version)
+    # Unparseable version string: say nothing rather than cry wolf.
+    if not parsed:
+        return
+    if parsed < _version_tuple(MIN_VERSION):
+        print(f"[obsidian_api] WARNING: plugin version {version} is older than the "
+              f"minimum Sensei supports ({MIN_VERSION}). Update 'Local REST API' in "
+              f"Obsidian's Community plugins pane — note edits may fail until you do.")
     else:
         print(f"[obsidian_api] plugin version {version} OK")
 

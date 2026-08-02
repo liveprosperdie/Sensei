@@ -4,57 +4,50 @@ Connects Akira to your Obsidian vault so you can say *"track our progress on Pro
 Alpha"* and have it land in the right note, under the right heading, without touching
 the keyboard.
 
-Takes about five minutes. Steps 2 and 3 are the ones people get wrong, so they have
-warnings on them.
+Takes about three minutes. There are two steps, and Step 2 is the one people get wrong.
 
 ---
 
 ## Step 1 — Install the plugin
 
-In Obsidian: **Settings → Community plugins → Browse → search "Local REST API"**
+Make sure Obsidian itself is up to date first: **Settings → General → Check for
+updates**. You want **1.13.1 or newer** (current stable is 1.13.4). This is the only
+version requirement, and updating Obsidian normally satisfies it.
+
+Then: **Settings → Community plugins → Browse → search "Local REST API"**
 (full name: *Local REST API with MCP*, by Adam Coddington).
 
-Install it and **enable** it.
+Install it and **enable** it. **Take the latest version** — the browser gives you latest
+by default, which is what you want.
 
 > Repo, if you want to read the source:
 > [`coddingtonbear/obsidian-local-rest-api`](https://github.com/coddingtonbear/obsidian-local-rest-api)
 
----
+**If the plugin refuses to load and says it needs a newer Obsidian:** your Obsidian is
+older than 1.13.1. Update Obsidian — don't downgrade the plugin.
 
-## Step 2 — Do NOT install the latest version
+<details>
+<summary>Historical note: this guide used to tell you to pin 5.0.3. That is no longer necessary.</summary>
 
-> ### ⚠️ Pin version **5.0.3**
->
-> This plugin is one of the rare cases where "just update to latest" is actively wrong.
-> Several releases — including the current latest — declare `minAppVersion: 1.13.1`,
-> and Obsidian **1.13 is a Catalyst-only early-access build**. If you are on the normal
-> stable Obsidian, those versions will not load.
->
-> | Version | `minAppVersion` | Works on stable Obsidian? |
-> |---|---|---|
-> | 5.1.0 (latest) | 1.13.1 | **No** |
-> | **5.0.3** | 1.8.7 | **Yes — use this** |
-> | 5.0.2 | 1.8.7 | Yes |
-> | 5.0.1 | 1.13.1 | **No** |
-> | 5.0.0 | 1.13.1 | **No** |
-> | 4.1.7 | 1.4.0 | Yes, but too old — no heading-level patching |
->
-> This has already happened twice (5.0.0/5.0.1, then again in 5.1.0), so assume it can
-> happen again on the next release. **Check `minAppVersion` before you update.**
+Plugin releases 5.0.0, 5.0.1, and 5.1.0 set `minAppVersion: 1.13.1`. For a while
+Obsidian 1.13 was Catalyst-only early access, so those releases genuinely would not load
+for most people, and the setup guide pinned 5.0.3 (`minAppVersion: 1.8.7`) with a manual
+install procedure.
 
-**If the plugin fails to load, or Obsidian says it requires a newer version:** you
-installed one of the 1.13.1 releases. Grab 5.0.3 manually instead —
-[releases page](https://github.com/coddingtonbear/obsidian-local-rest-api/releases/tag/5.0.3)
-→ download `main.js`, `manifest.json`, `styles.css` → drop them in
-`<your-vault>/.obsidian/plugins/obsidian-local-rest-api/` → restart Obsidian.
+Obsidian 1.13 has since shipped to the public stable channel — `desktop-releases.json`
+now reports `latestVersion: 1.13.4` with an identical `beta` block, i.e. no early-access
+gap. So the requirement is satisfiable by anyone who updates Obsidian, and the manual
+pin, the folder-dragging, and the whole version-picker problem are all moot.
 
-Sensei also checks this for you: it reads the version the plugin reports on startup and
-prints a warning if you are outside the known-good range, rather than letting you hit a
-confusing failure later.
+Latest is now also the *better* choice: 5.1.0 fixes a bug where a read immediately after
+a write could return stale content, which is exactly the read-after-write pattern Sensei
+uses for note updates.
+
+</details>
 
 ---
 
-## Step 3 — Copy the API key
+## Step 2 — Copy the API key
 
 Open **Settings → Local REST API**. The top of the pane shows an **API Key** — copy it.
 
@@ -87,7 +80,7 @@ OBSIDIAN_API_URL=http://127.0.0.1:27123
 
 ---
 
-## Step 4 — Check it
+## Step 3 — Check it
 
 Start Sensei with Obsidian running and say:
 
@@ -148,8 +141,8 @@ automatically. Same result, correct mechanism.
 | "I can't reach Obsidian's REST API" | Obsidian is closed, or the plugin is disabled |
 | "Obsidian rejected the API key" | `OBSIDIAN_API_KEY` is stale or wrong — re-copy from the settings pane |
 | "I need an Obsidian API key first" | `OBSIDIAN_API_KEY` is not set at all |
-| Plugin won't load / "requires newer version" | You're on a 1.13.1 release — see Step 2 |
-| Version warning on startup | Plugin is outside the tested 5.0.2–5.0.3 range |
+| Plugin won't load / "requires newer version" | Your Obsidian is older than 1.13.1 — update Obsidian (Step 1) |
+| Version warning on startup | Plugin is older than the tested minimum (5.0.2) — update it |
 | Wrong note got the update | Say the note name explicitly; a note open in Obsidian is the default target |
 
 Akira relays these once and stops. It will **not** silently reroute your notes into a

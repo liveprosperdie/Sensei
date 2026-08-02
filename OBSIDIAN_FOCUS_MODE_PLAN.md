@@ -46,6 +46,11 @@ Two consequences v1.0 missed entirely:
 
 ### 0.3 Version stability — CONFIRMED, AND WORSE THAN REPORTED
 
+> **SUPERSEDED as of 2026-08-02 by [§0.6](#06-version-pinning-no-longer-required-supersedes-03).**
+> The analysis below was correct when written, but Obsidian 1.13 has since reached the
+> public stable channel, so the pin it recommends is no longer needed. Kept for
+> auditing.
+
 The reported 5.0.0/5.0.1 breakage is real, and the *same regression has already
 recurred in the current latest release*:
 
@@ -71,6 +76,53 @@ wrong advice for this plugin** and the SETUP guide says so in a warning box.
 Sensei enforces this at runtime rather than trusting the docs: `obsidian_api.py`
 reads the reported plugin version from `GET /` and warns on a version outside the
 known-good range instead of failing an opaque call later.
+
+### 0.6 Version pinning no longer required (supersedes §0.3)
+
+Re-verified 2026-08-02, before building tooling to automate the pin. **The pin is
+obsolete — so the tooling was not built.**
+
+`obsidianmd/obsidian-releases/desktop-releases.json` now reports:
+
+```
+minimumVersion: 1.1.9
+latestVersion:  1.13.4      <- public stable
+beta: { latestVersion: 1.13.4 }   <- identical, i.e. no early-access gap
+```
+
+Obsidian 1.13 was Catalyst-only when §0.3 was written; it is now the public stable
+release. The `beta` block being identical to the top-level one is the tell: there is no
+longer any version available to Catalyst users that isn't available to everyone.
+
+Consequences:
+
+- `minAppVersion: 1.13.1` is now satisfiable by **any** user who updates Obsidian, so
+  5.1.0 installs normally from the Community plugins browser.
+- The entire friction chain this task set out to fix — no version picker in the browser,
+  manual release-asset downloads, hand-placing files in `.obsidian/plugins/`, disabling
+  the auto-installed latest — **only existed because of the pin.** Removing the pin
+  removes all of it. There is nothing left to automate.
+- Latest is now the *better* choice, not merely an acceptable one: 5.1.0's notes include
+  *"Fixes an issue in which a read immediately following a write could observe stale
+  content, by routing vault writes through Obsidian's Vault API"* — precisely the
+  read-after-PATCH pattern `obsidian_control.py` uses.
+
+**Rejected, with reasons** (evaluated rather than skipped):
+
+| Option | Verdict |
+|---|---|
+| Python installer script that fetches release assets from the GitHub API | **Rejected.** Solves a problem that no longer exists, and would leave Sensei silently downgrading users away from the stale-read fix. Also a standing maintenance liability: it writes into `.obsidian/plugins/` and fights Obsidian's own updater. |
+| Document BRAT for pinning an exact tag | **Rejected.** BRAT is the right tool for pinning, but pinning is the thing that's obsolete. Recommending a second plugin to work around a resolved incompatibility is strictly worse than "update Obsidian, install latest". |
+| Combination of both | **Rejected** for the same reason — combining two solutions to a non-problem. |
+
+**Implemented instead:** the requirement inverted from "pin the plugin to an old
+version" to "keep Obsidian current, take plugin latest", which is both simpler *and* the
+path of least resistance through Obsidian's UI. Setup dropped from four steps to three.
+`obsidian_api.py`'s version guard changed from an exact-allowlist (`5.0.2`/`5.0.3`) to a
+`MIN_VERSION = "5.0.2"` floor — an allowlist would have warned on every future release
+and trained users to ignore the warning. No Phase 1 request/PATCH/auth code was touched.
+
+---
 
 ### 0.4 Architecture decision — REST, not MCP
 
@@ -299,8 +351,8 @@ Create-Target-If-Missing: true
 > port, and "install latest" guidance below were all wrong.
 
 **Local REST API with MCP** (https://github.com/coddingtonbear/obsidian-local-rest-api)
-- **Pin version 5.0.3** — not latest. 5.1.0 and 5.0.0/5.0.1 require Catalyst-only
-  early-access Obsidian (§0.3).
+- **Install latest** (>= 5.0.2), and keep Obsidian >= 1.13.1. The 5.0.3 pin in §0.3 is
+  obsolete now that Obsidian 1.13 is public stable — see §0.6.
 - Default endpoint: `https://127.0.0.1:27124` (HTTPS, self-signed cert). Plain HTTP on
   `27123` is opt-in, not default.
 - Requires `Authorization: Bearer <api-key>` on every endpoint except `GET /`.
@@ -761,7 +813,7 @@ User sees result (next note refresh)
 ## Plugin & Setup Dependencies
 
 ### REQUIRED (MUST-INSTALL)
-- **Local REST API with MCP** (`coddingtonbear/obsidian-local-rest-api`) — **pin 5.0.3**
+- **Local REST API with MCP** (`coddingtonbear/obsidian-local-rest-api`) — **latest, >= 5.0.2** (§0.6)
   - Endpoint: `https://127.0.0.1:27124` (HTTPS default); `http://127.0.0.1:27123` opt-in
   - Auth: `Authorization: Bearer <api-key>` from the plugin's settings pane, read by
     Sensei from `OBSIDIAN_API_KEY`
