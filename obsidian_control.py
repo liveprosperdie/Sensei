@@ -13,6 +13,12 @@ Action format (mirrors docs_control / office_control):
   diagram|<note>|<mermaid source>     Embed a mermaid code block
   tags                                List vault tags with counts
   open|<note>                         Open a note in the Obsidian UI
+  focus|on / focus|off                Enter/leave Focus Mode (local state only)
+  organize|<content or empty>         FM-1: hand raw content (clipboard when no
+                                      content is given) to a reasoning pass that
+                                      decides the note structure itself, then
+                                      run its plan through the primitives above.
+                                      Focus Mode only.
 
 DELIBERATELY ABSENT — do not add without a code-level confirmation gate:
   delete / trash of any kind, whole-file overwrite of an existing note, and
@@ -290,12 +296,133 @@ def _do_open(note: str) -> dict:
             "message": f"Opened {_note_title(path)} in Obsidian."}
 
 
+# ── FM-1: open-ended organization ────────────────────────────────────────────
+# There is deliberately NO content analysis here. This function reads the raw
+# content, hands it to claude_handler.plan_organization (which is where the
+# judgment happens), and executes whatever plan comes back through the SAME
+# primitives every other sub-action uses. If you ever feel the urge to add an
+# "if the content looks like X" branch below, that belongs in the prompt, not
+# here — the whole point of this path is that the model decides, not the code.
+
+# op name -> the existing Phase 1 primitive it runs. Anything not in this map
+# is rejected, so a hallucinated operation can never reach the vault.
+_ORGANIZE_OPS = ("create", "append", "progress", "link", "moc", "diagram")
+
+
+def _read_raw_content() -> str | None:
+    """Whatever the user wants organized: the clipboard, read via executor's
+    existing PowerShell clipboard reader. None means unreadable."""
+    try:
+        import executor
+        return executor._ps_read_clipboard()
+    except Exception as e:
+        print(f"[obsidian_control] clipboard read failed: {e}")
+        return None
+
+
+def _run_organize_step(step: dict) -> dict:
+    """Execute ONE planned operation via the existing sub-actions."""
+    op = str(step.get("op") or "").strip().lower()
+    note = (step.get("note") or "").strip()
+    content = step.get("content") or ""
+    if op not in _ORGANIZE_OPS:
+        return {"success": False, "message": f"Unsupported operation {op!r}."}
+    if op == "create":
+        return _do_create(note, content)
+    if op == "append":
+        return _do_append(note, (step.get("section") or "").strip(),
+                          content, timestamped=False)
+    if op == "progress":
+        return _do_append(note, DEFAULT_SECTION, content, timestamped=True)
+    if op == "link":
+        return _do_link(note, step.get("targets") or "")
+    if op == "moc":
+        return _do_moc(note, step.get("targets") or "")
+    return _do_diagram(note, content)
+
+
+def _vault_context() -> str:
+    """A short line telling the reasoning pass what is already in play, so it
+    can add to an existing note instead of always creating new ones."""
+    bits = []
+    try:
+        import obsidian_context
+        if obsidian_context.focus_note:
+            bits.append(f"note currently open: {_note_title(obsidian_context.focus_note)}")
+        recent = list(obsidian_context.mentioned_notes)[-5:]
+        if recent:
+            bits.append("notes mentioned this session: " + ", ".join(recent))
+    except Exception as e:
+        print(f"[obsidian_control] vault context skipped: {e}")
+    return " | ".join(bits)
+
+
+def _do_organize(inline_content: str) -> dict:
+    raw = inline_content.strip() if inline_content else (_read_raw_content() or "")
+    if not raw.strip():
+        return {"success": False, "speak": True,
+                "message": "There's nothing on your clipboard to organize."}
+
+    plan = None
+    try:
+        import claude_handler
+        plan = claude_handler.plan_organization(raw, _vault_context())
+    except Exception as e:
+        print(f"[obsidian_control] organize planning failed: {e!r}")
+    if not plan:
+        return {"success": False, "speak": True,
+                "message": "I couldn't work out a good structure for that, so I "
+                           "haven't written anything."}
+
+    done, failures = [], []
+    for step in plan["plan"]:
+        if not isinstance(step, dict):
+            continue
+        res = _run_organize_step(step)
+        print(f"[organize] {step.get('op')} -> {res.get('success')} "
+              f"{res.get('message', '')[:80]!r}")
+        if res.get("success"):
+            title = _note_title((step.get("note") or ""))
+            if title:
+                done.append(title)
+                try:
+                    import obsidian_context
+                    obsidian_context.note_mentioned(title)
+                except Exception:
+                    pass
+        else:
+            failures.append(res.get("message") or "one step failed")
+
+    if not done:
+        return {"success": False, "speak": True,
+                "message": failures[0] if failures
+                else "Nothing was written to your vault."}
+
+    # The model already wrote the spoken line. Only fall back to a built
+    # sentence if it didn't, and never echo the raw content either way.
+    message = plan["summary"] or (
+        f"Organized that into {len(done)} "
+        f"{'note' if len(done) == 1 else 'notes'}: {', '.join(done)}.")
+    if failures:
+        message += f" {len(failures)} of the steps didn't go through."
+    return {"success": True, "speak": True, "message": message}
+
+
 # ── dispatcher ───────────────────────────────────────────────────────────────
 
 def obsidian_control(action: str, parameter: str | None = None) -> dict:
     action = (action or "").strip().lower()
     parts = [p.strip() for p in (parameter or "").split("|")]
     print(f"[obsidian_control] action={action!r} params={parts!r}")
+
+    # Mode switch first: it is pure local state, so it must work even with no
+    # API key configured. obsidian_context owns the flag — nothing else may.
+    if action == "focus":
+        import obsidian_context
+        want = (parts[0] if parts else "").strip().lower() not in ("off", "false", "stop", "end", "0")
+        state = obsidian_context.set_focus_mode(want)
+        return {"success": True, "speak": True,
+                "message": "Focus mode on." if state else "Focus mode off."}
 
     if not obsidian_api.is_configured():
         return {"success": False,
@@ -339,6 +466,15 @@ def obsidian_control(action: str, parameter: str | None = None) -> dict:
 
     if action == "diagram":
         return _do_diagram(arg(0), rest(1))
+
+    if action == "organize":
+        # FM-1. Empty parameter = organize the clipboard. Focus-mode only: the
+        # gate lives HERE in code, not just in the prompt.
+        import obsidian_context
+        if not obsidian_context.is_focus_mode():
+            return {"success": False, "speak": True,
+                    "message": "That one's focus mode only. Say the word and I'll turn it on."}
+        return _do_organize(rest(0))
 
     if action == "tags":
         return _do_tags()
