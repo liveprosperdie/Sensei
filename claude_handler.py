@@ -16,6 +16,10 @@ load_dotenv()
 # ── Client ────────────────────────────────────────────────────────────────────
 
 # timeout prevents silent multi-minute hangs (SDK default is ~10 min)
+# One place names the model, so the routing call and every reasoning pass can
+# never drift onto different Claude versions.
+MODEL = "claude-sonnet-5"
+
 client = anthropic.Anthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY"),
     timeout=30.0,
@@ -320,6 +324,7 @@ OBSIDIAN (the user's permanent notes vault — this is the knowledge store, Goog
 - obsidian_control|moc|Index Title|Note A,Note B,Note C — builds a Map of Content index note. Use for "organize my notes on X", "make a map of X".
 - obsidian_control|diagram|note name|mermaid source — embeds a mermaid block (Obsidian renders these natively). Keep the source to a few short lines; for anything bigger, say so instead of emitting a wall of text in the parameter.
 - obsidian_control|tags — lists vault tags. obsidian_control|open|note name — opens a note in the Obsidian UI. obsidian_control|status — connectivity check, use when a note action failed and you want to tell the user why.
+- obsidian_control|focus|on and obsidian_control|focus|off — enter or leave FOCUS MODE. Use on for "focus mode", "let's focus", "start a focus session", "deep work"; off for "exit focus mode", "I'm done focusing". Focus Mode unlocks extra note-handling behaviour that is described to you only while it is on, so never claim a focus-only capability while it is off — turn it on first.
 NOTE NAMES: pass what the user SAID ("project alpha"). Every action resolves a spoken name against the vault by search, so you never need the exact filename or the .md extension. If a session started with a note open, the [SESSION START] line names it — treat that as the default target for a bare "add this to my notes" rather than asking which note.
 NOTE CONTENT RULE: the CONTENT RULE above applies here too. Progress summaries and bullet lists are fine inline because they are short. Anything essay-length does NOT belong in an Obsidian parameter.
 IF OBSIDIAN IS UNREACHABLE: the action says so plainly (Obsidian closed, plugin disabled, or missing API key). Relay that once and stop — do NOT fall back to writing the user's notes into a Google Doc or a local file, and do NOT retry in a loop. Their vault is the only correct destination.
@@ -457,7 +462,181 @@ SAFETY AND BOUNDARIES:
 - Akira respects user autonomy. Safety rules apply to genuinely risky situations only.
 """
 
+# ── FOCUS MODE prompt block ──────────────────────────────────────────────────
+# SENT ONLY WHILE FOCUS MODE IS ON (obsidian_context.is_focus_mode()). It is a
+# SEPARATE system block, never merged into AKIRA_PROMPT, so basic mode never
+# pays for it in tokens and never advertises focus-only capabilities.
+#
+# FORMAT CONTRACT — every future focus-mode feature follows it exactly:
+#
+#   ## FM-<n> — <FEATURE NAME>  [<STATUS>]
+#   TRIGGER: what the user says that means this feature
+#   ROUTE:   the exact action string(s) to emit
+#   RULES:   how to behave once routed (short lines, one rule each)
+#   NEVER:   the anti-patterns for this feature
+#
+# STATUS is ACTIVE (wired end to end) or STUB (no code yet — a STUB stays a
+# COMMENT below the string so the model is never told about a capability that
+# does not exist). To add a feature: append a new FM-<n> section inside the
+# string, keep the four labels, wire the action, flip the status. Nothing above
+# FM-0 or below the template needs to change.
+FOCUS_MODE_PROMPT = """
+════════════════════════ FOCUS MODE — ACTIVE ════════════════════════
+You are in FOCUS MODE. Everything in your base instructions still applies. This block ADDS capabilities and overrides the base instructions only where it says so explicitly.
+
+## FM-0 — SCOPE
+RULES:
+- Focus Mode is about the user's Obsidian vault and their working session. It does not loosen any safety or confirmation rule.
+- Protecting focus is the point: keep spoken replies to one short sentence, and do not ask a question you can reasonably answer yourself.
+NEVER:
+- Never read raw source content back to the user out loud. They already have it. Summarize what you DID, never what the content said.
+
+## FM-1 — ORGANIZE THIS  [ACTIVE]
+TRIGGER: "organize this", "sort this into notes", "capture this properly", "put this in my vault" — any open-ended request to turn a dump of content into notes, where the right structure is a judgment call rather than one obvious write.
+ROUTE: obsidian_control|organize — with NO content in the parameter to organize whatever is on the clipboard, or obsidian_control|organize|the content only when the user dictated it aloud in this conversation.
+RULES:
+- This is the ONE note action where you do NOT decide the structure. The action hands the raw content to a separate reasoning pass that reads it and decides how many notes it deserves, what each is called, what goes in each, and how they link, then executes that through the ordinary vault primitives.
+- Content never travels inside your JSON envelope on the clipboard route. Emit the bare action and let it read the clipboard.
+- The result comes back as one already-composed summary sentence. Speak that and stop.
+- If it reports an empty clipboard or an unreachable vault, relay that once and stop.
+- If the user names the exact destination ("add this to Project Alpha under Blockers"), that is NOT this feature — use append or progress as normal.
+NEVER:
+- Never pre-empt the reasoning pass by choosing note titles, a note count, or a template yourself.
+- Never follow up with your own create, moc or link calls to "finish the job" — the pass already ran every write it decided on.
+- Never read the organized content back aloud.
+════════════════════════════════════════════════════════════════════
+"""
+
+# ── FM-2 — POMODORO ──────────────────────────────────────────────────────────
+# STUB. No timer code is wired, so nothing about it is in FOCUS_MODE_PROMPT yet.
+# When it lands, add this section INSIDE the string above, after FM-1:
+#   ## FM-2 — POMODORO  [ACTIVE]
+#   TRIGGER: ...   ROUTE: ...   RULES: ...   NEVER: ...
+#
+# ── FM-3 — TODO LIST ─────────────────────────────────────────────────────────
+# STUB. Focus-mode todo control goes here in the same four-label format — not
+# into AKIRA_PROMPT.
+#   ## FM-3 — TODO LIST  [ACTIVE]
+#   TRIGGER: ...   ROUTE: ...   RULES: ...   NEVER: ...
+#
+# ── FM-<n> — NEXT FEATURE ────────────────────────────────────────────────────
+# Copy the four-label template. Do not restructure the block.
+
+
+def system_blocks(date_block: str) -> list[dict]:
+    """Assemble the system prompt: base, then FOCUS MODE only when it is on.
+
+    One place decides what the model sees. The focus block is cached
+    separately from the base block, so flipping the mode never invalidates
+    the big cached prompt.
+    """
+    blocks = [{"type": "text", "text": AKIRA_PROMPT,
+               "cache_control": {"type": "ephemeral"}}]
+    try:
+        import obsidian_context
+        if obsidian_context.is_focus_mode():
+            blocks.append({"type": "text", "text": FOCUS_MODE_PROMPT,
+                           "cache_control": {"type": "ephemeral"}})
+    except Exception as e:
+        print(f"[system_blocks] focus-mode check skipped: {e}")
+    blocks.append({"type": "text", "text": date_block})
+    return blocks
+
 # ── Public API ───────────────────────���────────────────────────────────────────
+
+# ── FM-1: open-ended note organization (a REASONING pass, not a dispatch) ────
+# Architecturally different from ask_akira on purpose:
+#   ask_akira            -> fixed menu of action names, model PICKS one, Python
+#                           runs a deterministic procedure. Right for mechanical
+#                           work, wrong for a judgment call.
+#   plan_organization    -> the RAW CONTENT itself goes to the model with an
+#                           open prompt and the vault primitives listed as
+#                           capabilities. The model decides the structure and
+#                           emits the writes it wants; Python only executes
+#                           them. No classification, no templates, no keyword
+#                           branches anywhere in the code path.
+# It is a SEPARATE call with its own system prompt and its own token budget, and
+# it is NOT added to conversation_history — raw content must never end up in the
+# routing history where it could be read back aloud.
+
+ORGANIZE_PROMPT = """
+You are the note-organization reasoning pass for Akira, working inside the user's Obsidian vault.
+
+You are given a raw dump of content the user wants captured. Read it properly and decide, for THIS content specifically, the best way to hold it in a vault they will come back to weeks from now.
+
+That decision is yours. Nothing is pre-decided for you:
+- One note or several. Split when the content genuinely covers separate concerns; keep it together when splitting would scatter one idea.
+- What each note is called. Real, specific titles a person would recognize in a search — not "Note 1", not the generic category name.
+- What goes in each note, and in what order. Rewrite into clean markdown with headings and short lines. Preserve every fact, drop the noise, do not pad, do not invent details that are not in the content.
+- How they connect. If you made several notes, link them so the graph is useful. A map of content is worth it when there are enough notes that an index actually helps, and not otherwise.
+- Whether anything belongs in a note that already exists rather than a new one. VAULT CONTEXT below tells you what is already in play.
+
+You do not execute anything yourself. You emit a short plan of vault operations and it is executed for you, in order.
+
+Available operations — these are the real primitives, nothing else exists:
+  {"op": "create",  "note": "Title",      "content": "markdown body"}      new note; fails if that title already exists
+  {"op": "append",  "note": "Title",      "section": "Heading", "content": "markdown"}   adds under a heading, creating the heading if absent
+  {"op": "progress","note": "Title",      "content": "- short bullet\\n- short bullet"}  timestamped entry under Progress Log
+  {"op": "link",    "note": "Title",      "targets": "Other Note,Third Note"}            wikilinks under Related
+  {"op": "moc",     "note": "Index Title","targets": "Note A,Note B"}                    map-of-content index note
+  {"op": "diagram", "note": "Title",      "content": "mermaid source"}                   embed a mermaid diagram
+
+Output STRICT JSON and nothing else, no markdown fence:
+{"plan": [ ...operations in execution order... ], "summary": "one spoken sentence saying what you did"}
+
+Rules for the summary: one sentence, conversational, names the notes you created. It is spoken aloud, so no markdown, no bullets, no em dashes. NEVER quote or read back the content itself.
+Rules for the plan: create a note before you link to it. Keep it to the operations the content actually justifies — a plan of fifteen writes for one paragraph is wrong. Escape newlines inside JSON strings as \\n.
+"""
+
+
+def plan_organization(raw_content: str, vault_context: str = "") -> dict | None:
+    """Reason over raw content and return {"plan": [...], "summary": str}.
+
+    Returns None if the model could not be reached or its reply was unusable —
+    the caller reports that honestly rather than writing a guessed structure.
+    """
+    import llm_json
+
+    content = (raw_content or "").strip()
+    if not content:
+        return None
+    # Generous but bounded: a whole page of notes is fine, a pasted book is not.
+    if len(content) > 24000:
+        content = content[:24000] + "\n\n[content truncated]"
+
+    user_block = (
+        (f"VAULT CONTEXT: {vault_context}\n\n" if vault_context else "")
+        + "RAW CONTENT TO ORGANIZE:\n" + content
+    )
+    try:
+        message = client.messages.create(
+            model=MODEL,
+            # Real headroom: note bodies live in THIS reply, unlike the routing
+            # envelope, which is exactly why this is a separate call.
+            max_tokens=8000,
+            system=[{"type": "text", "text": ORGANIZE_PROMPT,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": user_block}],
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+        )
+    except Exception as e:
+        print(f"[plan_organization] model call failed: {e!r}")
+        return None
+
+    if getattr(message, "stop_reason", None) == "max_tokens":
+        print("[plan_organization] WARNING: plan hit max_tokens — discarding")
+        return None
+
+    parsed, info = llm_json.parse(message.content[0].text)
+    if not isinstance(parsed, dict) or info.get("truncated"):
+        print(f"[plan_organization] unusable plan: {message.content[0].text[:300]!r}")
+        return None
+    steps = parsed.get("plan")
+    if not isinstance(steps, list) or not steps:
+        print("[plan_organization] plan had no operations")
+        return None
+    return {"plan": steps, "summary": (parsed.get("summary") or "").strip()}
+
 
 def ask_akira(text: str) -> str:
     """Send user text to Akira, get back a JSON string response."""
@@ -501,17 +680,15 @@ def ask_akira(text: str) -> str:
     )
 
     message = client.messages.create(
-        model="claude-sonnet-4-6",
+        model=MODEL,
         # 1600, not 600: the routing envelope is small, but a legitimate
         # multi-step response with a confirmation_message ran out of budget and
         # ended mid-string, which reached the user as an unparseable reply.
         # Content still NEVER travels in this envelope (see CONTENT RULE) —
         # this is headroom for routing, not a licence to inline documents.
         max_tokens=1600,
-        system=[
-            {"type": "text", "text": AKIRA_PROMPT, "cache_control": {"type": "ephemeral"}},
-            {"type": "text", "text": date_block},
-        ],
+        # base prompt + FOCUS MODE block (only while focus mode is on) + date
+        system=system_blocks(date_block),
         messages=messages_snapshot,
         extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
     )

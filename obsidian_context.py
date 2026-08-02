@@ -38,12 +38,35 @@ _turn_times: list[float] = []
 
 _MAX_MENTIONED = 8
 
+# ── focus-mode switch ────────────────────────────────────────────────────────
+# THE single source of truth for "is Akira in Focus Mode right now". Read by
+# claude_handler.system_blocks() to decide whether the FOCUS MODE prompt block
+# is sent at all, and by obsidian_control for focus-only sub-actions. Anything
+# else that needs the mode must call is_focus_mode() — never keep its own flag.
+_focus_mode = False
+
+
+def is_focus_mode() -> bool:
+    with _lock:
+        return _focus_mode
+
+
+def set_focus_mode(active: bool) -> bool:
+    """Turn Focus Mode on/off. Returns the resulting state."""
+    global _focus_mode
+    with _lock:
+        _focus_mode = bool(active)
+        state = _focus_mode
+    print(f"[obsidian_context] focus_mode={'on' if state else 'off'}")
+    return state
+
 
 def reset() -> None:
     """Clear all session state. Called when a focus session ends."""
-    global focus_note
+    global focus_note, _focus_mode
     with _lock:
         focus_note = None
+        _focus_mode = False
         mentioned_notes.clear()
         _turn_times.clear()
 
