@@ -525,6 +525,21 @@ def handle_response(response: dict) -> bool:
         if response.get("action"):
             actions_to_run = [{"action": response["action"], "parameter": response.get("parameter")}]
 
+        # Deliberation tier: swap any "deliberate" abstain signal for the plan a
+        # real reasoning pass produced. Done HERE, above the safety net, so
+        # planned steps are gated identically to router-emitted ones.
+        actions_to_run, deliberated_speech = _expand_deliberation(actions_to_run)
+        if deliberated_speech:
+            # The reasoning pass speaks for itself — its summary/question always
+            # beats the router's placeholder "Let me think about that one."
+            response["response"] = deliberated_speech
+        # An empty plan is a valid outcome (it asked a question or declined):
+        # nothing runs, and the summary/question falls through to the single
+        # speak_and_wait at the end of this function.
+        response["actions"] = actions_to_run
+        response.pop("action", None)
+        response.pop("parameter", None)
+
         # safety net: catch dangerous actions Claude forgot to gate
         # (includes risky shopping steps like checkout / place order / address)
         unsafe = [a for a in actions_to_run if _is_dangerous_step(a)]
