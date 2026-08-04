@@ -170,9 +170,14 @@ def _do_read(note: str, section: str | None) -> dict:
         res = obsidian_api.request("GET", obsidian_api.vault_path(hits[0]["path"]))
         if not res["success"]:
             return res
-    # raw markdown is not directly speakable — let the LLM synthesize it
-    res["speak_summary"] = True
-    return res
+    # Bounded read-aloud: speak the first chunk and ask before continuing,
+    # rather than handing the whole note to the LLM to narrate in one breath.
+    # This bounds SPEECH only — _do_organize and other internal passes still
+    # fetch notes in full through obsidian_api directly.
+    import chunked_read
+    first = chunked_read.begin(_note_title(note) or "That note",
+                               res.get("message") or "")
+    return {"success": True, "speak": True, "message": first["message"]}
 
 
 def _do_append(note: str, section: str, text: str, *, timestamped: bool) -> dict:
@@ -357,7 +362,37 @@ def _vault_context() -> str:
     return " | ".join(bits)
 
 
-def _do_organize(inline_content: str) -> dict:
+# Operations simple-capture mode (focus mode off) is allowed to perform, and the
+# cap on how many notes it may bring into existence. Enforced in CODE as well as
+# in the prompt: a model talked into ignoring its constraint must still not be
+# able to restructure a vault outside focus mode.
+_SIMPLE_ORGANIZE_OPS = {"create", "append", "progress"}
+_SIMPLE_ORGANIZE_MAX_CREATES = 1
+
+
+def _exceeds_simple_capture(steps: list) -> str:
+    """Reason the plan is too structural for simple mode, or "" if it's fine."""
+    creates = 0
+    targets = set()
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        op = (step.get("op") or "").strip().lower()
+        if op not in _SIMPLE_ORGANIZE_OPS:
+            return f"it wants to build structure ({op})"
+        title = _note_title((step.get("note") or "")).strip().lower()
+        if title:
+            targets.add(title)
+        if op == "create":
+            creates += 1
+    if creates > _SIMPLE_ORGANIZE_MAX_CREATES:
+        return f"it wants to create {creates} separate notes"
+    if len(targets) > 1:
+        return f"it spans {len(targets)} different notes"
+    return ""
+
+
+def _do_organize(inline_content: str, *, full_capability: bool = True) -> dict:
     raw = inline_content.strip() if inline_content else (_read_raw_content() or "")
     if not raw.strip():
         return {"success": False, "speak": True,
@@ -366,7 +401,8 @@ def _do_organize(inline_content: str) -> dict:
     plan = None
     try:
         import claude_handler
-        plan = claude_handler.plan_organization(raw, _vault_context())
+        plan = claude_handler.plan_organization(
+            raw, _vault_context(), full_capability=full_capability)
     except Exception as e:
         print(f"[obsidian_control] organize planning failed: {e!r}")
     if not plan:
@@ -374,8 +410,27 @@ def _do_organize(inline_content: str) -> dict:
                 "message": "I couldn't work out a good structure for that, so I "
                            "haven't written anything."}
 
+    # The reasoning pass itself said this needs focus mode. Offer, don't attempt.
+    if plan.get("needs_focus_mode"):
+        why = plan.get("why") or "that needs proper restructuring across several notes"
+        return {"success": True, "speak": True,
+                "message": f"{why} That's focus mode work. Want me to turn it on "
+                           f"and do it properly?"}
+
+    steps = plan["plan"]
+    if not full_capability:
+        # Defence in depth: the prompt asked for single-target capture, so verify
+        # the plan actually is one before any of it touches the vault.
+        overreach = _exceeds_simple_capture(steps)
+        if overreach:
+            print(f"[organize] simple-mode plan rejected: {overreach}")
+            return {"success": True, "speak": True,
+                    "message": "I can file that properly, but "
+                               f"{overreach}, which is focus mode work. "
+                               "Want me to turn focus mode on and do it right?"}
+
     done, failures = [], []
-    for step in plan["plan"]:
+    for step in steps:
         if not isinstance(step, dict):
             continue
         res = _run_organize_step(step)
@@ -468,13 +523,16 @@ def obsidian_control(action: str, parameter: str | None = None) -> dict:
         return _do_diagram(arg(0), rest(1))
 
     if action == "organize":
-        # FM-1. Empty parameter = organize the clipboard. Focus-mode only: the
-        # gate lives HERE in code, not just in the prompt.
+        # FM-1. Empty parameter = organize the clipboard.
+        #
+        # No longer an all-or-nothing gate. Outside focus mode this still runs,
+        # constrained to single-target capture, and offers focus mode when the
+        # content genuinely needs structural work — the old hard refusal here is
+        # what made "organize this" fall through to read_file and narrate raw
+        # content, because the capability was invisible AND unreachable.
         import obsidian_context
-        if not obsidian_context.is_focus_mode():
-            return {"success": False, "speak": True,
-                    "message": "That one's focus mode only. Say the word and I'll turn it on."}
-        return _do_organize(rest(0))
+        return _do_organize(rest(0),
+                            full_capability=obsidian_context.is_focus_mode())
 
     if action == "tags":
         return _do_tags()

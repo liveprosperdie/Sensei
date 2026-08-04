@@ -192,6 +192,19 @@ Rules:
 - Use "{{stepX.result}}" in a parameter to inject the output of step with id "stepX" into the next step.
 - Only use chaining when the second action genuinely needs the first one's output.
 
+WHEN YOU ARE NOT SURE WHICH ACTION FITS — escalate instead of guessing:
+Everything below this line is a fixed list of actions, and picking from a list makes it very easy to answer a request you don't fully understand with whichever entry looks closest. That is the one failure mode you must refuse. A wrong-but-plausible action SUCCEEDS, and then you narrate that success confidently, so the user is told something got done that didn't. Never let "closest match" stand in for understanding.
+You therefore have an escape hatch, and using it is CORRECT behaviour, not a failure:
+- deliberate: "the user's request, in their own words" — hands the request to a proper reasoning pass with room to think, which works out what was actually meant and plans the real steps. Route here whenever ANY of these is true:
+  - You genuinely do not know which action the user means, or two different actions both look plausible and they'd do noticeably different things.
+  - The request needs judgment about HOW rather than just WHAT ("sort this out", "clean this up", "handle it", "make this make sense").
+  - It's a multi-step job where later steps depend on what earlier ones turn up, so you can't sensibly commit to the whole sequence up front.
+  - It's about processing CONTENT (a file, a note, a page) into some other shape, and the right shape is a judgment call.
+  - Getting it wrong would be narrated to the user as success rather than showing up as an obvious error.
+This is about your CONFIDENCE, not about keywords. Do not keep a mental list of phrases that mean deliberate; ask yourself whether you actually know what the user wants and whether one action on the list really does it. If yes, just do it — the fast path is right for most things and you should not escalate ordinary requests. If no, escalate.
+Never escalate to avoid work you can plainly do, and never escalate a clear mechanical instruction ("open a new tab", "mute", "scroll down", "click sign in") — those are unambiguous and cheap to undo.
+Say only a short neutral line in "response" when you escalate, like "Let me think about that one." The reasoning pass speaks for itself afterwards, so do NOT promise a specific outcome you haven't decided on yet.
+
 STRICT BEHAVIOR RULES:
 - NEVER take additional actions beyond exactly what the user asked for. If a click fails, say so and stop. Do not search, do not open tabs, do not try alternatives on your own.
 - NEVER open a new tab unless the user explicitly says "new tab" or "different tab".
@@ -260,7 +273,9 @@ ACTION PARAMETER FORMATS (fields split with |; relative names resolve against th
 - open_folder: "folder name or path" — opens it in File Explorer and makes it the session folder.
 - list_folder: "folder name or path (optional — defaults to session folder)" — speaks the contents.
 - create_file: "path|optional initial content" — refuses if the file already exists.
-- read_file: "path" — reads content for you to reference or read aloud. Handles PDF and docx too (text is extracted).
+- read_file: "path" — reads a file and speaks the FIRST CHUNK only, then asks the user whether to continue. Handles PDF and docx too. The action already speaks the chunk AND already asks the question, so relay its message and STOP — do not summarize the rest, and do not call read_file again to get more.
+- read_more: no parameter — speaks the NEXT chunk of a read already in progress. Route here when the user says yes / keep going / continue / next after a chunked read. stop_reading: no parameter — route here for no / that's enough / stop.
+- READING ALOUD IS BOUNDED ON PURPOSE; INTERNAL PROCESSING IS NOT. When you need whole content in order to DO something with it, the right action ingests it in full by itself (summarize_file, file_to_doc, obsidian_control|organize). Never loop read_file/read_more to reassemble a document — pick the action that ingests it properly.
 - summarize_file: "name or path" — reads the file (text, code, PDF, or docx) and speaks a 4-5 sentence summary of what's in it. Use whenever the user asks what a file says / contains / is about.
 - file_to_doc: "file name or path|Doc Title|what to put in the doc|[short or detailed]" — extracts the text of a local file (PDF, docx, text, code) and creates a Google Doc from it in ONE action. The third field describes what to extract ("everything", "just the electrical engineering courses section"). Use this whenever the user wants file content turned into a Google Doc — NEVER chain read_file into docs_control for that (read_file only returns a snippet; file_to_doc passes the FULL extracted text to the doc writer).
 - search_file: "name or partial name|optional folder" — folder can be a spoken name like pictures or downloads. Defaults to the session folder or home.
@@ -345,13 +360,19 @@ If any workspace action reports "Google account not connected", tell the user to
 OBSIDIAN (the user's permanent notes vault — this is the knowledge store, Google Docs is not): obsidian_control|action|params. All ungated; every write is ADDITIVE, so nothing here can destroy a note.
 - obsidian_control|progress|note name|the bullet summary — THE ONE TO USE for "track progress", "log what we just did", "note that down". Writes a timestamped entry under the note's Progress Log heading, creating that heading if it doesn't exist. Content must be SHORT bullet lines ("- Finished the auth endpoint\\n- Blocked on schema review"), never paragraphs.
 - obsidian_control|append|note name|section|text — adds text under a specific heading. Use when the user names a section ("add that to my blockers").
-- obsidian_control|search|term — finds notes. obsidian_control|read|note name (or read|note name|section) — reads one. obsidian_control|active — tells you which note is open in Obsidian right now.
+- obsidian_control|search|term — finds notes. obsidian_control|read|note name (or read|note name|section) — reads one, speaking the FIRST CHUNK only and asking before continuing, exactly like read_file; route yes/keep going to read_more. obsidian_control|active — tells you which note is open in Obsidian right now.
 - obsidian_control|create|Title|short content — a NEW note. It REFUSES to overwrite an existing note, so if it comes back saying one exists, switch to append instead of trying again.
 - obsidian_control|link|note name|Other Note,Third Note — adds [[wikilinks]] under a Related heading. Obsidian derives the backlinks and graph edges from these automatically, so writing links IS building the graph — never claim you edited the graph view directly, it is read-only.
 - obsidian_control|moc|Index Title|Note A,Note B,Note C — builds a Map of Content index note. Use for "organize my notes on X", "make a map of X".
 - obsidian_control|diagram|note name|mermaid source — embeds a mermaid block (Obsidian renders these natively). Keep the source to a few short lines; for anything bigger, say so instead of emitting a wall of text in the parameter.
 - obsidian_control|tags — lists vault tags. obsidian_control|open|note name — opens a note in the Obsidian UI. obsidian_control|status — connectivity check, use when a note action failed and you want to tell the user why.
-- obsidian_control|focus|on and obsidian_control|focus|off — enter or leave FOCUS MODE. Use on for "focus mode", "let's focus", "start a focus session", "deep work"; off for "exit focus mode", "I'm done focusing". Focus Mode unlocks extra note-handling behaviour that is described to you only while it is on, so never claim a focus-only capability while it is off — turn it on first.
+- obsidian_control|focus|on and obsidian_control|focus|off — enter or leave FOCUS MODE. Use on for "focus mode", "let's focus", "start a focus session", "deep work"; off for "exit focus mode", "I'm done focusing".
+- obsidian_control|organize|optional content — THE ONE TO USE for "organize this", "organize that", "sort these notes out", "clean this up", "write this up properly", "put this in my vault". With no content it organizes what's on the clipboard. It reads the content in full ITSELF and reasons out the structure, so never pre-read it with read_file first and never try to build the structure yourself out of create/append calls.
+  organize WORKS WHETHER OR NOT FOCUS MODE IS ON — the difference is only how much it will take on:
+    focus mode OFF -> single-target capture: filing something into one note, a progress entry, one new note. If the content actually needs breaking across several linked notes or an index, it will TELL you so and offer to turn focus mode on. Let it make that call.
+    focus mode ON  -> the full thing: multiple notes, wikilinks, maps of content, diagrams.
+  So ALWAYS route organize requests to obsidian_control|organize. Do NOT refuse it because focus mode is off, do NOT ask the user to turn focus mode on before trying, and above all do NOT fall back to read_file, summarize_file, moc, or create when the user asked you to organize something — reading content aloud is not organizing it, and substituting one for the other is the worst thing you can do here.
+CAPABILITIES THAT NEED FOCUS MODE: if the user asks for something that genuinely only works in focus mode, SAY THAT and offer to turn it on ("want me to turn focus mode on for that?"). Never quietly pick a different action instead, and never pretend the capability doesn't exist.
 NOTE NAMES: pass what the user SAID ("project alpha"). Every action resolves a spoken name against the vault by search, so you never need the exact filename or the .md extension. If a session started with a note open, the [SESSION START] line names it — treat that as the default target for a bare "add this to my notes" rather than asking which note.
 NOTE CONTENT RULE: the CONTENT RULE above applies here too. Progress summaries and bullet lists are fine inline because they are short. Anything essay-length does NOT belong in an Obsidian parameter.
 IF OBSIDIAN IS UNREACHABLE: the action says so plainly (Obsidian closed, plugin disabled, or missing API key). Relay that once and stop — do NOT fall back to writing the user's notes into a Google Doc or a local file, and do NOT retry in a loop. Their vault is the only correct destination.
@@ -518,10 +539,12 @@ RULES:
 NEVER:
 - Never read raw source content back to the user out loud. They already have it. Summarize what you DID, never what the content said.
 
-## FM-1 — ORGANIZE THIS  [ACTIVE]
+## FM-1 — ORGANIZE THIS  [ACTIVE — FULL CAPABILITY]
 TRIGGER: "organize this", "sort this into notes", "capture this properly", "put this in my vault" — any open-ended request to turn a dump of content into notes, where the right structure is a judgment call rather than one obvious write.
 ROUTE: obsidian_control|organize — with NO content in the parameter to organize whatever is on the clipboard, or obsidian_control|organize|the content only when the user dictated it aloud in this conversation.
 RULES:
+- Focus mode is what unlocks the FULL version of this: multiple notes, wikilinks, maps of content, diagrams. Outside focus mode the same action still runs but limits itself to single-target capture, so now that you are in here, the reasoning pass will build real structure when the content earns it.
+- This is the unhurried context. Correctness matters more than speed — let the pass take the time to do it properly rather than steering it toward the smallest possible plan.
 - This is the ONE note action where you do NOT decide the structure. The action hands the raw content to a separate reasoning pass that reads it and decides how many notes it deserves, what each is called, what goes in each, and how they link, then executes that through the ordinary vault primitives.
 - Content never travels inside your JSON envelope on the clipboard route. Emit the bare action and let it read the clipboard.
 - The result comes back as one already-composed summary sentence. Speak that and stop.
@@ -615,9 +638,40 @@ Rules for the summary: one sentence, conversational, names the notes you created
 Rules for the plan: create a note before you link to it. Keep it to the operations the content actually justifies — a plan of fifteen writes for one paragraph is wrong. Escape newlines inside JSON strings as \\n.
 """
 
+# Appended to ORGANIZE_PROMPT when focus mode is OFF. Organization still works
+# outside focus mode, but only for the low-ambiguity end of the range: a single
+# clearly-scoped write. The judgment-heavy work plan_organization was actually
+# built for (splitting content across notes, building a graph, indexing) is what
+# focus mode is FOR, so out here we recognise it and offer rather than attempt.
+#
+# The line is drawn at STRUCTURAL JUDGMENT, not at content length: deciding
+# where one piece of content goes is safe and obvious; deciding how a body of
+# content should be shaped into a connected structure is not, and a wrong guess
+# there scatters a vault quietly.
+SIMPLE_ORGANIZE_CONSTRAINT = """
 
-def plan_organization(raw_content: str, vault_context: str = "") -> dict | None:
+IMPORTANT — FOCUS MODE IS OFF, SO YOU ARE IN SIMPLE CAPTURE MODE.
+Right now you may only do single-target capture. Allowed operations: append, progress, and create — and at most ONE note may be created. You may NOT use link, moc, or diagram, and you may NOT split content across multiple notes.
+
+Judge the content against that limit honestly:
+- If it is one clearly-scoped thing — a note to file under a heading, a progress entry, a single self-contained note — do it. That is the common case and you should just handle it.
+- If doing it properly would genuinely need several linked notes, an index, or a structural call about how to break it up, do NOT do a degraded version of that and do NOT cram it into one note. Return exactly this instead:
+  {"needs_focus_mode": true, "why": "one spoken sentence saying what the content would actually need, without reading the content back"}
+
+Do not reach for needs_focus_mode to avoid ordinary work. Reach for it only when the content really does need structure you are not allowed to build out here.
+"""
+
+
+def plan_organization(raw_content: str, vault_context: str = "", *,
+                      full_capability: bool = True) -> dict | None:
     """Reason over raw content and return {"plan": [...], "summary": str}.
+
+    full_capability=False (focus mode off) constrains the pass to single-target
+    capture and lets it answer {"needs_focus_mode": True, "why": ...} when the
+    content genuinely needs structural work. The constraint is applied in the
+    PROMPT here and re-checked in code by the caller — the model deciding it is
+    allowed to do something is never the only thing standing between a vague
+    request and a scattered vault.
 
     Returns None if the model could not be reached or its reply was unusable —
     the caller reports that honestly rather than writing a guessed structure.
@@ -635,13 +689,16 @@ def plan_organization(raw_content: str, vault_context: str = "") -> dict | None:
         (f"VAULT CONTEXT: {vault_context}\n\n" if vault_context else "")
         + "RAW CONTENT TO ORGANIZE:\n" + content
     )
+    organize_system = ORGANIZE_PROMPT if full_capability else (
+        ORGANIZE_PROMPT + SIMPLE_ORGANIZE_CONSTRAINT)
+    print(f"[plan_organization] full_capability={full_capability}")
     try:
         message = client.messages.create(
             model=MODEL,
             # Real headroom: note bodies live in THIS reply, unlike the routing
             # envelope, which is exactly why this is a separate call.
             max_tokens=8000,
-            system=[{"type": "text", "text": ORGANIZE_PROMPT,
+            system=[{"type": "text", "text": organize_system,
                      "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": user_block}],
             extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
@@ -659,11 +716,131 @@ def plan_organization(raw_content: str, vault_context: str = "") -> dict | None:
     if not isinstance(parsed, dict) or info.get("truncated"):
         print(f"[plan_organization] unusable plan: {raw_reply[:300]!r}")
         return None
+    # Simple-capture mode may legitimately decline: the content needs structure
+    # it is not allowed to build. That is a real answer, not a failure.
+    if parsed.get("needs_focus_mode"):
+        print("[plan_organization] declined — content needs full capability")
+        return {"plan": [], "summary": "",
+                "needs_focus_mode": True,
+                "why": (parsed.get("why") or "").strip()}
+
     steps = parsed.get("plan")
     if not isinstance(steps, list) or not steps:
         print("[plan_organization] plan had no operations")
         return None
     return {"plan": steps, "summary": (parsed.get("summary") or "").strip()}
+
+
+# ── The deliberation tier (generalized from plan_organization) ────────────────
+# plan_organization proved the shape: a SEPARATE call, its own system prompt,
+# real token headroom, excluded from conversation_history, emitting a PLAN that
+# Python only validates and executes. deliberate() is that same shape made
+# domain-agnostic, for any request where closest-match routing would be
+# guessing.
+#
+# Why this exists at all: ask_akira fuses "what does the user want" and "which
+# action is that" into ONE forward pass over a 60+ entry menu, with no abstain
+# option. Ambiguity therefore becomes false confidence — a wrong action that
+# succeeds gets narrated fluently, which is exactly how "organize this" ended
+# up reading a file aloud. deliberate() is the abstain path: the router can say
+# "I am not sure" and buy a real reasoning pass instead of guessing.
+#
+# It deliberately does NOT execute anything. The plan it returns is expanded by
+# sensei.handle_response BEFORE the existing safety net, so every planned step
+# inherits the confirmation gating that already protects the fast paths.
+
+DELIBERATE_PROMPT = """
+You are Akira's reasoning pass. You are here because the fast router looked at what the user said and was NOT confident it maps cleanly onto one action. Your job is to think it through properly and decide what should actually happen.
+
+The system prompt above lists every action that exists and the exact parameter format for each. That is your capability list — treat those actions as things you CAN DO, not as a menu to pattern-match against. Nothing outside that list exists.
+
+Work in this order:
+1. Work out what the user is actually trying to achieve, not which action name their words resemble. Use the CONTEXT block: what is on screen, which note is open, what was just discussed.
+2. Decide whether you can act on that with confidence.
+   - If yes, emit the ordered steps that accomplish it.
+   - If the request is genuinely underspecified in a way that changes what you would DO, ask one short question instead of guessing.
+   - If it needs a capability that is currently unavailable (for example something that only works in focus mode), say so and offer to enable it. Never silently substitute a different action.
+3. Prefer the smallest plan that genuinely accomplishes the goal. Multiple steps are fine when the goal needs them; padding is not.
+
+Hard rules:
+- Never plan a step whose only purpose is to look busy.
+- Never plan "deliberate" — you are already it.
+- Never plan a destructive step (deleting, overwriting, sending, purchasing) as a way of exploring. If the goal genuinely requires one, plan it and it will be confirmed with the user before it runs.
+- If you are reading something TO the user, one read action is enough; it chunks itself and asks before continuing.
+
+Output STRICT JSON and nothing else, no markdown fence:
+{"reasoning": "two or three sentences of your actual thinking, for the log, never spoken",
+ "plan": [{"action": "action_name", "parameter": "pipe|delimited|params or null"}],
+ "summary": "one short spoken sentence telling the user what you are doing",
+ "ask": "a question INSTEAD of acting, or null"}
+
+If you set "ask", leave "plan" empty. If you emit a plan, "ask" must be null.
+The summary and the ask are SPOKEN: conversational, no markdown, no bullets, no em dashes, and never read raw file or note content back.
+"""
+
+
+def deliberate(request: str, context: str = "", *,
+               focus_mode: bool = False) -> dict | None:
+    """Reason about an ambiguous request and return a plan of concrete actions.
+
+    Returns {"reasoning": str, "plan": [{"action","parameter"}], "summary": str,
+    "ask": str} or None if the model was unreachable or its reply unusable —
+    the caller then says so honestly rather than guessing an action.
+
+    Deliberately NOT added to conversation_history: this is a side reasoning
+    pass, and its plan JSON has no business being read back as dialogue.
+    """
+    import llm_json
+
+    req = (request or "").strip()
+    if not req:
+        return None
+
+    user_block = (
+        f"WHAT THE USER SAID: {req}\n\n"
+        f"CONTEXT: {context or 'none available'}\n"
+        f"FOCUS MODE: {'on' if focus_mode else 'off'}\n"
+    )
+    try:
+        message = client.messages.create(
+            model=MODEL,
+            # Room to actually think, unlike the 1600-token routing envelope.
+            max_tokens=4000,
+            system=[{"type": "text", "text": AKIRA_PROMPT,
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": DELIBERATE_PROMPT,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": user_block}],
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+        )
+    except Exception as e:
+        print(f"[deliberate] model call failed: {e!r}")
+        return None
+
+    if getattr(message, "stop_reason", None) == "max_tokens":
+        print("[deliberate] WARNING: reasoning hit max_tokens — discarding")
+        return None
+
+    raw_reply = response_text(message)
+    parsed, info = llm_json.parse(raw_reply)
+    if not isinstance(parsed, dict) or info.get("truncated"):
+        print(f"[deliberate] unusable reply: {raw_reply[:300]!r}")
+        return None
+
+    steps = parsed.get("plan")
+    steps = steps if isinstance(steps, list) else []
+    out = {
+        "reasoning": (parsed.get("reasoning") or "").strip(),
+        "plan": steps,
+        "summary": (parsed.get("summary") or "").strip(),
+        "ask": (parsed.get("ask") or "").strip(),
+    }
+    print(f"[deliberate] reasoning={out['reasoning'][:200]!r}")
+    print(f"[deliberate] steps={[s.get('action') for s in steps if isinstance(s, dict)]}")
+    if not out["plan"] and not out["ask"]:
+        print("[deliberate] neither a plan nor a question — unusable")
+        return None
+    return out
 
 
 def ask_akira(text: str) -> str:
