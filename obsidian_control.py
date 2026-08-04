@@ -170,9 +170,14 @@ def _do_read(note: str, section: str | None) -> dict:
         res = obsidian_api.request("GET", obsidian_api.vault_path(hits[0]["path"]))
         if not res["success"]:
             return res
-    # raw markdown is not directly speakable — let the LLM synthesize it
-    res["speak_summary"] = True
-    return res
+    # Bounded read-aloud: speak the first chunk and ask before continuing,
+    # rather than handing the whole note to the LLM to narrate in one breath.
+    # This bounds SPEECH only — _do_organize and other internal passes still
+    # fetch notes in full through obsidian_api directly.
+    import chunked_read
+    first = chunked_read.begin(_note_title(note) or "That note",
+                               res.get("message") or "")
+    return {"success": True, "speak": True, "message": first["message"]}
 
 
 def _do_append(note: str, section: str, text: str, *, timestamped: bool) -> dict:

@@ -191,11 +191,43 @@ FAILURE_PREFIXES = (
     "Skipped", "Something went wrong", "Unknown action",
 )
 
-# Boot fingerprint — makes stale-process / wrong-file issues instantly visible
+# Boot fingerprint — makes stale-process / wrong-file / wrong-BRANCH issues
+# instantly visible. The git line matters most: a bug report is unreadable
+# without knowing which commit was actually running.
 print(f"[BOOT] sensei: {os.path.abspath(__file__)}")
 print(f"[BOOT] claude_handler: {claude_handler.__file__}")
 print(f"[BOOT] prompt has github_control: "
       f"{'github_control' in getattr(claude_handler, 'AKIRA_PROMPT', '')}")
+
+
+def _git_fingerprint() -> str:
+    """branch @ short-sha (+dirty) of the checkout actually being run."""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    def _git(*args: str) -> str:
+        return subprocess.check_output(("git", "-C", here) + args,
+                                       stderr=subprocess.DEVNULL,
+                                       text=True, timeout=5).strip()
+    try:
+        stamp = f"{_git('rev-parse', '--abbrev-ref', 'HEAD')} @ {_git('rev-parse', '--short', 'HEAD')}"
+        return stamp + (" +uncommitted-changes" if _git("status", "--porcelain") else "")
+    except Exception as e:
+        return f"unknown ({e.__class__.__name__})"
+
+
+print(f"[BOOT] git: {_git_fingerprint()}")
+print(f"[BOOT] model: {getattr(claude_handler, 'MODEL', '?')}")
+# Feature fingerprints: proves at a glance whether the running code has the
+# features a bug report is about, instead of guessing from the branch name.
+try:
+    import chunked_read as _cr
+    import obsidian_control as _oc
+    print(f"[BOOT] features: focus_mode={hasattr(claude_handler, 'FOCUS_MODE_PROMPT')} "
+          f"organize={hasattr(_oc, '_do_organize')} "
+          f"chunked_read={_cr.SPOKEN_CHUNK_CHARS}ch "
+          f"by_type_parsing={hasattr(claude_handler, 'response_text')}")
+except Exception as e:
+    print(f"[BOOT] features: check failed ({e.__class__.__name__})")
 
 print("Listening for 'Sensei'...")
 

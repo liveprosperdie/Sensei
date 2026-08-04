@@ -1267,7 +1267,7 @@ def youtube_control(parameter: str) -> str:
     return f"Don't know how to do '{param}' on YouTube."
 
 
-# ── Netflix control ───────────────────────────────────────────────────────────
+# ── Netflix control ───────────────────────────────────────────────────���───────
 
 # Netflix's internal player API (stable since ~2017, used by every Netflix
 # extension). Gives direct play/pause/seek/volume/track control — far more
@@ -3244,10 +3244,24 @@ def _extract_document_text(fpath: str, max_chars: int = 24000) -> tuple[str | No
     return None, f"No text extractor for {ext[1:] if ext else 'that kind of'} files."
 
 
+# Memory guard for loading a text file to read aloud. NOT a spoken limit — the
+# spoken limit is chunked_read.SPOKEN_CHUNK_CHARS. A file bigger than this is
+# still read, just not held in memory beyond this point.
+_READ_ALOUD_MAX_CHARS = 400_000
+
+
 def read_file(parameter: str | None = None) -> dict:
-    """read_file|path — reads up to 4000 chars, speaks a snippet. PDF and
-    docx route through _extract_document_text (same path summarize_file
-    uses); other binary formats are still refused."""
+    """read_file|path — reads the file and speaks the FIRST CHUNK ONLY, then
+    asks whether to continue (see chunked_read). PDF and docx route through
+    _extract_document_text (same path summarize_file uses); other binary
+    formats are still refused.
+
+    The chunking here bounds what is SPOKEN, not what is read off disk. The
+    full text is loaded and handed to chunked_read intact so the progress
+    count is honest and 'keep going' has something to continue into.
+    Internal-ingestion callers (summarize_file, file_to_doc) deliberately do
+    NOT come through here — they need the whole text at once.
+    """
     print(f"[read_file] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
     fpath, err = _resolve_path(parts[0] if parts and parts[0] else None)
@@ -3262,11 +3276,9 @@ def read_file(parameter: str | None = None) -> dict:
         if xerr:
             return {"success": False, "message": xerr}
         _remember(fpath)
-        content = text[:4000]  # same cap as the plain-text route
-        snippet = content[:600].strip()
-        more = " There's more — I read the first part only." if len(text) > 4000 else ""
-        return {"success": True, "speak": True,
-                "message": f"{os.path.basename(fpath)} ({len(content)} chars read): {snippet}{more}"}
+        import chunked_read
+        first = chunked_read.begin(os.path.basename(fpath), text)
+        return {"success": True, "speak": True, "message": first["message"]}
     # binary guard — reading an image/exe as text produces spoken garbage
     if ext in {".doc", ".xls", ".xlsx", ".ppt", ".pptx",
                ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic",
@@ -3276,17 +3288,45 @@ def read_file(parameter: str | None = None) -> dict:
                 "message": f"{os.path.basename(fpath)} is a {ext[1:]} file — I can't read it as text. Say 'open it' and I'll launch it in the default app instead."}
     try:
         with open(fpath, "rb") as f:
-            raw = f.read(4000)
-        if b"\x00" in raw:  # unknown binary format
+            # Sniff for binary on a small prefix, then load the rest. The cap
+            # is a memory guard, NOT a reading-aloud limit — chunked_read does
+            # the spoken bounding.
+            raw = f.read(_READ_ALOUD_MAX_CHARS)
+        if b"\x00" in raw[:4000]:  # unknown binary format
             return {"success": False,
                     "message": f"{os.path.basename(fpath)} looks like a binary file — I can't read it as text. Want me to open it instead?"}
         content = raw.decode("utf-8", errors="replace")
     except Exception as e:
         return {"success": False, "message": f"Couldn't read the file: {e}"}
     _remember(fpath)
-    snippet = content[:600].strip()
+    import chunked_read
+    first = chunked_read.begin(os.path.basename(fpath), content)
+    return {"success": True, "speak": True, "message": first["message"]}
+
+
+def read_more(parameter: str | None = None) -> dict:
+    """read_more — speak the NEXT chunk of the read already in progress.
+
+    Exists so 'yes, keep going' after a chunked read has somewhere to route.
+    Holds no content of its own; chunked_read owns the cursor.
+    """
+    print(f"[read_more] called with parameter={parameter!r}")
+    import chunked_read
+    nxt = chunked_read.more()
+    if nxt is None:
+        return {"success": False, "speak": True,
+                "message": "I'm not part-way through anything right now. "
+                           "Tell me what to read and I'll start."}
+    return {"success": True, "speak": True, "message": nxt["message"]}
+
+
+def stop_reading(parameter: str | None = None) -> dict:
+    """stop_reading — abandon the read in progress."""
+    print(f"[stop_reading] called with parameter={parameter!r}")
+    import chunked_read
     return {"success": True, "speak": True,
-            "message": f"{os.path.basename(fpath)} ({len(content)} chars read): {snippet}"}
+            "message": "Stopped there." if chunked_read.stop()
+            else "I wasn't reading anything."}
 
 
 def write_file(parameter: str | None = None) -> dict:
@@ -4714,6 +4754,12 @@ def vscode_control(action: str, parameter: str | None = None) -> dict:
     if action == "read file":
         return read_file(parameter)
 
+    if action in ("read more", "read_more"):
+        return read_more(parameter)
+
+    if action in ("stop reading", "stop_reading"):
+        return stop_reading(parameter)
+
     if action == "write file":
         return write_file(parameter)   # gated upstream under both entry points
 
@@ -5342,6 +5388,8 @@ _ACTION_MAP = {
     "gmail_compose":     lambda p: gmail_compose(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "create_file":       create_file,
     "read_file":         read_file,
+    "read_more":         read_more,
+    "stop_reading":      stop_reading,
     "write_file":        write_file,
     "edit_file":         edit_file,
     "search_file":       search_file,
