@@ -18,7 +18,34 @@ load_dotenv()
 # timeout prevents silent multi-minute hangs (SDK default is ~10 min)
 # One place names the model, so the routing call and every reasoning pass can
 # never drift onto different Claude versions.
-MODEL = "claude-sonnet-5"
+MODEL = "claude-sonnet-4-6"
+
+
+def response_text(message) -> str:
+    """Pull the assistant's text out of a Messages response BY BLOCK TYPE.
+
+    NEVER index message.content by position. Sonnet 5 can return a
+    ThinkingBlock (and later, other non-text block kinds) BEFORE the text
+    block, so content[0].text raises
+    AttributeError: 'ThinkingBlock' object has no attribute 'text'.
+    Same rule as this project's MCP-response handling: parse by type, never by
+    position. Every call site in this codebase goes through here.
+
+    Non-text blocks are skipped, not rendered — thinking must never reach the
+    user's ears or the conversation history. Multiple text blocks are joined,
+    since the API is free to split one reply across several.
+    """
+    parts = []
+    for block in getattr(message, "content", None) or []:
+        if getattr(block, "type", None) == "text":
+            text = getattr(block, "text", None)
+            if text:
+                parts.append(text)
+    if not parts:
+        kinds = [getattr(b, "type", "?") for b in getattr(message, "content", None) or []]
+        print(f"[response_text] no text block in reply; blocks={kinds}")
+    return "\n".join(parts)
+
 
 client = anthropic.Anthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY"),
@@ -627,9 +654,10 @@ def plan_organization(raw_content: str, vault_context: str = "") -> dict | None:
         print("[plan_organization] WARNING: plan hit max_tokens — discarding")
         return None
 
-    parsed, info = llm_json.parse(message.content[0].text)
+    raw_reply = response_text(message)
+    parsed, info = llm_json.parse(raw_reply)
     if not isinstance(parsed, dict) or info.get("truncated"):
-        print(f"[plan_organization] unusable plan: {message.content[0].text[:300]!r}")
+        print(f"[plan_organization] unusable plan: {raw_reply[:300]!r}")
         return None
     steps = parsed.get("plan")
     if not isinstance(steps, list) or not steps:
@@ -692,7 +720,8 @@ def ask_akira(text: str) -> str:
         messages=messages_snapshot,
         extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
     )
-    response_text = message.content[0].text
+    # by type, not position: a ThinkingBlock can precede the text block
+    reply = response_text(message)
     # stop_reason == max_tokens is the ONLY reliable signal that the envelope
     # was cut off. Logging it makes the difference between "the model wrote bad
     # JSON" and "the model ran out of room" visible in the live log.
@@ -700,9 +729,9 @@ def ask_akira(text: str) -> str:
         print("[ask_akira] WARNING: reply hit max_tokens — JSON is truncated")
 
     with _history_lock:
-        conversation_history.append({"role": "assistant", "content": response_text})
+        conversation_history.append({"role": "assistant", "content": reply})
 
-    return response_text
+    return reply
 
 
 def record_action_results(results: list) -> None:
@@ -766,7 +795,7 @@ def synthesize_action_reply() -> str | None:
                    "raw JSON or ids aloud.",
             messages=messages,
         )
-        text = message.content[0].text.strip()
+        text = response_text(message).strip()
         if not text:
             return None
         # keep history honest: what Akira actually SAID replaces the stub ack
@@ -817,7 +846,7 @@ def ask_confirmation(text: str, pending_description: str | None = None) -> bool:
                              "Reply only YES or NO. Nothing else.",
             messages=[{"role": "user", "content": text}],
         )
-        verdict = message.content[0].text.strip().upper().startswith("YES")
+        verdict = response_text(message).strip().upper().startswith("YES")
         print(f"[ask_confirmation] haiku says {'YES' if verdict else 'NO'} for {text!r}")
         return verdict
     except Exception as e:
@@ -837,7 +866,7 @@ def summarize_text(text: str, filename: str = "") -> str:
                "the file IS, then the key points.",
         messages=[{"role": "user", "content": f"File: {filename}\n\n{text}"}],
     )
-    return message.content[0].text.strip()
+    return response_text(message).strip()
 
 
 # vision_match removed: screen-coordinate clicking acted on the whole DESKTOP,
