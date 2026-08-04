@@ -49,9 +49,45 @@ def response_text(message) -> str:
 
 client = anthropic.Anthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY"),
+    # Default for the FAST path (routing, narration, confirmation, summaries).
+    # These are all small max_tokens calls that sit between the user speaking
+    # and Akira answering, so they must fail fast rather than hang — 30s of
+    # silence is already too much dead air on a voice interface.
     timeout=30.0,
     max_retries=1,
 )
+
+# ── Timeouts for the reasoning tier ──────────────────────────────────────────
+# The reasoning passes are a different shape from the fast path: they generate
+# whole note bodies or multi-step plans, so their replies are 3-25x larger and
+# take proportionally longer to produce. The 30s default above is a fast-path
+# number and is simply too short for them — plan_organization was observed
+# dying with APITimeoutError on real content.
+#
+# Applied PER CALL via client.with_options(), NOT by raising the client-wide
+# timeout: raising it globally would let a hung routing call sit for two
+# minutes, which is exactly what the 30s default exists to prevent.
+#
+# Scaled to each call's max_tokens (8000 and 4000 respectively). Sonnet emits
+# roughly 60-80 tokens/sec, so a typical organize plan (~1-3k tokens) lands
+# near 20-50s and has comfortable headroom here. A plan that ran all the way to
+# the 8000 ceiling would need ~100-130s and could still time out — if that shows
+# up in practice, raise ORGANIZE_TIMEOUT rather than lowering max_tokens.
+ORGANIZE_TIMEOUT = 120.0   # plan_organization(), max_tokens=8000
+DELIBERATE_TIMEOUT = 90.0  # deliberate(),        max_tokens=4000
+
+# The SDK RETRIES TIMED-OUT REQUESTS. With the client's max_retries=1 a timeout
+# costs two full attempts, so a 120s ceiling silently becomes 240s of dead air
+# on a voice interface — worse than the failure it was meant to prevent. These
+# two calls therefore take a single attempt, which makes worst-case wall time
+# equal to the timeout above.
+#
+# The tradeoff, stated plainly: a transient Anthropic overload (529) that a
+# retry would have absorbed now surfaces as "I couldn't work out a structure"
+# instead. That is the better trade here, because that failure path is graceful
+# and writes nothing, whereas minutes of silence is indistinguishable from a
+# hang. Set this to 1 if overload errors turn out to be the more common failure.
+REASONING_MAX_RETRIES = 0
 
 # ── Voice setup ───────────────────────────────────────────────────────────────
 
@@ -693,7 +729,13 @@ def plan_organization(raw_content: str, vault_context: str = "", *,
         ORGANIZE_PROMPT + SIMPLE_ORGANIZE_CONSTRAINT)
     print(f"[plan_organization] full_capability={full_capability}")
     try:
-        message = client.messages.create(
+        # ORGANIZE_TIMEOUT, not the client's 30s fast-path default: this reply
+        # contains entire note bodies and legitimately takes longer to generate.
+        # Single attempt so a timeout can't double into 4 minutes of silence.
+        message = client.with_options(
+            timeout=ORGANIZE_TIMEOUT,
+            max_retries=REASONING_MAX_RETRIES,
+        ).messages.create(
             model=MODEL,
             # Real headroom: note bodies live in THIS reply, unlike the routing
             # envelope, which is exactly why this is a separate call.
@@ -704,7 +746,11 @@ def plan_organization(raw_content: str, vault_context: str = "", *,
             extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
         )
     except Exception as e:
-        print(f"[plan_organization] model call failed: {e!r}")
+        # Includes APITimeoutError. Returning None makes the caller say it wrote
+        # nothing, which is the correct outcome — a half-planned vault would be
+        # worse than an honest failure.
+        print(f"[plan_organization] model call failed after "
+              f"{ORGANIZE_TIMEOUT:.0f}s limit: {e!r}")
         return None
 
     if getattr(message, "stop_reason", None) == "max_tokens":
@@ -802,7 +848,14 @@ def deliberate(request: str, context: str = "", *,
         f"FOCUS MODE: {'on' if focus_mode else 'off'}\n"
     )
     try:
-        message = client.messages.create(
+        # DELIBERATE_TIMEOUT, not the client's 30s fast-path default — same
+        # class of problem as plan_organization: a reasoning reply is far larger
+        # than a routing envelope and needs proportionally longer to generate.
+        # Single attempt, for the same dead-air reason as organize.
+        message = client.with_options(
+            timeout=DELIBERATE_TIMEOUT,
+            max_retries=REASONING_MAX_RETRIES,
+        ).messages.create(
             model=MODEL,
             # Room to actually think, unlike the 1600-token routing envelope.
             max_tokens=4000,
@@ -814,7 +867,10 @@ def deliberate(request: str, context: str = "", *,
             extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
         )
     except Exception as e:
-        print(f"[deliberate] model call failed: {e!r}")
+        # Includes APITimeoutError. None makes the caller admit it couldn't
+        # work the request out, rather than falling back to a guessed action.
+        print(f"[deliberate] model call failed after "
+              f"{DELIBERATE_TIMEOUT:.0f}s limit: {e!r}")
         return None
 
     if getattr(message, "stop_reason", None) == "max_tokens":
