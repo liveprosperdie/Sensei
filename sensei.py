@@ -165,6 +165,84 @@ def _is_dangerous_step(step: dict) -> bool:
     return False
 
 
+# ── Deliberation tier ────────────────────────────────────────────────────────
+# "deliberate" is not a real executor action — it is an ABSTAIN signal from the
+# router meaning "I'm not confident this maps to one action". It is expanded
+# here, BEFORE the safety net, into the concrete steps a proper reasoning pass
+# decided on. Expanding it here rather than inside executor is deliberate: every
+# planned step then flows through _is_dangerous_step and the existing
+# confirmation machinery exactly like a router-emitted step, so the reasoning
+# pass cannot route around a single safety guarantee.
+
+_DELIBERATE_MAX_STEPS = 8
+
+
+def _expand_deliberation(steps: list[dict]) -> tuple[list[dict], str | None]:
+    """Replace any deliberate step with the plan it reasons out.
+
+    Returns (steps_to_run, spoken_override). A spoken_override with no steps
+    means the pass asked a question or declined instead of acting.
+    """
+    if not any((s.get("action") or "").strip().lower() == "deliberate"
+               for s in steps if isinstance(s, dict)):
+        return steps, None
+
+    expanded: list[dict] = []
+    spoken: str | None = None
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if (step.get("action") or "").strip().lower() != "deliberate":
+            expanded.append(step)
+            continue
+
+        request = (step.get("parameter") or "").strip()
+        print(f"[deliberate] escalated request={request[:160]!r}")
+        try:
+            ctx = get_pc_context()
+            bits = [f"foreground app: {ctx.get('foreground_app') or 'unknown'}"]
+            url = ctx.get("current_url")
+            if url and url not in ("about:blank", "chrome://newtab/", ""):
+                bits.append(f"page open: {url}")
+            try:
+                import obsidian_context
+                if obsidian_context.focus_note:
+                    bits.append(f"note open: {obsidian_context.focus_note}")
+                focus = obsidian_context.is_focus_mode()
+            except Exception:
+                focus = False
+            plan = claude_handler.deliberate(request, " | ".join(bits),
+                                             focus_mode=focus)
+        except Exception as e:
+            print(f"[deliberate] expansion failed: {e!r}")
+            plan = None
+
+        if not plan:
+            spoken = ("I thought about that one and couldn't work out what you "
+                      "wanted precisely enough to act on it. Can you tell me "
+                      "a bit more directly?")
+            continue
+
+        if plan.get("ask") and not plan.get("plan"):
+            spoken = plan["ask"]
+            continue
+
+        for planned in plan["plan"][:_DELIBERATE_MAX_STEPS]:
+            if not isinstance(planned, dict):
+                continue
+            name = (planned.get("action") or "").strip()
+            # No recursion: a reasoning pass may not buy itself another one.
+            if not name or name.lower() == "deliberate":
+                continue
+            expanded.append({"action": name,
+                             "parameter": planned.get("parameter")})
+        if plan.get("summary"):
+            spoken = plan["summary"]
+
+    print(f"[deliberate] expanded to {[s.get('action') for s in expanded]}")
+    return expanded, spoken
+
+
 def _confirmation_prompt(unsafe: list[dict]) -> str:
     """Confirmation wording for the safety net's own fallback.
 
@@ -191,11 +269,44 @@ FAILURE_PREFIXES = (
     "Skipped", "Something went wrong", "Unknown action",
 )
 
-# Boot fingerprint — makes stale-process / wrong-file issues instantly visible
+# Boot fingerprint — makes stale-process / wrong-file / wrong-BRANCH issues
+# instantly visible. The git line matters most: a bug report is unreadable
+# without knowing which commit was actually running.
 print(f"[BOOT] sensei: {os.path.abspath(__file__)}")
 print(f"[BOOT] claude_handler: {claude_handler.__file__}")
 print(f"[BOOT] prompt has github_control: "
       f"{'github_control' in getattr(claude_handler, 'AKIRA_PROMPT', '')}")
+
+
+def _git_fingerprint() -> str:
+    """branch @ short-sha (+dirty) of the checkout actually being run."""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    def _git(*args: str) -> str:
+        return subprocess.check_output(("git", "-C", here) + args,
+                                       stderr=subprocess.DEVNULL,
+                                       text=True, timeout=5).strip()
+    try:
+        stamp = f"{_git('rev-parse', '--abbrev-ref', 'HEAD')} @ {_git('rev-parse', '--short', 'HEAD')}"
+        return stamp + (" +uncommitted-changes" if _git("status", "--porcelain") else "")
+    except Exception as e:
+        return f"unknown ({e.__class__.__name__})"
+
+
+print(f"[BOOT] git: {_git_fingerprint()}")
+print(f"[BOOT] model: {getattr(claude_handler, 'MODEL', '?')}")
+# Feature fingerprints: proves at a glance whether the running code has the
+# features a bug report is about, instead of guessing from the branch name.
+try:
+    import chunked_read as _cr
+    import obsidian_control as _oc
+    print(f"[BOOT] features: focus_mode={hasattr(claude_handler, 'FOCUS_MODE_PROMPT')} "
+          f"organize={hasattr(_oc, '_do_organize')} "
+          f"chunked_read={_cr.SPOKEN_CHUNK_CHARS}ch "
+          f"deliberate={hasattr(claude_handler, 'deliberate')} "
+          f"by_type_parsing={hasattr(claude_handler, 'response_text')}")
+except Exception as e:
+    print(f"[BOOT] features: check failed ({e.__class__.__name__})")
 
 print("Listening for 'Sensei'...")
 
@@ -413,6 +524,21 @@ def handle_response(response: dict) -> bool:
         actions_to_run = response.get("actions", [])
         if response.get("action"):
             actions_to_run = [{"action": response["action"], "parameter": response.get("parameter")}]
+
+        # Deliberation tier: swap any "deliberate" abstain signal for the plan a
+        # real reasoning pass produced. Done HERE, above the safety net, so
+        # planned steps are gated identically to router-emitted ones.
+        actions_to_run, deliberated_speech = _expand_deliberation(actions_to_run)
+        if deliberated_speech:
+            # The reasoning pass speaks for itself — its summary/question always
+            # beats the router's placeholder "Let me think about that one."
+            response["response"] = deliberated_speech
+        # An empty plan is a valid outcome (it asked a question or declined):
+        # nothing runs, and the summary/question falls through to the single
+        # speak_and_wait at the end of this function.
+        response["actions"] = actions_to_run
+        response.pop("action", None)
+        response.pop("parameter", None)
 
         # safety net: catch dangerous actions Claude forgot to gate
         # (includes risky shopping steps like checkout / place order / address)
