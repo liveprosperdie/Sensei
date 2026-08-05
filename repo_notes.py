@@ -381,14 +381,37 @@ def generate(repo: str) -> dict:
                                    f"it, so I haven't written anything."}
 
     plan = claude_handler.plan_repo_notes(repo, meta, readme, summaries)
-    # The original live failure, now recoverable: retry once on a smaller input,
-    # because output size tracks input size here.
+    # The original live failure, now recoverable: retry once on a genuinely
+    # SMALLER input, because output size tracks input size here. Whichever input
+    # is actually carrying the weight is the one that gets halved — on the
+    # README-first path there are no summaries to trim, so trimming them would
+    # resend byte-identical input and buy an identical failure.
     if isinstance(plan, dict) and plan.get("hit_max_tokens"):
-        trimmed = dict(list(summaries.items())[:max(1, len(summaries) // 2)])
-        print(f"[repo_notes] retrying with {len(trimmed)} summaries")
-        plan = claude_handler.plan_repo_notes(repo, meta, readme, trimmed)
-        if isinstance(plan, dict) and plan.get("hit_max_tokens"):
+        # Halve the summaries when there are enough of them to halve. With 0 or 1
+        # summary that is a no-op, so the README is trimmed instead — otherwise
+        # the "retry" would resend byte-identical input and buy an identical
+        # failure at full price.
+        retry_summaries = summaries
+        retry_readme = readme
+        if len(summaries) > 1:
+            retry_summaries = dict(list(summaries.items())[:len(summaries) // 2])
+        elif len(readme) > README_MIN_CHARS:
+            retry_readme = readme[:max(README_MIN_CHARS, len(readme) // 2)]
+
+        shrank = (len(retry_summaries) < len(summaries)
+                  or len(retry_readme) < len(readme))
+        if not shrank:
+            # Nothing left to cut. The input is already minimal, so a retry would
+            # be identical; don't pay for it twice.
+            print("[repo_notes] input already minimal — not retrying")
             plan = None
+        else:
+            print(f"[repo_notes] retrying with {len(retry_summaries)} summaries, "
+                  f"{len(retry_readme)} chars of readme")
+            plan = claude_handler.plan_repo_notes(
+                repo, meta, retry_readme, retry_summaries)
+            if isinstance(plan, dict) and plan.get("hit_max_tokens"):
+                plan = None
     if not plan or not plan.get("plan"):
         return {"success": False,
                 "message": f"I read through {repo} but couldn't settle on a good "

@@ -227,8 +227,15 @@ def status_line() -> str:
                           key=lambda t: t.get("finished") or 0.0)
 
         if running:
-            parts = [f"{t['label']}, going {_ago(now - t['started'])} now"
-                     for t in running]
+            # Below ~15s, an elapsed number is both useless and faintly absurd
+            # ("going 0 seconds now"), so it just says it only just began.
+            def _progress(t: dict) -> str:
+                elapsed = now - t["started"]
+                if elapsed < 15:
+                    return f"{t['label']}, only just started"
+                return f"{t['label']}, going {_ago(elapsed)} now"
+
+            parts = [_progress(t) for t in running]
             if len(parts) == 1:
                 line = f"Still working on it: {parts[0]}."
             else:
@@ -244,11 +251,13 @@ def status_line() -> str:
 
         if finished:
             last = finished[-1]
-            when = _ago(now - (last["finished"] or now))
+            elapsed = now - (last["finished"] or now)
+            # "about 0 seconds ago" is worse than saying nothing about timing.
+            when = "just now" if elapsed < 15 else f"about {_ago(elapsed)} ago"
             if last["state"] == DONE:
-                return (f"That's done — I finished {last['label']} about {when} ago. "
+                return (f"That's done — I finished {last['label']} {when}. "
                         + (last["message"] or "")).strip()
-            return (f"That one failed, about {when} ago. "
+            return (f"That one failed, {when}. "
                     + (last["message"] or "")).strip()
 
     return "I don't have anything running in the background right now."
