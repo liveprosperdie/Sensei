@@ -2780,6 +2780,30 @@ def github_control(action: str, parameter: str | None = None) -> dict:
         except Exception as e:
             return {"success": False, "message": f"Couldn't fetch the readme: {e}"}
 
+    if action in ("repo notes", "generate notes", "architecture notes",
+                  "write notes", "document repo"):
+        # Reads the repo and writes linked Obsidian notes about its architecture.
+        # Minutes of model calls, so it runs in the background — but the TARGET is
+        # resolved right here on the main thread, because resolving it needs the
+        # browser's current URL and Selenium is not thread-safe. Only the slow,
+        # browser-free remainder is handed off.
+        target = repo
+        if parameter and "/" in parameter and " " not in parameter.strip():
+            target = parameter.strip().strip("/")
+        if not target and _gh_last_repos:
+            target = _gh_last_repos[0]["label"]
+        if not target:
+            return {"success": False,
+                    "message": "Open a repo first, or tell me the owner and name."}
+        import background_tasks
+        import repo_notes
+        return background_tasks.start(
+            f"writing up notes on {target}",
+            lambda: repo_notes.generate(target),
+            ack=f"I'll read through {target} and write up notes on its "
+                f"architecture in the background. Keep talking to me, and I'll "
+                f"tell you when it's done.")
+
     if action == "clone repo":
         # REAL git clone into Documents\GitHub Clones (default, spoken aloud).
         # Optional parameter overrides the destination: "clone repo|D:\code".
@@ -2813,21 +2837,33 @@ def github_control(action: str, parameter: str | None = None) -> dict:
                    "clone", "--", url, dest]
         else:
             env["GIT_TERMINAL_PROMPT"] = "0"  # fail fast instead of hanging on a prompt
-        try:
-            proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
-        except subprocess.TimeoutExpired:
-            return {"success": False, "message": f"Cloning {repo} timed out after five minutes — it may be a huge repo or a slow connection."}
-        except Exception as e:
-            return {"success": False, "message": f"Couldn't run git: {e}"}
-        if proc.returncode == 0:
-            return {"success": True, "message": f"Cloned {repo} into {dest}."}
-        err = (proc.stderr or "").strip().splitlines()
-        err_line = err[-1] if err else "unknown git error"
-        if "Authentication failed" in str(proc.stderr) or "could not read" in str(proc.stderr):
-            return {"success": False, "message": f"Git couldn't authenticate for {repo} — if it's private, check that your GITHUB_TOKEN has repo scope."}
-        if "already exists" in str(proc.stderr):
-            return {"success": False, "message": f"{repo.split('/')[1]} already exists in {base_dir}."}
-        return {"success": False, "message": f"Clone failed: {err_line[:120]}"}
+        # Everything above is fast validation and stays inline, so a bad path or
+        # a missing git is still reported instantly. Only the clone itself — up to
+        # five minutes of network I/O — goes to the background, because the user
+        # has no reason to sit in silence waiting for a download.
+        def _run_clone() -> dict:
+            try:
+                proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=300)
+            except subprocess.TimeoutExpired:
+                return {"success": False, "message": f"Cloning {repo} timed out after five minutes — it may be a huge repo or a slow connection."}
+            except Exception as e:
+                return {"success": False, "message": f"Couldn't run git: {e}"}
+            if proc.returncode == 0:
+                return {"success": True, "message": f"Cloned {repo} into {dest}."}
+            err = (proc.stderr or "").strip().splitlines()
+            err_line = err[-1] if err else "unknown git error"
+            if "Authentication failed" in str(proc.stderr) or "could not read" in str(proc.stderr):
+                return {"success": False, "message": f"Git couldn't authenticate for {repo} — if it's private, check that your GITHUB_TOKEN has repo scope."}
+            if "already exists" in str(proc.stderr):
+                return {"success": False, "message": f"{repo.split('/')[1]} already exists in {base_dir}."}
+            return {"success": False, "message": f"Clone failed: {err_line[:120]}"}
+
+        import background_tasks
+        return background_tasks.start(
+            f"cloning {repo}",
+            _run_clone,
+            ack=f"Cloning {repo} into {base_dir} in the background. I'll tell you "
+                f"when it's finished.")
 
     # ── Tier A: writes via DOM (logged-in session) or PAT if available ──────
     if action in ("star repo", "unstar repo"):
@@ -5414,6 +5450,11 @@ _ACTION_MAP = {
     "adjust_volume":     adjust_volume,
     "adjust_brightness": adjust_brightness,
     "screenshot":        lambda _: screenshot(),
+    # "how's that going?" / "is it done yet?" — answers from the background task
+    # registry. Lazy import keeps executor's import graph unchanged.
+    "background_status": lambda _: {
+        "success": True, "speak": True,
+        "message": __import__("background_tasks").status_line()},
     # Legacy action names kept as aliases onto the single system_control
     # implementation — the old local copies used bare `shutdown /f`, which
     # force-killed apps past unsaved work, and never checked whether

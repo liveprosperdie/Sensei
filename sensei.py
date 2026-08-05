@@ -16,6 +16,7 @@ import openwakeword
 import claude_handler
 import llm_json
 import action_guard
+import background_tasks
 import system_control
 import office_control
 import obsidian_context
@@ -405,6 +406,31 @@ def speak_and_wait(text: str) -> None:
     user_speaking.clear()
 
 
+def _announce_background() -> bool:
+    """Speak any finished-background-task lines. Returns True if it spoke.
+
+    MAIN THREAD ONLY. Worker threads must never call speak themselves:
+    akira_speaking is a plain global shared with the VAD listener, and two TTS
+    streams at once would both overlap audio and corrupt the barge-in state.
+    Workers queue a line here instead, and this drains it at a safe moment.
+    """
+    if not background_tasks.has_announcements():
+        return False
+    spoke = False
+    for line in background_tasks.take_announcements():
+        print(f"[background] announcing: {line[:100]!r}")
+        speak_and_wait(line)
+        spoke = True
+        # Put the outcome in the LLM's history too, so the next turn can answer
+        # "what did you call those notes?" instead of having no idea the work
+        # ever happened — the completion never went through run_actions.
+        try:
+            claude_handler.record_action_results([line])
+        except Exception as e:
+            print(f"[background] history record failed: {e}")
+    return spoke
+
+
 # ── Action execution ───────────────────────────────────────────────────────��──
 
 def run_actions(response: dict, step_results: dict | None = None) -> list:
@@ -431,6 +457,21 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
 
     results    = list(guard_notes)
     failed_ids = set()
+
+    # Step ids whose result a LATER step consumes, either through depends_on or a
+    # {{stepX.result}} substitution. Backgrounding replaces a step's real result
+    # with an acknowledgement, so backgrounding one of these would feed the next
+    # step "I'll get started on that" instead of the value it needs. Chained
+    # steps therefore stay inline no matter what the background table says.
+    consumed: set = set()
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        if s.get("depends_on"):
+            consumed.add(s["depends_on"])
+        raw_param = s.get("parameter")
+        if isinstance(raw_param, str):
+            consumed.update(re.findall(r"\{\{(\w+)\.result\}\}", raw_param))
 
     for step in steps:
         step_id    = step.get("id")
@@ -460,6 +501,26 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
             print(f"[run_actions] substituted parameter={parameter!r}")
 
         print(f"[run_actions] {step['action']} | {parameter!r} | id={step_id}")
+
+        # Slow, artifact-producing work runs in the background so the session
+        # keeps going. Decided by background_tasks' table, NOT by anything here —
+        # one place owns that list. This sits below the confirmation machinery on
+        # purpose: gated steps never reach run_actions until the user has said
+        # yes, so backgrounding can never be used to skip a confirmation.
+        bg_label = background_tasks.should_background(step["action"], parameter)
+        if bg_label and step_id in consumed:
+            print(f"[run_actions] not backgrounding {step['action']}: "
+                  f"step {step_id} feeds a later step")
+            bg_label = None
+        if bg_label:
+            result = background_tasks.start(
+                bg_label,
+                # bound now, not at call time — the loop variables move on
+                lambda a=step["action"], p=parameter: execute(a, p))
+            if step_id:
+                step_results[step_id] = result
+            results.append(result)
+            continue
 
         try:
             result = execute(step["action"], parameter)
@@ -641,6 +702,10 @@ def handle_response(response: dict) -> bool:
     print("[v0] speaking response...")
     speak_and_wait(response.get("response", ""))
     print("[v0] done speaking")
+
+    # A task that finished WHILE this turn was being processed couldn't be spoken
+    # then — the main thread was busy. Now is the first safe moment.
+    _announce_background()
 
     if response.get("end_session"):
         flush_stream()
@@ -848,6 +913,24 @@ while True:
         # ── Idle — listening for wake word ────────────────────────────
         else:
             session_active = False
+
+            # Interrupt-on-completion. This branch polls every ~80ms, so a task
+            # that finishes while Akira is idle gets announced essentially the
+            # moment it finishes, with no wake word needed.
+            #
+            # Idle is the ONLY point where speaking unprompted is safe: during a
+            # turn the mic is actively recording, so speaking there would put
+            # Akira's own voice into the transcription. Anything that completes
+            # mid-turn is announced by handle_response instead.
+            if background_tasks.has_announcements() and not user_speaking.is_set():
+                if _announce_background():
+                    # Akira's own voice just went into an open mic. Drop it and
+                    # reset the detector so it cannot self-trigger the wake word.
+                    flush_stream()
+                    oww_model.reset()
+                    last_activation_time = time.time()
+                    continue
+
             chunk    = stream.read(1280, exception_on_overflow=False)
             audio_np = np.frombuffer(chunk, dtype=np.int16)
             # Look the score up by the model's real key. Positional access

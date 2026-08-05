@@ -20,6 +20,12 @@ load_dotenv()
 # never drift onto different Claude versions.
 MODEL = "claude-sonnet-5"
 
+# The cheap model, for passes that are mechanical rather than judgment-heavy:
+# short summaries, yes/no confirmation, per-file code description. Named here for
+# the same anti-drift reason as MODEL — it was previously a string literal
+# repeated at four call sites.
+HAIKU_MODEL = "claude-haiku-4-5"
+
 
 def response_text(message) -> str:
     """Pull the assistant's text out of a Messages response BY BLOCK TYPE.
@@ -293,6 +299,10 @@ ACTION PARAMETER FORMATS:
 - switch_window: triggered when user says "switch to", "show me", "bring up", "go to", or "focus on" an already-open app.
 - maximize_window / minimize_window: always specify the app name. Never send null.
 
+BACKGROUND WORK: background_status
+- Some actions run in the background because they take minutes (writing notes from a repository, cloning a repository, organizing content into the vault, turning a file into a document). When one of those starts, it returns its own spoken acknowledgement — speak exactly that and do not claim the work is finished or describe results you have not been given.
+- background_status: parameter null. Use it whenever the user asks about work already in progress: "how's that going", "is it done yet", "did that finish", "what happened to those notes", "are you still working on that". NEVER answer those from memory or guess — you cannot see whether a background task finished, and this action is the only thing that can. Speak its result.
+
 CLIPBOARD: read_clipboard, write_clipboard[T]
 - read_clipboard: reads the current clipboard content (text) and returns it for you to speak or use in chained actions. Ungated, pure read.
 - write_clipboard[T]: "exact content" — writes the EXACT user-dictated content verbatim to clipboard with NO paraphrasing or reformatting per bible §6.4. Ungated, pure write.
@@ -375,6 +385,7 @@ ACTION PARAMETER FORMATS:
   Browse: "search repos|tetris python" (reports top repos with stars), "open repo|first" or "open repo|owner/name" (by ordinal, name, or exact owner/name), "view file|src/main.py", "view issues", "view pull requests", "read readme" (spoken summary of the current repo).
   Actions: "star repo", "unstar repo", "fork repo", "clone repo" (runs a REAL git clone into Documents\\GitHub Clones by default — always tell the user where it went; "clone repo|D:\\code" clones into a custom folder instead), "create issue|title|body".
   State changes (these ALWAYS pause for user confirmation first): "create pull request|branch|title", "merge pull request|7", "close issue|12", "close pull request|7", "delete branch|old-feature", "delete repo" (needs a GITHUB_TOKEN; treat as seriously as deleting files).
+  Notes from a repo: "repo notes" (optionally "repo notes|owner/name") — reads the repository and writes a set of linked Obsidian notes about how it is built. Use this for anything like "read this repo and write notes on the architecture", "document this codebase", "explain how this project is structured, in my notes". It runs in the BACKGROUND and returns immediately with its own spoken acknowledgement, so speak that and nothing more — never say it is finished, and never invent note titles. "read readme" is the different, smaller thing: a quick spoken summary with no notes written.
   OUT OF SCOPE: pushing code, force push, or any local git operation — tell the user to use their terminal.
   NEVER use click for GitHub search results, star/fork buttons, or merge buttons — github_control handles those reliably. Only use click on GitHub for things github_control cannot do.
 VS CODE: vscode_control
@@ -590,7 +601,7 @@ NEVER:
 - Never pre-empt the reasoning pass by choosing note titles, a note count, or a template yourself.
 - Never follow up with your own create, moc or link calls to "finish the job" — the pass already ran every write it decided on.
 - Never read the organized content back aloud.
-════════════════════════════════════════════════════════════════════
+════════════════════════════════════════���═══════════════════════════
 """
 
 # ── FM-2 — POMODORO ──────────────────────────────────────────────────────────
@@ -773,6 +784,181 @@ def plan_organization(raw_content: str, vault_context: str = "", *,
     steps = parsed.get("plan")
     if not isinstance(steps, list) or not steps:
         print("[plan_organization] plan had no operations")
+        return None
+    return {"plan": steps, "summary": (parsed.get("summary") or "").strip()}
+
+
+# ── Repo-to-notes: the two-model split ───────────────────────────────────────
+# The live failure this replaces: deliberate() correctly escalated "read my
+# GitHub repo and write notes about the architecture", then hit max_tokens trying
+# to reason about a whole repo in ONE call and discarded the result.
+#
+# The fix is not a bigger token ceiling — it is splitting the work by how much
+# judgment each part actually needs, and paying accordingly:
+#
+#   PASS 1 (cheap, N calls)  summarize_code_batch() on HAIKU. "What does this
+#       file do" is mechanical description, not architectural judgment. It is
+#       also the bulk of the tokens, since it is the only pass that ever sees
+#       source code. Batched several files per call to amortise the prompt.
+#
+#   PASS 2 (expensive, 1 call)  plan_repo_notes() on Sonnet. Sees only the short
+#       summaries from pass 1 plus repo metadata — never raw source — so its
+#       input stays small no matter how big the repo is. This is where the real
+#       decision lives (what the notes are, how they link), which is exactly the
+#       work Sonnet is worth paying for.
+#
+# The README-first short-circuit in repo_notes.py can skip pass 1 entirely, which
+# makes the common case ONE Sonnet call on a few KB of prose.
+
+REPO_NOTES_TIMEOUT = 180.0   # plan_repo_notes(), max_tokens=8000, runs in background
+BATCH_SUMMARY_TIMEOUT = 90.0  # summarize_code_batch(), cheap model
+
+
+CODE_SUMMARY_PROMPT = """
+You are summarizing source files so a later pass can reason about a codebase's architecture without reading the code itself.
+
+For EACH file you are given, write two to four sentences covering only what is actually there: what the file is responsible for, the key functions, classes or exports it defines, what it depends on or talks to, and anything structurally notable (an entry point, a dispatcher, a config schema, a data model). Name real identifiers from the file.
+
+Do not evaluate the code, do not suggest improvements, do not guess at anything the file does not show you. If a file is trivial or is just configuration, say so in one line rather than padding it.
+
+Output STRICT JSON and nothing else, no markdown fence:
+{"summaries": {"exact/path/as/given.py": "your summary", "another/file.ts": "your summary"}}
+
+Use the file paths exactly as given to you. Escape newlines inside JSON strings as \\n.
+"""
+
+
+def summarize_code_batch(repo: str, files: list[dict]) -> dict:
+    """Summarize a batch of files on the CHEAP model. Returns {path: summary}.
+
+    files: [{"path": str, "text": str}]. Returns {} on failure — the caller
+    proceeds with whatever other batches succeeded rather than losing the run.
+    """
+    import llm_json
+
+    if not files:
+        return {}
+    blocks = []
+    for f in files:
+        blocks.append(f"=== FILE: {f['path']} ===\n{f['text']}")
+    user_block = f"REPOSITORY: {repo}\n\n" + "\n\n".join(blocks)
+
+    try:
+        message = client.with_options(
+            timeout=BATCH_SUMMARY_TIMEOUT,
+            max_retries=REASONING_MAX_RETRIES,
+        ).messages.create(
+            model=HAIKU_MODEL,
+            # ~120 tokens per file of summary, plus JSON overhead.
+            max_tokens=min(4000, 400 + 200 * len(files)),
+            system=[{"type": "text", "text": CODE_SUMMARY_PROMPT,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": user_block}],
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+        )
+    except Exception as e:
+        print(f"[summarize_code_batch] {len(files)} files failed: {e!r}")
+        return {}
+
+    parsed, info = llm_json.parse(response_text(message))
+    if not isinstance(parsed, dict):
+        print("[summarize_code_batch] unusable reply")
+        return {}
+    summaries = parsed.get("summaries")
+    if not isinstance(summaries, dict):
+        return {}
+    # Truncation costs the LAST file in the batch, not the whole batch.
+    return {str(k): str(v) for k, v in summaries.items() if v}
+
+
+REPO_NOTES_PROMPT = """
+You are Akira's codebase-documentation pass, writing into the user's Obsidian vault.
+
+You are given what is known about ONE repository: its metadata, its README if it has a useful one, its file layout, and short summaries of its significant source files. From that, decide how this specific codebase should be documented as a set of linked notes the user will come back to weeks from now.
+
+The breakdown is YOURS to decide. Nothing is pre-decided and there is no template:
+- How many notes, and what each one covers. Let the repo's actual structure decide — a small library might warrant an overview and two notes; a large app with clearly separate subsystems warrants a note per subsystem. Do not split a small codebase to look thorough, and do not compress a large one into one wall of text.
+- What each note is called. Real, specific titles. Prefix them with the repository name so they cannot collide with unrelated notes already in the vault, for example "next.js — Routing" rather than bare "Routing".
+- What goes in each note: what the thing is responsible for, how it is put together, the important files and identifiers, how data or control flows through it, and anything a newcomer would need to know first. Write clean markdown with headings and short lines.
+- How the notes connect, so the graph is actually useful.
+
+Ground every claim in what you were given. You are working from summaries, not the full source, so write at the level those summaries actually support and do not invent specifics you were not told. If the evidence is thin for some part of the repo, say plainly in the note that it was not examined in detail rather than filling the gap with plausible-sounding detail.
+
+Always produce an overview note that serves as the entry point, and make it a map of content linking the rest when there are enough notes for an index to help.
+
+You do not execute anything yourself. You emit a plan of vault operations and it is executed for you, in order.
+
+Available operations — these are the real primitives, nothing else exists:
+  {"op": "create",  "note": "Title",      "content": "markdown body"}      new note; fails if that title already exists
+  {"op": "append",  "note": "Title",      "section": "Heading", "content": "markdown"}   adds under a heading, creating the heading if absent
+  {"op": "link",    "note": "Title",      "targets": "Other Note,Third Note"}            wikilinks under Related
+  {"op": "moc",     "note": "Index Title","targets": "Note A,Note B"}                    map-of-content index note
+  {"op": "diagram", "note": "Title",      "content": "mermaid source"}                   embed a mermaid diagram
+
+A diagram is worth one call when the repo has a flow or layering worth seeing at a glance. Skip it otherwise.
+
+Output STRICT JSON and nothing else, no markdown fence:
+{"plan": [ ...operations in execution order... ], "summary": "one spoken sentence saying what you wrote"}
+
+Rules for the summary: one sentence, conversational, names the repo and roughly what you produced. It is spoken aloud, so no markdown, no bullets, no em dashes.
+Rules for the plan: create a note before you link to it. Escape newlines inside JSON strings as \\n.
+"""
+
+
+def plan_repo_notes(repo: str, meta: str, readme: str,
+                    summaries: dict) -> dict | None:
+    """Structure a repo into a plan of vault operations. Returns
+    {"plan": [...], "summary": str} or None if unusable.
+
+    Runs on the expensive model but sees only metadata, README prose and short
+    file summaries — never raw source — so its input size is bounded by the
+    number of files, not by how large they are.
+    """
+    import llm_json
+
+    parts = [f"REPOSITORY: {repo}"]
+    if meta:
+        parts.append("METADATA:\n" + meta)
+    if readme:
+        parts.append("README:\n" + readme[:14000])
+    if summaries:
+        listing = "\n\n".join(f"{path}\n  {summary}"
+                              for path, summary in summaries.items())
+        parts.append("FILE SUMMARIES:\n" + listing[:40000])
+    else:
+        parts.append("FILE SUMMARIES: none were gathered — the README above is "
+                     "your only evidence, so keep the notes at the level it "
+                     "actually supports and say what was not examined.")
+
+    try:
+        message = client.with_options(
+            timeout=REPO_NOTES_TIMEOUT,
+            max_retries=REASONING_MAX_RETRIES,
+        ).messages.create(
+            model=MODEL,
+            max_tokens=8000,
+            system=[{"type": "text", "text": REPO_NOTES_PROMPT,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": "\n\n".join(parts)}],
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+        )
+    except Exception as e:
+        print(f"[plan_repo_notes] model call failed: {e!r}")
+        return None
+
+    if getattr(message, "stop_reason", None) == "max_tokens":
+        # The exact failure mode that started all this. It is now survivable
+        # rather than fatal: the caller retries with fewer notes requested.
+        print("[plan_repo_notes] WARNING: plan hit max_tokens — discarding")
+        return {"hit_max_tokens": True}
+
+    parsed, info = llm_json.parse(response_text(message))
+    if not isinstance(parsed, dict) or info.get("truncated"):
+        print(f"[plan_repo_notes] unusable plan")
+        return None
+    steps = parsed.get("plan")
+    if not isinstance(steps, list) or not steps:
+        print("[plan_repo_notes] plan had no operations")
         return None
     return {"plan": steps, "summary": (parsed.get("summary") or "").strip()}
 
@@ -1016,7 +1202,7 @@ def synthesize_action_reply() -> str | None:
         return None
     try:
         message = client.messages.create(
-            model="claude-haiku-4-5",
+            model=HAIKU_MODEL,
             max_tokens=300,
             system="You are Akira, a voice assistant. The last [ACTION RESULT] "
                    "message contains the raw data an action just returned for the "
@@ -1072,7 +1258,7 @@ def ask_confirmation(text: str, pending_description: str | None = None) -> bool:
                if pending_description else "The user was asked to confirm an action. ")
     try:
         message = client.messages.create(
-            model="claude-haiku-4-5",
+            model=HAIKU_MODEL,
             max_tokens=10,
             system=context + "If their reply agrees, or restates or repeats the same "
                              "action approvingly, reply YES. Otherwise reply NO. "
@@ -1091,7 +1277,7 @@ def summarize_text(text: str, filename: str = "") -> str:
     """4-5 line spoken summary of file content, for executor.summarize_file.
     Uses haiku — fast and cheap, summary quality is plenty."""
     message = client.messages.create(
-        model="claude-haiku-4-5",
+        model=HAIKU_MODEL,
         max_tokens=300,
         system="Summarize the following file content in 4-5 short spoken sentences. "
                "Plain conversational language — it will be read aloud by a voice "
