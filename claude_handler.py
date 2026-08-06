@@ -5,6 +5,7 @@ Handles all LLM calls, TTS, and vision matching.
 
 import os
 import re
+import json
 import threading
 import datetime as dt
 import pyttsx3
@@ -601,7 +602,7 @@ NEVER:
 - Never pre-empt the reasoning pass by choosing note titles, a note count, or a template yourself.
 - Never follow up with your own create, moc or link calls to "finish the job" — the pass already ran every write it decided on.
 - Never read the organized content back aloud.
-════════════════════════════════════════���═══════════════════════════
+══════════════════════════════════════���═���═══════════════════════════
 """
 
 # ── FM-2 — POMODORO ──────────────────────────────────────────────────────────
@@ -610,7 +611,7 @@ NEVER:
 #   ## FM-2 — POMODORO  [ACTIVE]
 #   TRIGGER: ...   ROUTE: ...   RULES: ...   NEVER: ...
 #
-# ── FM-3 — TODO LIST ─────────────────────────────────────────────────────────
+# ── FM-3 — TODO LIST ────────────────────────────────────────────────────────���
 # STUB. Focus-mode todo control goes here in the same four-label format — not
 # into AKIRA_PROMPT.
 #   ## FM-3 — TODO LIST  [ACTIVE]
@@ -810,7 +811,7 @@ def plan_organization(raw_content: str, vault_context: str = "", *,
 # The README-first short-circuit in repo_notes.py can skip pass 1 entirely, which
 # makes the common case ONE Sonnet call on a few KB of prose.
 
-REPO_NOTES_TIMEOUT = 180.0   # plan_repo_notes(), max_tokens=8000, runs in background
+REPO_NOTES_TIMEOUT = 180.0   # outer budget for the staged structuring passes
 BATCH_SUMMARY_TIMEOUT = 90.0  # summarize_code_batch(), cheap model
 
 
@@ -871,48 +872,66 @@ def summarize_code_batch(repo: str, files: list[dict]) -> dict:
     return {str(k): str(v) for k, v in summaries.items() if v}
 
 
-REPO_NOTES_PROMPT = """
-You are Akira's codebase-documentation pass, writing into the user's Obsidian vault.
+"""
+STAGE 2 + 3 — why structuring is split in two.
 
-You are given what is known about ONE repository: its metadata, its README if it has a useful one, its file layout, and short summaries of its significant source files. From that, decide how this specific codebase should be documented as a set of linked notes the user will come back to weeks from now.
+The Haiku/Sonnet split bounded the INPUT to structuring but left the OUTPUT
+unbounded: one call still had to emit titles, full markdown bodies for every
+note, and all the cross-links in a single response. That is an output-side
+ceiling, and shrinking the input cannot fix it — live, it still hit max_tokens
+after retrying down to 10 summaries and the whole job was discarded.
+
+So the decision and the writing are now separate calls:
+
+  STAGE 2  plan_repo_outline()  — decides titles, a one-line purpose each, and
+      which notes link to which. Output is a few hundred tokens no matter how
+      big the repo is, because it contains no prose bodies at all.
+
+  STAGE 3  write_note_bodies()  — writes the actual markdown, batched a few
+      notes per call, with the outline as shared context. Each call's output is
+      bounded by the batch size, not by the repo, and one over-long note can no
+      longer truncate the others.
+
+Linking then reuses the relationships the outline ALREADY decided, so nothing
+re-derives them and the link step costs no tokens at all.
+"""
+
+REPO_OUTLINE_TIMEOUT = 120.0
+NOTE_BODY_TIMEOUT = 150.0
+
+
+REPO_OUTLINE_PROMPT = """
+You are Akira's codebase-documentation pass, planning how one repository should be documented in the user's Obsidian vault.
+
+You are given what is known about ONE repository: its metadata, its README if it has a useful one, its file layout, and short summaries of its significant source files. Decide the SHAPE of the documentation only. You are NOT writing the notes here — a later pass writes each body from your outline, so keep every purpose to a single line.
 
 The breakdown is YOURS to decide. Nothing is pre-decided and there is no template:
-- How many notes, and what each one covers. Let the repo's actual structure decide — a small library might warrant an overview and two notes; a large app with clearly separate subsystems warrants a note per subsystem. Do not split a small codebase to look thorough, and do not compress a large one into one wall of text.
-- What each note is called. Real, specific titles. Prefix them with the repository name so they cannot collide with unrelated notes already in the vault, for example "next.js — Routing" rather than bare "Routing".
-- What goes in each note: what the thing is responsible for, how it is put together, the important files and identifiers, how data or control flows through it, and anything a newcomer would need to know first. Write clean markdown with headings and short lines.
+- How many notes, and what each covers. Let the repo's actual structure decide — a small library might warrant an overview and two notes; a large app with clearly separate subsystems warrants a note per subsystem. Do not split a small codebase to look thorough, and do not compress a large one into one wall of text. Prefer between two and eight notes.
+- What each note is called. Real, specific titles. Prefix every title with the repository name so they cannot collide with unrelated notes already in the vault, for example "next.js — Routing" rather than bare "Routing".
+- Which files each note is about, so the writing pass knows which summaries to lean on. Use the exact paths you were given.
 - How the notes connect, so the graph is actually useful.
 
-Ground every claim in what you were given. You are working from summaries, not the full source, so write at the level those summaries actually support and do not invent specifics you were not told. If the evidence is thin for some part of the repo, say plainly in the note that it was not examined in detail rather than filling the gap with plausible-sounding detail.
+Exactly one note must be the overview and entry point. Mark it with "overview": true.
 
-Always produce an overview note that serves as the entry point, and make it a map of content linking the rest when there are enough notes for an index to help.
-
-You do not execute anything yourself. You emit a plan of vault operations and it is executed for you, in order.
-
-Available operations — these are the real primitives, nothing else exists:
-  {"op": "create",  "note": "Title",      "content": "markdown body"}      new note; fails if that title already exists
-  {"op": "append",  "note": "Title",      "section": "Heading", "content": "markdown"}   adds under a heading, creating the heading if absent
-  {"op": "link",    "note": "Title",      "targets": "Other Note,Third Note"}            wikilinks under Related
-  {"op": "moc",     "note": "Index Title","targets": "Note A,Note B"}                    map-of-content index note
-  {"op": "diagram", "note": "Title",      "content": "mermaid source"}                   embed a mermaid diagram
-
-A diagram is worth one call when the repo has a flow or layering worth seeing at a glance. Skip it otherwise.
+Ground the plan in what you were given. If the evidence is thin for some part of the repo, it is better to say so in the outline than to invent a note about something you were not shown.
 
 Output STRICT JSON and nothing else, no markdown fence:
-{"plan": [ ...operations in execution order... ], "summary": "one spoken sentence saying what you wrote"}
+{"notes": [{"title": "repo — Name", "purpose": "one line on what this note covers", "files": ["path/one.py"], "links": ["repo — Other Note"], "overview": false}],
+ "index": true or false,
+ "diagram": "mermaid source for the overview, or null",
+ "summary": "one spoken sentence naming the repo and what you are producing"}
 
-Rules for the summary: one sentence, conversational, names the repo and roughly what you produced. It is spoken aloud, so no markdown, no bullets, no em dashes.
-Rules for the plan: create a note before you link to it. Escape newlines inside JSON strings as \\n.
+Rules: "links" holds titles from your OWN notes list and nothing else. Set "index" true only when there are enough notes that a map of content actually helps. Include a diagram only when the repo has a flow or layering worth seeing at a glance. The summary is spoken aloud, so no markdown, no bullets, no em dashes.
 """
 
 
-def plan_repo_notes(repo: str, meta: str, readme: str,
-                    summaries: dict) -> dict | None:
-    """Structure a repo into a plan of vault operations. Returns
-    {"plan": [...], "summary": str} or None if unusable.
+def plan_repo_outline(repo: str, meta: str, readme: str,
+                      summaries: dict) -> dict | None:
+    """STAGE 2: decide the note structure only. Bounded, small output.
 
-    Runs on the expensive model but sees only metadata, README prose and short
-    file summaries — never raw source — so its input size is bounded by the
-    number of files, not by how large they are.
+    Returns {"notes": [...], "index": bool, "diagram": str|None,
+    "summary": str} or None. Sees only metadata, README prose and short file
+    summaries — never raw source.
     """
     import llm_json
 
@@ -932,35 +951,147 @@ def plan_repo_notes(repo: str, meta: str, readme: str,
 
     try:
         message = client.with_options(
-            timeout=REPO_NOTES_TIMEOUT,
+            timeout=REPO_OUTLINE_TIMEOUT,
             max_retries=REASONING_MAX_RETRIES,
         ).messages.create(
             model=MODEL,
-            max_tokens=8000,
-            system=[{"type": "text", "text": REPO_NOTES_PROMPT,
+            # Titles and one-liners only. 2500 is already generous, which is the
+            # entire point of separating this from the body writing.
+            max_tokens=2500,
+            system=[{"type": "text", "text": REPO_OUTLINE_PROMPT,
                      "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": "\n\n".join(parts)}],
             extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
         )
     except Exception as e:
-        print(f"[plan_repo_notes] model call failed: {e!r}")
+        print(f"[plan_repo_outline] model call failed: {e!r}")
         return None
 
     if getattr(message, "stop_reason", None) == "max_tokens":
-        # The exact failure mode that started all this. It is now survivable
-        # rather than fatal: the caller retries with fewer notes requested.
-        print("[plan_repo_notes] WARNING: plan hit max_tokens — discarding")
+        print("[plan_repo_outline] WARNING: outline hit max_tokens")
         return {"hit_max_tokens": True}
 
     parsed, info = llm_json.parse(response_text(message))
     if not isinstance(parsed, dict) or info.get("truncated"):
-        print(f"[plan_repo_notes] unusable plan")
+        print("[plan_repo_outline] unusable outline")
         return None
-    steps = parsed.get("plan")
-    if not isinstance(steps, list) or not steps:
-        print("[plan_repo_notes] plan had no operations")
+    notes = parsed.get("notes")
+    if not isinstance(notes, list) or not notes:
+        print("[plan_repo_outline] outline had no notes")
         return None
-    return {"plan": steps, "summary": (parsed.get("summary") or "").strip()}
+
+    clean = []
+    for n in notes:
+        if not isinstance(n, dict) or not (n.get("title") or "").strip():
+            continue
+        clean.append({
+            "title": str(n["title"]).strip(),
+            "purpose": str(n.get("purpose") or "").strip(),
+            "files": [str(f) for f in (n.get("files") or []) if f],
+            "links": [str(t).strip() for t in (n.get("links") or []) if t],
+            "overview": bool(n.get("overview")),
+        })
+    if not clean:
+        return None
+    diagram = parsed.get("diagram")
+    return {"notes": clean,
+            "index": bool(parsed.get("index")),
+            "diagram": str(diagram).strip() if diagram else None,
+            "summary": (parsed.get("summary") or "").strip()}
+
+
+NOTE_BODY_PROMPT = """
+You are Akira writing the actual content of codebase notes into the user's Obsidian vault.
+
+You are given a repository's metadata, short summaries of its files, the full outline of the note set, and the specific notes YOU must write in this pass. Write only the notes you are asked for.
+
+For each one, write clean markdown: what the thing is responsible for, how it is put together, the important files and identifiers by their real names, how data or control flows through it, and what a newcomer needs to know first. Use headings and short lines. Aim for something genuinely useful to reread weeks later — thorough but not padded, and no filler sections.
+
+Do NOT add a Related or links section — linking is handled separately for you. Do not restate the outline. Do not wrap the body in a code fence.
+
+Ground every claim in the summaries you were given. You are working from summaries, not full source, so write at the level they actually support. Where the evidence is thin, say plainly that the area was not examined in detail rather than inventing plausible-sounding specifics.
+
+Output STRICT JSON and nothing else, no markdown fence:
+{"bodies": {"exact note title": "markdown body", "another title": "markdown body"}}
+
+Use the note titles exactly as given. Escape newlines inside JSON strings as \\n.
+"""
+
+
+def write_note_bodies(repo: str, meta: str, outline: list,
+                      targets: list, summaries: dict) -> dict:
+    """STAGE 3: write the markdown for `targets` (a batch of outline notes).
+
+    Returns {title: markdown}. Returns {} on failure so the caller can keep the
+    notes that other batches produced rather than losing the whole run.
+    """
+    import llm_json
+
+    if not targets:
+        return {}
+
+    # Only the summaries these notes actually reference, so a batch about one
+    # subsystem doesn't drag the whole repo's summaries along.
+    wanted = {p for t in targets for p in (t.get("files") or [])}
+    relevant = {p: s for p, s in summaries.items() if p in wanted}
+    if not relevant:
+        relevant = summaries
+
+    shape = "\n".join(
+        f"- {n['title']}" + (f": {n['purpose']}" if n.get("purpose") else "")
+        for n in outline)
+    asked = "\n\n".join(
+        f"TITLE: {t['title']}\nPURPOSE: {t.get('purpose') or 'not specified'}\n"
+        f"RELEVANT FILES: {', '.join(t.get('files') or []) or 'not specified'}"
+        for t in targets)
+
+    parts = [f"REPOSITORY: {repo}"]
+    if meta:
+        parts.append("METADATA:\n" + meta)
+    if relevant:
+        listing = "\n\n".join(f"{p}\n  {s}" for p, s in relevant.items())
+        parts.append("FILE SUMMARIES:\n" + listing[:40000])
+    parts.append("THE FULL NOTE SET (for context — do not write these):\n" + shape)
+    parts.append(f"WRITE EXACTLY THESE {len(targets)} NOTES:\n" + asked)
+
+    try:
+        message = client.with_options(
+            timeout=NOTE_BODY_TIMEOUT,
+            max_retries=REASONING_MAX_RETRIES,
+        ).messages.create(
+            model=MODEL,
+            # ~1500 tokens of body per note. Bounded by BATCH SIZE, never by the
+            # repo — this is what stops the max_tokens failure from returning.
+            max_tokens=min(8000, 800 + 1500 * len(targets)),
+            system=[{"type": "text", "text": NOTE_BODY_PROMPT,
+                     "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": "\n\n".join(parts)}],
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+        )
+    except Exception as e:
+        print(f"[write_note_bodies] {len(targets)} notes failed: {e!r}")
+        return {}
+
+    truncated = getattr(message, "stop_reason", None) == "max_tokens"
+    parsed, info = llm_json.parse(response_text(message))
+    if not isinstance(parsed, dict):
+        print("[write_note_bodies] unusable reply")
+        return {}
+    bodies = parsed.get("bodies")
+    if not isinstance(bodies, dict):
+        return {}
+    out = {str(k): str(v) for k, v in bodies.items() if v and str(v).strip()}
+    if truncated:
+        # A truncated batch costs its LAST note, not all of them. Drop the tail
+        # so a half-written body never reaches the vault; the caller retries it.
+        if len(out) > 1:
+            last = list(out)[-1]
+            print(f"[write_note_bodies] truncated — dropping partial {last!r}")
+            out.pop(last, None)
+        else:
+            print("[write_note_bodies] truncated on a single note — dropping")
+            return {}
+    return out
 
 
 # ── The deliberation tier (generalized from plan_organization) ────────────────
@@ -1126,6 +1257,24 @@ def ask_akira(text: str) -> str:
         "date. Never guess the year."
     )
 
+    # ASSISTANT PREFILL — the structural guarantee that the reply is JSON.
+    #
+    # This fixes a live bug where three consecutive turns came back as plain
+    # PROSE with no JSON wrapper at all, every one of them while a background
+    # task was active. The system prompt demanding JSON was never the problem;
+    # in-context format imitation was. Every assistant turn in
+    # conversation_history is normally raw JSON, which silently reinforces the
+    # contract — but record_action_results() and synthesize_action_reply() were
+    # writing PROSE into the assistant role, and a background task injects those
+    # pairs repeatedly (announcements plus status polls). Once the last few
+    # assistant turns in the window are prose, the nearest-example pattern beats
+    # the system prompt and the model answers conversationally.
+    #
+    # Seeding the assistant turn with "{" makes prose physically unavailable:
+    # the model can only continue a JSON object. The history hygiene below is the
+    # other half of the fix; this is the half that cannot be undone by drift.
+    prefilled = messages_snapshot + [{"role": "assistant", "content": "{"}]
+
     message = client.messages.create(
         model=MODEL,
         # 1600, not 600: the routing envelope is small, but a legitimate
@@ -1136,11 +1285,12 @@ def ask_akira(text: str) -> str:
         max_tokens=1600,
         # base prompt + FOCUS MODE block (only while focus mode is on) + date
         system=system_blocks(date_block),
-        messages=messages_snapshot,
+        messages=prefilled,
         extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
     )
     # by type, not position: a ThinkingBlock can precede the text block
-    reply = response_text(message)
+    # The prefilled "{" is NOT echoed back by the API, so put it back.
+    reply = "{" + response_text(message)
     # stop_reason == max_tokens is the ONLY reliable signal that the envelope
     # was cut off. Logging it makes the difference between "the model wrote bad
     # JSON" and "the model ran out of room" visible in the live log.
@@ -1151,6 +1301,23 @@ def ask_akira(text: str) -> str:
         conversation_history.append({"role": "assistant", "content": reply})
 
     return reply
+
+
+# HISTORY HYGIENE — every assistant turn in conversation_history must be a valid
+# envelope, because the model imitates the format of the nearest assistant turns.
+# These two placeholders used to be bare prose ("(noted)", and the spoken
+# synthesis text), which is what taught the model to reply in prose during
+# background-task turns. Keeping them JSON-shaped removes that pressure at the
+# source; the "{" prefill in ask_akira is the belt to this braces.
+_ACK_STUB = {"role": "assistant",
+             "content": '{"mode": "conversation", "response": "(noted)", '
+                        '"end_session": false}'}
+
+
+def _as_envelope(spoken: str) -> str:
+    """Wrap spoken prose in a conversation-mode envelope for history storage."""
+    return json.dumps({"mode": "conversation", "response": spoken,
+                       "end_session": False}, ensure_ascii=False)
 
 
 def record_action_results(results: list) -> None:
@@ -1181,7 +1348,7 @@ def record_action_results(results: list) -> None:
     print(f"[record_action_results] {note[:120]!r}")
     with _history_lock:
         conversation_history.append({"role": "user", "content": note})
-        conversation_history.append({"role": "assistant", "content": "(noted)"})
+        conversation_history.append(_ACK_STUB.copy())
 
 
 def synthesize_action_reply() -> str | None:
@@ -1194,9 +1361,9 @@ def synthesize_action_reply() -> str | None:
     the caller keeps the routing call's original spoken response."""
     with _history_lock:
         messages = list(conversation_history)
-    # drop the trailing "(noted)" stub — ending on an assistant message
+    # drop the trailing ack stub — ending on an assistant message
     # would make the API treat it as a prefill to continue from
-    if messages and messages[-1] == {"role": "assistant", "content": "(noted)"}:
+    if messages and messages[-1] == _ACK_STUB:
         messages = messages[:-1]
     if not messages:
         return None
@@ -1217,11 +1384,14 @@ def synthesize_action_reply() -> str | None:
         text = response_text(message).strip()
         if not text:
             return None
-        # keep history honest: what Akira actually SAID replaces the stub ack
+        # keep history honest: what Akira actually SAID replaces the stub ack —
+        # but stored AS AN ENVELOPE, not as raw prose. Storing the bare text here
+        # is what put prose in the assistant role and flipped the model out of
+        # JSON mode on following turns.
         with _history_lock:
-            if conversation_history and conversation_history[-1] == {
-                    "role": "assistant", "content": "(noted)"}:
-                conversation_history[-1] = {"role": "assistant", "content": text}
+            if conversation_history and conversation_history[-1] == _ACK_STUB:
+                conversation_history[-1] = {"role": "assistant",
+                                            "content": _as_envelope(text)}
         print(f"[synthesize_action_reply] {text[:100]!r}")
         return text
     except Exception as e:
