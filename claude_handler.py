@@ -1216,6 +1216,123 @@ def deliberate(request: str, context: str = "", *,
     return out
 
 
+# ── ROUTING ENVELOPE SCHEMA (structured outputs) ──────────────────────────────
+#
+# WHY THIS EXISTS, AND WHY IT IS NOT A PREFILL (live bug, 2026-08):
+# The previous attempt at "guarantee valid JSON" seeded the assistant turn with
+# "{" (message prefilling). claude-sonnet-5 REJECTS that outright —
+#   400 invalid_request_error: "This model does not support assistant message
+#   prefill. The conversation must end with a user message."
+# — so every single routing call failed and the whole app was down. Prefill is
+# also documented as incompatible with JSON outputs, so it was never the road.
+#
+# The supported mechanism is structured outputs: output_config.format with
+# type "json_schema". Per the Anthropic docs, claude-sonnet-5 is in the
+# supported-models list for structured outputs, and beta headers are no longer
+# required (the older beta shape was output_format +
+# "structured-outputs-2025-11-13"). Output is constrained by a compiled grammar,
+# so prose is physically unavailable — the same guarantee the prefill was after,
+# via the API feature that actually exists on this model.
+#
+# SCHEMA SHAPE RULES, all driven by real limits in the docs:
+#  - Only "mode" is required. Every other field is OPTIONAL so an absent field
+#    stays ABSENT rather than arriving as null: sensei.handle_response keys off
+#    `.get("action")` truthiness and `.get("actions", [])` defaults, and a null
+#    "actions" would defeat that default. Optional also preserves the prompt's
+#    own freedom to omit pending_actions entirely.
+#  - Required properties are emitted FIRST, then optionals in schema order. So
+#    "mode" leads and the routing decision (action/actions) is generated BEFORE
+#    the spoken "response" — the model commits to what it is doing before it
+#    narrates it. Making "response" required would have hoisted narration above
+#    the decision.
+#  - additionalProperties MUST be False on every object (hard requirement).
+#  - Well inside the documented complexity limits: 14 optional params (limit 24)
+#    and 4 union-typed params (limit 16).
+_STEP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string"},
+        # null is part of the contract the prompt teaches ("parameter": null)
+        "parameter": {"type": ["string", "null"]},
+        "id": {"type": "string"},
+        "depends_on": {"type": "string"},
+    },
+    "required": ["action"],
+    "additionalProperties": False,
+}
+
+ROUTING_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "mode": {"type": "string", "enum": ["command", "conversation"]},
+        # single-action form
+        "action": {"type": "string"},
+        "parameter": {"type": ["string", "null"]},
+        # multi-action form
+        "actions": {"type": "array", "items": _STEP_SCHEMA},
+        "pending_actions": {"type": "array", "items": _STEP_SCHEMA},
+        "confirmation_required": {"type": "boolean"},
+        "confirmation_message": {"type": ["string", "null"]},
+        "response": {"type": "string"},
+        "end_session": {"type": "boolean"},
+    },
+    "required": ["mode"],
+    "additionalProperties": False,
+}
+
+_ROUTING_OUTPUT_CONFIG = {
+    "format": {"type": "json_schema", "schema": ROUTING_SCHEMA}
+}
+
+# Flipped to False the first time the API rejects the schema, so a bad schema or
+# an endpoint without structured outputs degrades to prompt-only JSON (which
+# llm_json still repairs) instead of taking the whole app down the way the
+# prefill did. This is the lesson from that outage encoded as a fallback.
+_structured_output_ok = True
+
+
+def _routing_call(messages: list[dict], date_block: str):
+    """The routing model call, schema-constrained where the API allows it.
+
+    output_config goes through extra_body rather than a named kwarg on purpose:
+    requirements.txt pins no anthropic version, and extra_body is forwarded as
+    raw request JSON by every SDK version, so an older installed SDK cannot turn
+    this into a TypeError.
+    """
+    global _structured_output_ok
+
+    kwargs = dict(
+        model=MODEL,
+        # 1600, not 600: the routing envelope is small, but a legitimate
+        # multi-step response with a confirmation_message ran out of budget and
+        # ended mid-string, which reached the user as an unparseable reply.
+        # Content still NEVER travels in this envelope (see CONTENT RULE) —
+        # this is headroom for routing, not a licence to inline documents.
+        max_tokens=1600,
+        # base prompt + FOCUS MODE block (only while focus mode is on) + date
+        system=system_blocks(date_block),
+        messages=messages,
+        extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+    )
+
+    if _structured_output_ok:
+        try:
+            return client.messages.create(
+                extra_body={"output_config": _ROUTING_OUTPUT_CONFIG}, **kwargs)
+        except anthropic.BadRequestError as e:
+            # Only a schema/format complaint disables the feature. Any other 400
+            # is a genuine problem with the request itself and must surface.
+            blame = str(e).lower()
+            if not any(w in blame for w in
+                       ("output_config", "output_format", "schema", "format")):
+                raise
+            _structured_output_ok = False
+            print(f"[routing_call] structured outputs rejected — falling back "
+                  f"to prompt-only JSON for the rest of this run: {e}")
+
+    return client.messages.create(**kwargs)
+
+
 def ask_akira(text: str) -> str:
     """Send user text to Akira, get back a JSON string response."""
     # inject PC context safely
@@ -1257,40 +1374,32 @@ def ask_akira(text: str) -> str:
         "date. Never guess the year."
     )
 
-    # ASSISTANT PREFILL — the structural guarantee that the reply is JSON.
+    # THE JSON GUARANTEE — three independent layers, none of them a prefill:
+    #  1. ROUTING_SCHEMA via output_config.format (see _routing_call): the
+    #     grammar makes prose physically unavailable. This is the primary
+    #     guarantee and it replaces the "{" prefill, which claude-sonnet-5
+    #     rejects with a 400 and which the docs list as incompatible with JSON
+    #     outputs anyway.
+    #  2. The system prompt's "ONE JSON OBJECT PER RESPONSE" section, which still
+    #     governs WHICH fields to fill and how short to keep them — the schema
+    #     constrains shape, not judgment.
+    #  3. llm_json.parse in the caller, the safety net for the cases the grammar
+    #     explicitly does NOT cover: stop_reason "max_tokens" truncation and
+    #     "refusal" both produce output that can miss the schema, and the
+    #     fallback path below is unconstrained.
     #
-    # This fixes a live bug where three consecutive turns came back as plain
-    # PROSE with no JSON wrapper at all, every one of them while a background
-    # task was active. The system prompt demanding JSON was never the problem;
-    # in-context format imitation was. Every assistant turn in
-    # conversation_history is normally raw JSON, which silently reinforces the
-    # contract — but record_action_results() and synthesize_action_reply() were
-    # writing PROSE into the assistant role, and a background task injects those
-    # pairs repeatedly (announcements plus status polls). Once the last few
-    # assistant turns in the window are prose, the nearest-example pattern beats
-    # the system prompt and the model answers conversationally.
-    #
-    # Seeding the assistant turn with "{" makes prose physically unavailable:
-    # the model can only continue a JSON object. The history hygiene below is the
-    # other half of the fix; this is the half that cannot be undone by drift.
-    prefilled = messages_snapshot + [{"role": "assistant", "content": "{"}]
+    # The history hygiene further down is still load-bearing. It fixed the
+    # original prose bug at its source: record_action_results() and
+    # synthesize_action_reply() used to write PROSE into the assistant role, and
+    # a background task injects those pairs repeatedly, so the nearest-example
+    # pattern started beating the system prompt. Keeping every assistant turn
+    # JSON-shaped removes that pressure, and matters doubly whenever layer 1 has
+    # degraded to the prompt-only fallback.
+    message = _routing_call(messages_snapshot, date_block)
 
-    message = client.messages.create(
-        model=MODEL,
-        # 1600, not 600: the routing envelope is small, but a legitimate
-        # multi-step response with a confirmation_message ran out of budget and
-        # ended mid-string, which reached the user as an unparseable reply.
-        # Content still NEVER travels in this envelope (see CONTENT RULE) —
-        # this is headroom for routing, not a licence to inline documents.
-        max_tokens=1600,
-        # base prompt + FOCUS MODE block (only while focus mode is on) + date
-        system=system_blocks(date_block),
-        messages=prefilled,
-        extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
-    )
-    # by type, not position: a ThinkingBlock can precede the text block
-    # The prefilled "{" is NOT echoed back by the API, so put it back.
-    reply = "{" + response_text(message)
+    # by type, not position: a ThinkingBlock can precede the text block.
+    # Grammar scope is the model's direct output only, so thinking stays free.
+    reply = response_text(message)
     # stop_reason == max_tokens is the ONLY reliable signal that the envelope
     # was cut off. Logging it makes the difference between "the model wrote bad
     # JSON" and "the model ran out of room" visible in the live log.
@@ -1308,7 +1417,7 @@ def ask_akira(text: str) -> str:
 # These two placeholders used to be bare prose ("(noted)", and the spoken
 # synthesis text), which is what taught the model to reply in prose during
 # background-task turns. Keeping them JSON-shaped removes that pressure at the
-# source; the "{" prefill in ask_akira is the belt to this braces.
+# source; ROUTING_SCHEMA in ask_akira is the belt to this braces.
 _ACK_STUB = {"role": "assistant",
              "content": '{"mode": "conversation", "response": "(noted)", '
                         '"end_session": false}'}
@@ -1361,8 +1470,8 @@ def synthesize_action_reply() -> str | None:
     the caller keeps the routing call's original spoken response."""
     with _history_lock:
         messages = list(conversation_history)
-    # drop the trailing ack stub — ending on an assistant message
-    # would make the API treat it as a prefill to continue from
+        # drop the trailing ack stub — claude-sonnet-5 rejects a request whose
+        # last message is an assistant turn ("must end with a user message")
     if messages and messages[-1] == _ACK_STUB:
         messages = messages[:-1]
     if not messages:
