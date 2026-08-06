@@ -45,6 +45,7 @@ MAX_FILES = 36            # files ever sent for summarization
 MAX_FILE_CHARS = 9000     # per-file clip
 BATCH_CHARS = 22000       # per cheap-model call
 MAX_BATCHES = 8           # hard ceiling on cheap-model calls
+NOTES_PER_BATCH = 2       # note BODIES per writing call — keeps output bounded
 MAX_TREE_ENTRIES = 4000   # tree entries considered at all
 
 # A README is "substantive" at this length AND with real structure. Length alone
@@ -274,6 +275,23 @@ def _batch(files: list[dict]) -> list[list[dict]]:
     return batches[:MAX_BATCHES]
 
 
+def _batch_notes(notes: list[dict]) -> list[list[dict]]:
+    """Group outline notes into body-writing batches.
+
+    NOTES_PER_BATCH is small on purpose: it is the knob that keeps each writing
+    call's OUTPUT bounded, which is the whole reason structuring was split. The
+    overview note is written alone — it is the longest and most important body,
+    so it gets the full per-call budget to itself.
+    """
+    overview = [n for n in notes if n.get("overview")]
+    rest = [n for n in notes if not n.get("overview")]
+    batches = [[n] for n in overview[:1]]
+    rest = overview[1:] + rest
+    for i in range(0, len(rest), NOTES_PER_BATCH):
+        batches.append(rest[i:i + NOTES_PER_BATCH])
+    return [b for b in batches if b]
+
+
 def _summarize(repo: str, files: list[dict]) -> dict:
     import claude_handler
 
@@ -380,51 +398,100 @@ def generate(repo: str) -> dict:
                         "message": f"I read {repo} but couldn't summarize any of "
                                    f"it, so I haven't written anything."}
 
-    plan = claude_handler.plan_repo_notes(repo, meta, readme, summaries)
-    # The original live failure, now recoverable: retry once on a genuinely
-    # SMALLER input, because output size tracks input size here. Whichever input
-    # is actually carrying the weight is the one that gets halved — on the
-    # README-first path there are no summaries to trim, so trimming them would
-    # resend byte-identical input and buy an identical failure.
-    if isinstance(plan, dict) and plan.get("hit_max_tokens"):
-        # Halve the summaries when there are enough of them to halve. With 0 or 1
-        # summary that is a no-op, so the README is trimmed instead — otherwise
-        # the "retry" would resend byte-identical input and buy an identical
-        # failure at full price.
-        retry_summaries = summaries
-        retry_readme = readme
+    # ── STAGE 2: decide the structure only. Small, bounded output.
+    outline = claude_handler.plan_repo_outline(repo, meta, readme, summaries)
+    if isinstance(outline, dict) and outline.get("hit_max_tokens"):
+        # The outline carries no prose bodies, so hitting the ceiling here means
+        # the INPUT was genuinely too big — trimming it is the right lever, unlike
+        # before, when the ceiling was an output problem that trimming could not
+        # touch. Whichever input is carrying the weight gets halved.
+        retry_summaries, retry_readme = summaries, readme
         if len(summaries) > 1:
             retry_summaries = dict(list(summaries.items())[:len(summaries) // 2])
         elif len(readme) > README_MIN_CHARS:
             retry_readme = readme[:max(README_MIN_CHARS, len(readme) // 2)]
-
-        shrank = (len(retry_summaries) < len(summaries)
-                  or len(retry_readme) < len(readme))
-        if not shrank:
-            # Nothing left to cut. The input is already minimal, so a retry would
-            # be identical; don't pay for it twice.
-            print("[repo_notes] input already minimal — not retrying")
-            plan = None
-        else:
-            print(f"[repo_notes] retrying with {len(retry_summaries)} summaries, "
-                  f"{len(retry_readme)} chars of readme")
-            plan = claude_handler.plan_repo_notes(
+        if (len(retry_summaries) < len(summaries)
+                or len(retry_readme) < len(readme)):
+            print(f"[repo_notes] outline retry: {len(retry_summaries)} summaries, "
+                  f"{len(retry_readme)} chars readme")
+            outline = claude_handler.plan_repo_outline(
                 repo, meta, retry_readme, retry_summaries)
-            if isinstance(plan, dict) and plan.get("hit_max_tokens"):
-                plan = None
-    if not plan or not plan.get("plan"):
+            if isinstance(outline, dict) and outline.get("hit_max_tokens"):
+                outline = None
+        else:
+            print("[repo_notes] outline input already minimal — not retrying")
+            outline = None
+    if not outline or not outline.get("notes"):
         return {"success": False,
                 "message": f"I read through {repo} but couldn't settle on a good "
                            f"note structure for it, so I haven't written anything."}
 
-    done, failures = _write_plan(plan["plan"])
+    notes = outline["notes"]
+    print(f"[repo_notes] outline: {len(notes)} notes -> "
+          f"{[n['title'] for n in notes]}")
+
+    # ── STAGE 3: write the bodies in batches. Each call's output is bounded by
+    # the batch size, so repo size can no longer blow the ceiling.
+    bodies: dict = {}
+    for batch in _batch_notes(notes):
+        got = claude_handler.write_note_bodies(
+            repo, meta, notes, batch, summaries)
+        # A dropped/truncated note is retried alone, where it gets the full
+        # per-call budget to itself instead of sharing with its batch.
+        missing = [n for n in batch if n["title"] not in got]
+        if missing and len(batch) > 1:
+            for n in missing:
+                print(f"[repo_notes] retrying {n['title']!r} alone")
+                got.update(claude_handler.write_note_bodies(
+                    repo, meta, notes, [n], summaries))
+        bodies.update(got)
+        print(f"[repo_notes] batch of {len(batch)} -> {len(got)} bodies")
+
+    if not bodies:
+        return {"success": False,
+                "message": f"I planned out notes for {repo} but couldn't write "
+                           f"their content, so I haven't saved anything."}
+
+    # ── Assemble vault ops. Linking reuses the outline's ALREADY-DECIDED
+    # relationships, so nothing re-derives them and this costs no tokens.
+    written = [n for n in notes if n["title"] in bodies]
+    steps = [{"op": "create", "note": n["title"], "content": bodies[n["title"]]}
+             for n in written]
+
+    have = {n["title"] for n in written}
+    for n in written:
+        # Never link to a note whose body failed — a wikilink to a nonexistent
+        # note is a dead end in the graph.
+        targets = [t for t in n.get("links") or [] if t in have and t != n["title"]]
+        if targets:
+            steps.append({"op": "link", "note": n["title"],
+                          "targets": ",".join(targets)})
+
+    overview = next((n["title"] for n in written if n.get("overview")),
+                    written[0]["title"])
+    if outline.get("diagram"):
+        steps.append({"op": "diagram", "note": overview,
+                      "content": outline["diagram"]})
+    if outline.get("index") and len(written) > 2:
+        steps.append({"op": "moc", "note": f"{repo} — Map",
+                      "targets": ",".join(n["title"] for n in written)})
+
+    done, failures = _write_plan(steps)
     if not done:
         return {"success": False,
                 "message": failures[0] if failures
                 else f"Nothing was written to your vault for {repo}."}
 
-    message = plan["summary"] or (
-        f"Wrote {len(done)} notes on {repo}: {', '.join(done[:4])}.")
+    # _write_plan reports a title for EVERY successful op, so link and moc steps
+    # are in `done` too — counting it directly claimed "7 notes" for 3 notes plus
+    # their links. Count the actual creates instead.
+    ok = set(done)
+    created = [n["title"] for n in written if n["title"] in ok]
+    message = outline.get("summary") or (
+        f"Wrote {len(created)} notes on {repo}: {', '.join(created[:4])}.")
+    skipped = len(notes) - len(created)
+    if skipped > 0:
+        message += f" {skipped} of the planned notes didn't come through."
     if failures:
         message += f" {len(failures)} of the writes didn't go through."
     return {"success": True, "speak": True, "message": message}
