@@ -28,6 +28,86 @@ MODEL = "claude-sonnet-5"
 # repeated at four call sites.
 HAIKU_MODEL = "claude-haiku-4-5"
 
+# ── MODEL TIERS ───────────────────────────────────────────────────────────────
+#
+# Which model does a given LLM job, by the shape of thinking it needs:
+#
+#   BRAIN         claude-sonnet-5  judgement about the USER — what they meant,
+#                                  what to do, how to organise their vault.
+#   SERVANT_GEN   glm-5.2          longer-form drafting from evidence already
+#                                  gathered by something else.
+#   SERVANT_MECH  qwen2.5-max      mechanical reduction — summarise, yes/no,
+#                                  which index.
+#
+# KEYED BY CALL SITE, NOT BY ACTION NAME, and that is forced rather than
+# preferred. Three of the ten LLM jobs (_routing_call, ask_confirmation,
+# synthesize_action_reply) are not actions at all — routing happens BEFORE any
+# action exists, and confirmation is part of the pending-action gate. More
+# decisively, ONE action spans two tiers: "github_control|repo notes" runs
+# summarize_code_batch (MECH) and then plan_repo_outline + write_note_bodies
+# (GEN) in a single dispatch, so an action->tier mapping cannot represent it at
+# all without splitting one dict value into three.
+#
+# Only LLM-invoking sites appear here. Tagging adjust_volume or list_tabs with
+# a tier would be metadata nothing reads. Absent from this dict therefore means
+# "makes no model call", NOT "defaults to BRAIN" — resolve_tier() raises on an
+# unknown name so a newly added LLM call site fails loudly at its first call
+# instead of silently inheriting a tier nobody chose.
+BRAIN = "BRAIN"
+
+MODEL_TIER = {
+    # Judgement about the user's intent and their vault.
+    "_routing_call": BRAIN,
+    "deliberate": BRAIN,
+    "plan_organization": BRAIN,
+    # Drafting prose from summaries another pass already produced.
+    "plan_repo_outline": "SERVANT_GEN",
+    "write_note_bodies": "SERVANT_GEN",
+    # Mechanical reductions.
+    "summarize_code_batch": "SERVANT_MECH",
+    "synthesize_action_reply": "SERVANT_MECH",
+    "ask_confirmation": "SERVANT_MECH",
+    "summarize_text": "SERVANT_MECH",
+    "match_element": "SERVANT_MECH",
+}
+
+
+def resolve_tier(call_site: str):
+    """Tier for an LLM call site. Raises KeyError if the site is untiered.
+
+    Loud by design: an LLM call site missing from MODEL_TIER is drift, and a
+    silent default would hide it while spending real money on whichever tier
+    the default happened to be.
+    """
+    try:
+        tier_name = MODEL_TIER[call_site]
+    except KeyError:
+        raise KeyError(
+            f"LLM call site {call_site!r} has no MODEL_TIER entry. Add it to "
+            f"MODEL_TIER in claude_handler.py — call sites are not allowed to "
+            f"default to a tier.") from None
+    if tier_name == BRAIN:
+        return None  # brain tier is the local anthropic client, not a Tier obj
+    import servant_clients
+    return getattr(servant_clients, tier_name)
+
+
+def servant_or_none(call_site: str):
+    """The servant Tier for a call site, or None to use the brain-tier model.
+
+    Returns None both for genuinely BRAIN-tier sites and for a servant tier
+    whose API key is absent — that is the fallback path from step 4, and it is
+    logged so a silently-unset key cannot masquerade as a routing decision.
+    """
+    tier = resolve_tier(call_site)
+    if tier is None:
+        return None
+    if not tier.available:
+        print(f"[tier:{call_site}] {tier.name} unavailable "
+              f"({tier.key_env} not set) — falling back to brain tier")
+        return None
+    return tier
+
 
 def response_text(message) -> str:
     """Pull the assistant's text out of a Messages response BY BLOCK TYPE.
@@ -834,24 +914,43 @@ def summarize_code_batch(repo: str, files: list[dict]) -> dict:
         blocks.append(f"=== FILE: {f['path']} ===\n{f['text']}")
     user_block = f"REPOSITORY: {repo}\n\n" + "\n\n".join(blocks)
 
-    try:
-        message = client.with_options(
-            timeout=BATCH_SUMMARY_TIMEOUT,
-            max_retries=REASONING_MAX_RETRIES,
-        ).messages.create(
-            model=HAIKU_MODEL,
-            # ~120 tokens per file of summary, plus JSON overhead.
-            max_tokens=min(4000, 400 + 200 * len(files)),
-            system=[{"type": "text", "text": CODE_SUMMARY_PROMPT,
-                     "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": user_block}],
-            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
-        )
-    except Exception as e:
-        print(f"[summarize_code_batch] {len(files)} files failed: {e!r}")
-        return {}
+    # ~120 tokens per file of summary, plus JSON overhead.
+    max_tokens = min(4000, 400 + 200 * len(files))
+    servant = servant_or_none("summarize_code_batch")
 
-    parsed, info = llm_json.parse(response_text(message))
+    if servant is not None:
+        import servant_clients
+        try:
+            parsed, info = servant_clients.call_json(
+                servant, system=CODE_SUMMARY_PROMPT, user=user_block,
+                max_tokens=max_tokens, timeout=BATCH_SUMMARY_TIMEOUT,
+                label="summarize_code_batch")
+        except servant_clients.ServantJSONError as e:
+            print(f"[summarize_code_batch] SERVANT-TIER BUG: {e}")
+            return {}
+        except servant_clients.ServantUnavailable as e:
+            print(f"[summarize_code_batch] {e} — retrying on cheap brain tier")
+            servant = None
+
+    if servant is None:
+        try:
+            message = client.with_options(
+                timeout=BATCH_SUMMARY_TIMEOUT,
+                max_retries=REASONING_MAX_RETRIES,
+            ).messages.create(
+                model=HAIKU_MODEL,
+                max_tokens=max_tokens,
+                system=[{"type": "text", "text": CODE_SUMMARY_PROMPT,
+                         "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": user_block}],
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+            )
+        except Exception as e:
+            print(f"[summarize_code_batch] {len(files)} files failed: {e!r}")
+            return {}
+
+        parsed, info = llm_json.parse(response_text(message))
+
     if not isinstance(parsed, dict):
         print("[summarize_code_batch] unusable reply")
         return {}
@@ -939,29 +1038,54 @@ def plan_repo_outline(repo: str, meta: str, readme: str,
                      "your only evidence, so keep the notes at the level it "
                      "actually supports and say what was not examined.")
 
-    try:
-        message = client.with_options(
-            timeout=REPO_OUTLINE_TIMEOUT,
-            max_retries=REASONING_MAX_RETRIES,
-        ).messages.create(
-            model=MODEL,
-            # Titles and one-liners only. 2500 is already generous, which is the
-            # entire point of separating this from the body writing.
-            max_tokens=2500,
-            system=[{"type": "text", "text": REPO_OUTLINE_PROMPT,
-                     "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": "\n\n".join(parts)}],
-            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
-        )
-    except Exception as e:
-        print(f"[plan_repo_outline] model call failed: {e!r}")
-        return None
+    # Titles and one-liners only. 2500 is already generous, which is the
+    # entire point of separating this from the body writing.
+    user_block = "\n\n".join(parts)
+    servant = servant_or_none("plan_repo_outline")
 
-    if getattr(message, "stop_reason", None) == "max_tokens":
-        print("[plan_repo_outline] WARNING: outline hit max_tokens")
-        return {"hit_max_tokens": True}
+    if servant is not None:
+        import servant_clients
+        try:
+            parsed, info = servant_clients.call_json(
+                servant, system=REPO_OUTLINE_PROMPT, user=user_block,
+                max_tokens=2500, timeout=REPO_OUTLINE_TIMEOUT,
+                label="plan_repo_outline")
+        except servant_clients.ServantJSONError as e:
+            # Our prompt/schema is wrong for this provider. Surface it — do NOT
+            # quietly re-run on Sonnet, which would hide the bug forever.
+            print(f"[plan_repo_outline] SERVANT-TIER BUG: {e}")
+            return None
+        except servant_clients.ServantUnavailable as e:
+            print(f"[plan_repo_outline] {e} — retrying on brain tier")
+            servant = None
+        else:
+            if info.get("truncated"):
+                print("[plan_repo_outline] WARNING: outline hit max_tokens")
+                return {"hit_max_tokens": True}
 
-    parsed, info = llm_json.parse(response_text(message))
+    if servant is None:
+        try:
+            message = client.with_options(
+                timeout=REPO_OUTLINE_TIMEOUT,
+                max_retries=REASONING_MAX_RETRIES,
+            ).messages.create(
+                model=MODEL,
+                max_tokens=2500,
+                system=[{"type": "text", "text": REPO_OUTLINE_PROMPT,
+                         "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": user_block}],
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+            )
+        except Exception as e:
+            print(f"[plan_repo_outline] model call failed: {e!r}")
+            return None
+
+        if getattr(message, "stop_reason", None) == "max_tokens":
+            print("[plan_repo_outline] WARNING: outline hit max_tokens")
+            return {"hit_max_tokens": True}
+
+        parsed, info = llm_json.parse(response_text(message))
+
     if not isinstance(parsed, dict) or info.get("truncated"):
         print("[plan_repo_outline] unusable outline")
         return None
@@ -1044,26 +1168,49 @@ def write_note_bodies(repo: str, meta: str, outline: list,
     parts.append("THE FULL NOTE SET (for context — do not write these):\n" + shape)
     parts.append(f"WRITE EXACTLY THESE {len(targets)} NOTES:\n" + asked)
 
-    try:
-        message = client.with_options(
-            timeout=NOTE_BODY_TIMEOUT,
-            max_retries=REASONING_MAX_RETRIES,
-        ).messages.create(
-            model=MODEL,
-            # ~1500 tokens of body per note. Bounded by BATCH SIZE, never by the
-            # repo — this is what stops the max_tokens failure from returning.
-            max_tokens=min(8000, 800 + 1500 * len(targets)),
-            system=[{"type": "text", "text": NOTE_BODY_PROMPT,
-                     "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": "\n\n".join(parts)}],
-            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
-        )
-    except Exception as e:
-        print(f"[write_note_bodies] {len(targets)} notes failed: {e!r}")
-        return {}
+    # ~1500 tokens of body per note. Bounded by BATCH SIZE, never by the
+    # repo — this is what stops the max_tokens failure from returning.
+    max_tokens = min(8000, 800 + 1500 * len(targets))
+    user_block = "\n\n".join(parts)
+    servant = servant_or_none("write_note_bodies")
+    truncated = False
 
-    truncated = getattr(message, "stop_reason", None) == "max_tokens"
-    parsed, info = llm_json.parse(response_text(message))
+    if servant is not None:
+        import servant_clients
+        try:
+            parsed, info = servant_clients.call_json(
+                servant, system=NOTE_BODY_PROMPT, user=user_block,
+                max_tokens=max_tokens, timeout=NOTE_BODY_TIMEOUT,
+                label="write_note_bodies")
+        except servant_clients.ServantJSONError as e:
+            print(f"[write_note_bodies] SERVANT-TIER BUG: {e}")
+            return {}
+        except servant_clients.ServantUnavailable as e:
+            print(f"[write_note_bodies] {e} — retrying on brain tier")
+            servant = None
+        else:
+            truncated = bool(info.get("truncated"))
+
+    if servant is None:
+        try:
+            message = client.with_options(
+                timeout=NOTE_BODY_TIMEOUT,
+                max_retries=REASONING_MAX_RETRIES,
+            ).messages.create(
+                model=MODEL,
+                max_tokens=max_tokens,
+                system=[{"type": "text", "text": NOTE_BODY_PROMPT,
+                         "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": user_block}],
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+            )
+        except Exception as e:
+            print(f"[write_note_bodies] {len(targets)} notes failed: {e!r}")
+            return {}
+
+        truncated = getattr(message, "stop_reason", None) == "max_tokens"
+        parsed, info = llm_json.parse(response_text(message))
+
     if not isinstance(parsed, dict):
         print("[write_note_bodies] unusable reply")
         return {}
@@ -1597,13 +1744,36 @@ def ask_confirmation(text: str, pending_description: str | None = None) -> bool:
         return True
     context = (f"The user was asked to confirm this action: {pending_description}. "
                if pending_description else "The user was asked to confirm an action. ")
+    system = context + ("If their reply agrees, or restates or repeats the same "
+                        "action approvingly, reply YES. Otherwise reply NO. "
+                        "Reply only YES or NO. Nothing else.")
+
+    # SERVANT_MECH: a two-token yes/no verdict is the most mechanical call in
+    # the codebase. The default-NO-on-error stance below is unchanged and still
+    # load-bearing — this gate guards destructive pending actions, so any
+    # failure to get a clear YES must read as "do not proceed".
+    servant = servant_or_none("ask_confirmation")
+    if servant is not None:
+        import servant_clients
+        try:
+            reply = servant_clients.call_openai_compatible(
+                servant, system=system, user=text, max_tokens=10,
+                label="ask_confirmation")
+            verdict = reply.strip().upper().startswith("YES")
+            print(f"[ask_confirmation] {servant.name} says "
+                  f"{'YES' if verdict else 'NO'} for {text!r}")
+            return verdict
+        except servant_clients.ServantUnavailable as e:
+            print(f"[ask_confirmation] {e} — retrying on cheap brain tier")
+        except Exception as e:
+            print(f"[ask_confirmation] servant error, defaulting NO: {e!r}")
+            return False
+
     try:
         message = client.messages.create(
             model=HAIKU_MODEL,
             max_tokens=10,
-            system=context + "If their reply agrees, or restates or repeats the same "
-                             "action approvingly, reply YES. Otherwise reply NO. "
-                             "Reply only YES or NO. Nothing else.",
+            system=system,
             messages=[{"role": "user", "content": text}],
         )
         verdict = response_text(message).strip().upper().startswith("YES")
@@ -1614,17 +1784,33 @@ def ask_confirmation(text: str, pending_description: str | None = None) -> bool:
         return False
 
 
+_SUMMARIZE_TEXT_PROMPT = (
+    "Summarize the following file content in 4-5 short spoken sentences. "
+    "Plain conversational language — it will be read aloud by a voice "
+    "assistant. No markdown, no bullet points, no headers. Lead with what "
+    "the file IS, then the key points.")
+
+
 def summarize_text(text: str, filename: str = "") -> str:
     """4-5 line spoken summary of file content, for executor.summarize_file.
-    Uses haiku — fast and cheap, summary quality is plenty."""
+    SERVANT_MECH — a mechanical reduction, so the cheapest tier that can read
+    is the right one. Falls back to Haiku when the servant key is unset."""
+    user = f"File: {filename}\n\n{text}"
+    servant = servant_or_none("summarize_text")
+    if servant is not None:
+        import servant_clients
+        try:
+            return servant_clients.call_openai_compatible(
+                servant, system=_SUMMARIZE_TEXT_PROMPT, user=user,
+                max_tokens=300, label="summarize_text").strip()
+        except servant_clients.ServantUnavailable as e:
+            print(f"[summarize_text] {e} — retrying on cheap brain tier")
+
     message = client.messages.create(
         model=HAIKU_MODEL,
         max_tokens=300,
-        system="Summarize the following file content in 4-5 short spoken sentences. "
-               "Plain conversational language — it will be read aloud by a voice "
-               "assistant. No markdown, no bullet points, no headers. Lead with what "
-               "the file IS, then the key points.",
-        messages=[{"role": "user", "content": f"File: {filename}\n\n{text}"}],
+        system=_SUMMARIZE_TEXT_PROMPT,
+        messages=[{"role": "user", "content": user}],
     )
     return response_text(message).strip()
 
