@@ -5,6 +5,7 @@ Handles all LLM calls, TTS, and vision matching.
 
 import os
 import re
+import copy
 import json
 import threading
 import datetime as dt
@@ -223,7 +224,7 @@ If the user's request requires more than one action — e.g. "search one piece a
 }
 
 Rules:
-- close_application, shutdown, restart, hibernate, delete_files, move_files, edit_file, uninstall_application, write_comment, calendar_control|delete — these ALWAYS go in pending_actions
+- close_application, shutdown, restart, hibernate, delete_files, move_files, edit_file, write_file, calendar_control|delete — these ALWAYS go in pending_actions
 - "actions" = things that run immediately, no confirmation needed.
 - "pending_actions" = things that require confirmation (any action marked [C]). These do NOT run until the user confirms.
 - If nothing needs confirmation, omit "pending_actions" entirely (or leave it empty) and set confirmation_required: false.
@@ -339,8 +340,6 @@ ACTION PARAMETER FORMATS (fields split with |; relative names resolve against th
 For all [C] file actions the executor builds the spoken enumeration itself — send the action directly, do NOT set confirmation_required for them, the pause happens automatically with the exact file list.
 NEVER chain {{stepX.result}} into a file action parameter — results are spoken sentences, not file paths. If you need a folder listing first, send list_folder ALONE, then use the exact names from its ACTION RESULT in your next turn.
 
-DOWNLOADS & INSTALL: download_file, download_application, install_application[C], uninstall_application[C]
-
 IMAGES & WALLPAPER: search_image, download_image, set_wallpaper
 ROUTING — CRITICAL: ANY request to search, find, get, download, or use an image from the web ("search mountain landscape images", "find me a sunset photo", "download a picture of X", "click the image of X", "set a photo of X as my wallpaper") goes DIRECTLY to search_image. NEVER route image requests through web_search + click on Google Images — click-scraping image results is unreliable and is not the image pipeline. click is only for images when the user is already browsing a specific page and refers to an image ON that page.
 HARD RULES FOR IMAGE DOWNLOADS — these are enforced in code (violating steps are dropped before execution), so follow them exactly:
@@ -351,7 +350,7 @@ HARD RULES FOR IMAGE DOWNLOADS — these are enforced in code (violating steps a
 - download_image: "url or pick|optional save path" — a direct URL downloads immediately. Otherwise the parameter is the user's pick from the last search_image results ("first", "the third one", "3", or a descriptive fragment), resolved against the stored candidate list. NEVER pass a search query here — search_image first, user picks, then ONE download.
 - set_wallpaper: "local image path" — local files ONLY. For a web image, the flow is search_image -> user picks -> then ONE response with BOTH steps chained: {"id": "dl", "action": "download_image", "parameter": "third"} then {"action": "set_wallpaper", "parameter": "{{dl.result}}", "depends_on": "dl"}. download_image's result IS the saved path, so {{dl.result}} is safe here — this is the ONE allowed path-chaining exception to the file-action rule above.
 
-BROWSER & SEARCH: web_search, open_url, site_search, browser_control, summarize_document, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control, meet_control, amazon_control, flipkart_control, github_control
+BROWSER & SEARCH: web_search, open_url, site_search, browser_control, new_tab, open_site_tab, switch_tab, close_tab, list_tabs, click, fill, scroll, youtube_control, netflix_control, meet_control, amazon_control, flipkart_control, github_control
 ACTION PARAMETER FORMATS:
 - web_search: general web searches. Parameter is the query, optionally with "|browser:name" suffix. Never use a website name as a browser.
 - browser_control: browser HISTORY navigation. Parameter: "back", "forward", or "reload". Use this for "go back", "go back a page", "previous page", "go forward", "refresh", "reload the page". NEVER use click for these — the back/forward/reload buttons live in browser chrome, not in the page, so click can never find them. Exception: "next page" on search results means a pagination LINK in the page, so that is click, not browser_control.
@@ -393,8 +392,6 @@ VS CODE: vscode_control
 - vscode_control: ONLY when the user explicitly says VS Code ("open it in VS Code", "open my project in VS Code"). Format: "action" or "action|parameter". "open folder|C:\\projects\\sensei", "open file|main.py", plus the same file actions ("create file", "read file", "write file", "edit file", "search file") when the user wants the result inside VS Code — the same confirmation rules apply. For any file request that does NOT mention VS Code, use the FILES & FOLDERS actions instead.
   OUT OF SCOPE: running code, managing extensions, or typing keystrokes into the editor — say those aren't available yet if asked.
 
-GOOGLE WORKSPACE: send_email[C], read_emails, create_document, read_document, create_event, read_schedule
-
 GOOGLE WORKSPACE (connected Google account):
 CALENDAR: calendar_control|action|params. Actions: list|days ("what's on my calendar" -> list|7), create|Title|YYYY-MM-DD HH:MM|YYYY-MM-DD HH:MM|optional desc (resolve relative dates like "tomorrow 3pm" to real datetimes yourself using the current date), get|eventId, update|eventId|title=X|start=YYYY-MM-DD HH:MM, delete|eventId [C], free|start|end|minutes (find open slots).
 DOCS: docs_control|action. create|Title|content (ONLY for exact content the user dictated), generate|Title|content brief|short or detailed (a separate AI writer composes the content, then the doc is created), read|name or id, append|name or id|text to add. Read/append accept the document NAME — it resolves via Drive search.
@@ -420,7 +417,8 @@ OBSIDIAN (the user's permanent notes vault — this is the knowledge store, Goog
     focus mode OFF -> single-target capture: filing something into one note, a progress entry, one new note. If the content actually needs breaking across several linked notes or an index, it will TELL you so and offer to turn focus mode on. Let it make that call.
     focus mode ON  -> the full thing: multiple notes, wikilinks, maps of content, diagrams.
   So ALWAYS route organize requests to obsidian_control|organize. Do NOT refuse it because focus mode is off, do NOT ask the user to turn focus mode on before trying, and above all do NOT fall back to read_file, summarize_file, moc, or create when the user asked you to organize something — reading content aloud is not organizing it, and substituting one for the other is the worst thing you can do here.
-CAPABILITIES THAT NEED FOCUS MODE: if the user asks for something that genuinely only works in focus mode, SAY THAT and offer to turn it on ("want me to turn focus mode on for that?"). Never quietly pick a different action instead, and never pretend the capability doesn't exist.
+CAPABILITIES THAT NEED FOCUS MODE: if the user asks for something that genuinely only works in focus mode, SAY THAT and offer to turn it on ("want me to turn focus mode on for that?"), then turn it on with obsidian_control|focus|on when they agree. Never quietly pick a different action instead, and never pretend the capability doesn't exist.
+FOCUS MODE IS NOT ITS OWN ACTION. "focus mode", "focus mode on", "let's focus", "deep work", "exit focus mode" are ALL obsidian_control with parameter focus|on or focus|off. There is no focus_mode action and there never was — emitting one is rejected outright.
 NOTE NAMES: pass what the user SAID ("project alpha"). Every action resolves a spoken name against the vault by search, so you never need the exact filename or the .md extension. If a session started with a note open, the [SESSION START] line names it — treat that as the default target for a bare "add this to my notes" rather than asking which note.
 NOTE CONTENT RULE: the CONTENT RULE above applies here too. Progress summaries and bullet lists are fine inline because they are short. Anything essay-length does NOT belong in an Obsidian parameter.
 IF OBSIDIAN IS UNREACHABLE: the action says so plainly (Obsidian closed, plugin disabled, or missing API key). Relay that once and stop — do NOT fall back to writing the user's notes into a Google Doc or a local file, and do NOT retry in a loop. Their vault is the only correct destination.
@@ -453,15 +451,7 @@ Devices: transfer|laptop or transfer|device name — play always starts on THIS 
 Examples: "play blinding lights" -> play|blinding lights. "go to 1 minute 30" -> seek|1:30. "show me the lyrics" -> show_lyrics. "open my library" -> show_library. "play my gym playlist" -> open_playlist|gym. "show my gym playlist" -> show_playlist|gym.
 NEVER ask whether to use the app or web player — the executor resolves that automatically.
 
-COMMUNICATION: send_whatsapp[C]
-
-MEMORY: save_preference, recall_memory, save_note, recall_note, update_preference
-
-PRODUCTIVITY: add_todo, complete_todo, read_todos, set_reminder, focus_mode, daily_briefing, monitor_task
-
-PERSONAL GROWTH: performance_review, mood_checkin, decision_help
-
-CONVERSATION: converse
+NOT CAPABILITIES — do not offer these, and never invent an action for them: sending WhatsApp or SMS, sending or replying to email (you DRAFT only, via gmail_compose), reminders, alarms, timers, a todo list, stored preferences or long-term memory beyond this conversation, mood check-ins, and performance reviews. Ordinary conversation is mode "conversation", not an action. Notes live in Obsidian via obsidian_control, and focus mode is obsidian_control|focus|on or off — there is no separate memory, note, or focus_mode action. If the user asks for something in this list, say plainly that you cannot do it yet and offer the nearest real capability if there is one.
 
 COMMAND INTERPRETATION RULES:
 - "search X in a new tab" / "open a new tab and search X" — use action "new_tab" with the query as parameter. Do NOT split into two commands.
@@ -477,7 +467,7 @@ COMMAND INTERPRETATION RULES:
 - "close this tab" / "close [site] tab" — use close_tab with the site or tab name as parameter.
 - "what tabs do I have open" / "list my tabs" — use list_tabs.
 - "switch to my [X] tab" — use switch_tab with X as parameter.
-- Never hallucinate an action not in the available list. Use conversation mode if you cannot map the request.
+- Never invent an action name. The action field is constrained to the real dispatch table, so a name that is not on it cannot be emitted at all — the turn fails rather than doing something almost-right. If nothing on the list fits, use deliberate; if the request is not a command at all, use conversation mode.
 
 PERSONALITY RULES:
 - If the user is procrastinating or making excuses — call it out, directly but not harshly.
@@ -1280,9 +1270,81 @@ ROUTING_SCHEMA = {
     "additionalProperties": False,
 }
 
-_ROUTING_OUTPUT_CONFIG = {
-    "format": {"type": "json_schema", "schema": ROUTING_SCHEMA}
-}
+# ── ACTION-NAME ENUM (built from the real dispatch table) ─────────────────────
+#
+# WHY THIS EXISTS (live bug, 2026-08): "focus mode on" routed to
+# {"action": "focus_mode", "parameter": "on"}. No such action exists — the real
+# one is obsidian_control|focus|on. The executor rejected it as "Unknown action"
+# so nothing crashed, but "action" was an unconstrained string, so the model was
+# free to invent any plausible-looking name at all. That is precisely the
+# failure the prompt's own escalation section spends a paragraph warning against
+# ("a wrong-but-plausible action SUCCEEDS, and then you narrate that success"),
+# and prose cannot enforce it. The grammar can.
+#
+# The names are READ FROM executor._ACTION_MAP (which already folds in
+# system_control.ACTIONS via **), never hand-typed — so adding or removing an
+# action updates this schema with no edit here, the same anti-drift reason
+# TIER1_ACTIONS/TIER2_ACTIONS are exported rather than mirrored.
+#
+# The import is LAZY and inside the function on purpose: executor pulls in
+# winreg, pywin32, selenium and pycaw at module scope, and executor.py records
+# the one-way edge deliberately ("claude_handler never imports executor"). A
+# module-level import here would invert that edge and make claude_handler
+# unimportable headlessly.
+_action_enum_cache: list[str] | None = None
+
+
+def _action_enum() -> list[str] | None:
+    """Every action name the executor can dispatch, plus "deliberate".
+
+    Returns None if the table cannot be read, which leaves "action" an
+    unconstrained string — the same degrade-rather-than-die stance as
+    _structured_output_ok below, for the same reason: a schema problem must
+    never be able to take routing down.
+    """
+    global _action_enum_cache
+    if _action_enum_cache is None:
+        try:
+            from executor import _ACTION_MAP
+        except Exception as e:
+            print(f"[action_enum] dispatch table unreadable, leaving action "
+                  f"unconstrained: {e!r}")
+            return None
+        # "deliberate" is dispatched by sensei (_expand_deliberation), not by
+        # the executor map, so it has to be added explicitly — otherwise the
+        # escape hatch the prompt tells the model to use becomes unemittable
+        # and every ambiguous request is forced back into guessing.
+        _action_enum_cache = sorted({*_ACTION_MAP, "deliberate"})
+        print(f"[action_enum] constrained to {len(_action_enum_cache)} actions")
+    return _action_enum_cache
+
+
+_routing_output_config_cache: dict | None = None
+
+
+def _routing_output_config() -> dict:
+    """ROUTING_SCHEMA with every "action" field pinned to the real action list.
+
+    Built lazily and cached because the enum needs executor imported, and
+    module import time is too early for that (see _action_enum).
+    """
+    global _routing_output_config_cache
+    if _routing_output_config_cache is None:
+        schema = copy.deepcopy(ROUTING_SCHEMA)
+        names = _action_enum()
+        if names:
+            props = schema["properties"]
+            # All three action fields: the single-action form and both
+            # multi-action arrays. deepcopy preserves _STEP_SCHEMA's aliasing
+            # between actions and pending_actions, so the last two assignments
+            # currently touch one shared dict — written out in full anyway so
+            # de-aliasing the template later cannot silently leave a hole.
+            props["action"]["enum"] = names
+            props["actions"]["items"]["properties"]["action"]["enum"] = names
+            props["pending_actions"]["items"]["properties"]["action"]["enum"] = names
+        _routing_output_config_cache = {
+            "format": {"type": "json_schema", "schema": schema}}
+    return _routing_output_config_cache
 
 # Flipped to False the first time the API rejects the schema, so a bad schema or
 # an endpoint without structured outputs degrades to prompt-only JSON (which
@@ -1318,7 +1380,7 @@ def _routing_call(messages: list[dict], date_block: str):
     if _structured_output_ok:
         try:
             return client.messages.create(
-                extra_body={"output_config": _ROUTING_OUTPUT_CONFIG}, **kwargs)
+                extra_body={"output_config": _routing_output_config()}, **kwargs)
         except anthropic.BadRequestError as e:
             # Only a schema/format complaint disables the feature. Any other 400
             # is a genuine problem with the request itself and must surface.
