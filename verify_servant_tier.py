@@ -22,7 +22,13 @@ WHAT IT PROVES
                 synthesize_action_reply, match_element) depend on.
 
 Exit code is 0 only if every executed check passed. A tier whose key is unset
-is reported as SKIP, not PASS — an unset key means the gate did not test it.
+is reported as SKIP, not PASS — an unset key means the gate did not test it,
+and SKIP is counted as a non-zero exit for exactly that reason.
+
+WHERE TO RUN IT
+  On the machine that holds the real keys. GLM_API_KEY and QWEN_API_KEY must be
+  in the environment (or loaded from .env the same way the app loads it) before
+  checks 2-4 do anything but SKIP. Check 1 is static and runs anywhere.
 """
 
 from __future__ import annotations
