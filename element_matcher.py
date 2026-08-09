@@ -11,8 +11,8 @@ Phase order — cheapest first, LLM strictly last:
   1. FUZZY substring               — longest-match-wins with ambiguity tie-out
   2. WORD OVERLAP                  — content words only, min 2
   3. BARE ORDINAL                  — visual order over content roles
-  4. LLM (Haiku)                   — COSTS TOKENS; phases 0-3 should resolve
-                                     virtually all "Nth image/link/video"
+  4. LLM (SERVANT_MECH, Haiku      — COSTS TOKENS; phases 0-3 should resolve
+     fallback)                       virtually all "Nth image/link/video"
                                      requests before ever reaching this.
 """
 
@@ -35,6 +35,14 @@ _META_WORDS = {
     'link', 'links', 'tab', 'tabs', 'button', 'buttons', 'profile',
     'profiles', 'video', 'videos', 'item', 'items', 'option', 'options',
 }
+
+# Phase 4 prompt and budgets. One index, or NONE — the brain-tier fallback gets
+# more room because a servant reply capped at max_tokens now raises
+# ServantUnavailable, and retrying on the same ceiling would truncate again.
+_MATCH_PROMPT = ("Match instruction to element index. Reply ONLY with the "
+                 "number. If no match, reply: NONE")
+_MATCH_TOKENS = 20
+_MATCH_TOKENS_BRAIN = 32
 
 # Role intent: "image"/"photo" etc. means role='image' elements ONLY —
 # never nav chrome. Same for video/button/link.
@@ -269,23 +277,38 @@ def find_element_index(elements: list[dict], instruction: str) -> int | None:
 
     # Phase 4: LLM matching (COSTS TOKENS) — lazy import so this module
     # never needs claude_handler (TTS init) unless we actually get here.
-    print(f"[LLM] Calling Haiku for '{instruction}'")
     subset = filtered[:40] if len(filtered) < len(elements) else elements[:40]
     elements_text = "\n".join(
         f"{el['index']}: [{el.get('role', '?')}] \"{el['text'][:100]}\""
         + (f" (url:{el['href'][:50]})" if el.get("href") else "")
         for el in subset)
+    user_block = f"Elements:\n{elements_text}\n\nFind: {instruction}"
     try:
-        from claude_handler import client, response_text
-        message = client.messages.create(
-            model="claude-haiku-4-5",
-            max_tokens=20,
-            system=("Match instruction to element index. Reply ONLY with the number. "
-                    "If no match, reply: NONE"),
-            messages=[{"role": "user",
-                       "content": f"Elements:\n{elements_text}\n\nFind: {instruction}"}],
-        )
-        result = response_text(message).strip()
+        # Routed through the tier registry like every other MECH site rather
+        # than naming a model here: "which of these 40 indices" is the most
+        # mechanical judgement in the codebase, and the old hardcoded
+        # "claude-haiku-4-5" literal was also a second place for the model
+        # string to drift away from claude_handler.HAIKU_MODEL.
+        from claude_handler import (client, response_text, servant_or_none,
+                                    HAIKU_MODEL)
+        servant = servant_or_none("match_element")
+        result = None
+        if servant is not None:
+            import servant_clients
+            try:
+                result = servant_clients.call_openai_compatible(
+                    servant, system=_MATCH_PROMPT, user=user_block,
+                    max_tokens=_MATCH_TOKENS, label="match_element").strip()
+            except servant_clients.ServantUnavailable as e:
+                print(f"[LLM] {e} — retrying on cheap brain tier")
+        if result is None:
+            message = client.messages.create(
+                model=HAIKU_MODEL,
+                max_tokens=_MATCH_TOKENS_BRAIN,
+                system=_MATCH_PROMPT,
+                messages=[{"role": "user", "content": user_block}],
+            )
+            result = response_text(message).strip()
         print(f"[LLM] Returned: {result}")
         if "NONE" in result.upper():
             return None

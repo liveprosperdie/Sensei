@@ -26,7 +26,8 @@ param, content as typed blocks) and cannot talk to /chat/completions at all.
 
 FAILURE POLICY — two different failures, two different answers
 --------------------------------------------------------------
-  * Tier UNAVAILABLE (no API key, transport error, HTTP error, empty reply)
+  * Tier UNAVAILABLE (no API key, transport error, HTTP error, empty reply,
+    reply truncated at max_tokens)
     -> raise ServantUnavailable, and the CALLER falls back to its brain-tier
        model. A missing GLM_API_KEY must degrade to working-but-pricier, never
        to a broken feature.
@@ -184,13 +185,29 @@ def call_openai_compatible(tier: Tier, *, system: str, user: str | None = None,
             f"{resp.text[:300]}") from e
 
     usage = payload.get("usage") or {}
+    finish = (payload["choices"][0] or {}).get("finish_reason") or "?"
     print(f"[tier:{tag}] {tier.name} {tier.model} {elapsed:.2f}s "
           f"in={usage.get('prompt_tokens', '?')} "
           f"out={usage.get('completion_tokens', '?')} "
-          f"finish={(payload['choices'][0] or {}).get('finish_reason', '?')}")
+          f"finish={finish}")
 
     if not text.strip():
         raise ServantUnavailable(f"{tier.name} returned an empty completion")
+
+    # TRUNCATION IS UNAVAILABILITY, NOT A REPLY.
+    # finish_reason == "length" means the servant ran out of budget mid-sentence.
+    # Returning that text would hand a half-finished summary straight to TTS
+    # (summarize_text) or a half-finished verdict to a destructive-action gate
+    # (ask_confirmation), with nothing in the logs pointing at why. Raising
+    # ServantUnavailable reuses the one fallback path every caller already
+    # implements — the brain tier retries the same job with more headroom —
+    # rather than adding a second return channel that nine call sites would
+    # have to remember to inspect. It is NOT ServantJSONError: a truncated
+    # reply is a budget problem, not a bug in our prompt or schema injection.
+    if finish == "length":
+        raise ServantUnavailable(
+            f"{tier.name} reply was truncated (finish_reason=length at "
+            f"max_tokens={max_tokens}, label={tag}): {text[-120:]!r}")
     return text
 
 
@@ -199,9 +216,12 @@ def call_json(tier: Tier, *, system: str, user: str, max_tokens: int,
     """Servant call whose reply must be JSON. Returns (parsed, info).
 
     Routed through llm_json.parse for the same reason brain-tier JSON calls
-    are: replies arrive fenced, prefixed with prose, or truncated, and
-    tolerant repair recovers most of that. Neither provider can be
-    grammar-constrained, so repair matters MORE here, not less.
+    are: replies arrive fenced or prefixed with prose, and tolerant repair
+    recovers most of that. Neither provider can be grammar-constrained, so
+    repair matters MORE here, not less. Truncated replies no longer reach the
+    parser at all — call_openai_compatible raises ServantUnavailable on
+    finish_reason=length, so a cut-off body is a fallback, not a parse failure
+    that would otherwise be misreported as ServantJSONError.
 
     A reply that survives transport but cannot be parsed raises
     ServantJSONError, which callers surface loudly. It is not a
