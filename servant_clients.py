@@ -112,6 +112,29 @@ SERVANT_MECH = Tier(
     "QWEN_API_KEY",
 )
 
+# GUARD is a fourth ROLE, not a third servant. It shares the servant wire
+# format and this module's Tier plumbing, but its failure policy is the exact
+# inverse (see guard.py): a servant that cannot answer falls back to the brain
+# and the task still completes, whereas a guard that cannot answer must never
+# resolve to "approved".
+#
+# Pointed at Qwen and keyed on the EXISTING QWEN_API_KEY on purpose: adding a
+# second secret would mean the guard is unrunnable until someone provisions it,
+# and an unprovisioned guard is the one failure mode most likely to get it
+# switched off. GUARD_MODEL/GUARD_BASE_URL/GUARD_API_KEY_ENV are separate
+# overrides so repointing at Kimi (or any OpenAI-compatible endpoint) is a .env
+# edit, not a code change — same migration path the QWEN_MODEL override exists
+# for. Sharing SERVANT_MECH's key does mean one revoked key takes out both the
+# mechanical tier and the guard at once; GUARD_API_KEY_ENV is how you split
+# them without touching this file.
+GUARD = Tier(
+    "GUARD",
+    os.environ.get("GUARD_MODEL", "qwen2.5-max"),
+    os.environ.get("GUARD_BASE_URL",
+                   "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+    os.environ.get("GUARD_API_KEY_ENV", "QWEN_API_KEY"),
+)
+
 DEFAULT_TIMEOUT = 90.0
 
 
