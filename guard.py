@@ -46,12 +46,37 @@ confirmation machinery that already exists, so a broken guard degrades to "the
 human decides", which is the pre-guard status quo and strictly safer than a
 silent pass.
 
+RELATION TO action_guard.py (three guard modules, three different jobs)
+----------------------------------------------------------------------
+Read this before adding a rule, so it lands in the right file:
+
+  action_guard.py  BETWEEN steps. Chain-level relationships — no
+                   download_image in the same chain as search_image, at most one
+                   download per chain. Pure, deterministic, no model. ALREADY
+                   WIRED, at sensei.py:462.
+  guard_rules.py   WITHIN one step. Is this action known, does its parameter
+                   have the right shape, and does the existing risk taxonomy
+                   object to it. Deterministic, no model.
+  guard.py         judgement about one step that no rule can express, from a
+                   model, on top of guard_rules' verdict.
+
+So a rule about how steps combine belongs in action_guard; a rule about whether
+a single step is well-formed belongs in guard_rules. The two do not currently
+overlap — action_guard names search_image/download_image only to relate them,
+guard_rules only to type their parameters.
+
 NOT WIRED YET
 -------------
 Nothing calls review() from the execution flow. Which actions consult the guard,
 and whether they do so before dispatch or alongside it, is the classification
 and timing work that comes next. This module is callable and testable on its
 own, and deliberately has no import of, or effect on, executor's dispatch.
+
+When that wiring happens, sensei.run_actions() around the existing
+action_guard.sanitize_actions() call (sensei.py:462) is the natural seam: it is
+already the one place every chain passes through before anything executes, and it
+already returns spoken notes, which is the channel a FLAG needs. Guarding inside
+executor's dispatch instead would mean auditing ~83 call sites.
 
 VERIFICATION STATUS
 -------------------
