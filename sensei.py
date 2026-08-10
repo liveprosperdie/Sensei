@@ -295,7 +295,13 @@ def _git_fingerprint() -> str:
 
 
 print(f"[BOOT] git: {_git_fingerprint()}")
-print(f"[BOOT] model: {getattr(claude_handler, 'MODEL', '?')}")
+# All four, not just the brain: the point of this line is diagnosing a bug
+# report, and "which model answered" now has four possible answers depending on
+# which path the user hit. Same '?' default as before so a future rename prints
+# a visible gap next to the name that moved instead of crashing the boot.
+print("[BOOT] models: " + "  ".join(
+    f"{name.split('_')[0].lower()}={getattr(claude_handler, name, '?')}"
+    for name in ("BRAIN_MODEL", "ROUTING_MODEL", "DRAFT_MODEL", "HAIKU_MODEL")))
 # Feature fingerprints: proves at a glance whether the running code has the
 # features a bug report is about, instead of guessing from the branch name.
 try:

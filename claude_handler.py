@@ -18,13 +18,30 @@ load_dotenv()
 # ── Client ────────────────────────────────────────────────────────────────────
 
 # timeout prevents silent multi-minute hangs (SDK default is ~10 min)
-# One place names the model, so the routing call and every reasoning pass can
-# never drift onto different Claude versions.
-MODEL = "claude-sonnet-5"
+#
+# These were one constant, MODEL, until it turned out to be doing three
+# unrelated jobs — and that overloading is what made upgrading the brain unsafe:
+# raising one name would have raised the per-utterance routing call and the
+# servant-fallback bulk drafting along with it. Split by JOB, not by model, so
+# two of them can share a string today and diverge later without a rename.
+
+# Judgement about the user. Escalation-only paths (deliberate, organize), so a
+# slower, pricier model here costs close to nothing per session.
+BRAIN_MODEL = "claude-opus-5"
+
+# Every voice turn goes through this one. Deliberately NOT the brain model:
+# Opus here would bill per utterance and add wake-word-to-reply latency to the
+# interactive path, to classify intent that Sonnet already classifies correctly.
+ROUTING_MODEL = "claude-sonnet-5"
+
+# Brain-tier stand-in when a servant tier is unreachable (see servant_or_none).
+# Bulk prose from evidence another pass already gathered — length matters more
+# than judgement, so this tracks the servant tiers' job, not the brain's.
+DRAFT_MODEL = "claude-sonnet-5"
 
 # The cheap model, for passes that are mechanical rather than judgment-heavy:
 # short summaries, yes/no confirmation, per-file code description. Named here for
-# the same anti-drift reason as MODEL — it was previously a string literal
+# the same anti-drift reason as the above — it was previously a string literal
 # repeated at four call sites.
 HAIKU_MODEL = "claude-haiku-4-5"
 
@@ -32,12 +49,21 @@ HAIKU_MODEL = "claude-haiku-4-5"
 #
 # Which model does a given LLM job, by the shape of thinking it needs:
 #
-#   BRAIN         claude-sonnet-5  judgement about the USER — what they meant,
-#                                  what to do, how to organise their vault.
+#   BRAIN         claude-opus-5    judgement about the USER — what they meant,
+#                 (BRAIN_MODEL)    what to do, how to organise their vault.
+#                 claude-sonnet-5  ...except _routing_call, which is BRAIN-tier
+#                 (ROUTING_MODEL)  work on the per-turn hot path and stays on
+#                                  Sonnet for cost and latency. BRAIN is one
+#                                  TIER, not one model — resolve_tier() returns
+#                                  None for it, meaning "the local Anthropic
+#                                  client", and each site names its own model.
 #   SERVANT_GEN   glm-5.2          longer-form drafting from evidence already
-#                                  gathered by something else.
+#                 (DRAFT_MODEL     gathered by something else. Falls back to
+#                  on fallback)    DRAFT_MODEL when the tier has no API key.
 #   SERVANT_MECH  qwen2.5-max      mechanical reduction — summarise, yes/no,
-#                                  which index.
+#                 (HAIKU_MODEL     which index. HAIKU_MODEL is the in-practice
+#                  on fallback)    fallback at four MECH sites, so it belongs
+#                                  in this table rather than as a bare constant.
 #
 # KEYED BY CALL SITE, NOT BY ACTION NAME, and that is forced rather than
 # preferred. Three of the ten LLM jobs (_routing_call, ask_confirmation,
@@ -818,7 +844,19 @@ def plan_organization(raw_content: str, vault_context: str = "", *,
             timeout=ORGANIZE_TIMEOUT,
             max_retries=REASONING_MAX_RETRIES,
         ).messages.create(
-            model=MODEL,
+            # Judgement and bulk text in ONE call, on the judgement model, and
+            # that is deliberate: whether a structural split is right depends on
+            # whether the bodies actually fill it, so a skeleton-then-fill split
+            # would make the structural call blind. A wrong structure scatters a
+            # vault silently; a weaker note body is editable prose.
+            #
+            # TRIPWIRE: this pass has no servant fallback and no partial salvage
+            # — max_tokens below is a hard discard. Sonnet's terseness used to be
+            # what kept large dumps under 8000; on a wordier model that margin is
+            # unproven. If focus-mode organize starts returning None, split the
+            # judgement out and put the bodies on DRAFT_MODEL before raising the
+            # ceiling.
+            model=BRAIN_MODEL,
             # Real headroom: note bodies live in THIS reply, unlike the routing
             # envelope, which is exactly why this is a separate call.
             max_tokens=8000,
@@ -1069,7 +1107,9 @@ def plan_repo_outline(repo: str, meta: str, readme: str,
                 timeout=REPO_OUTLINE_TIMEOUT,
                 max_retries=REASONING_MAX_RETRIES,
             ).messages.create(
-                model=MODEL,
+                # SERVANT_GEN fallback, not brain work — stays on the draft
+                # model so an absent servant key degrades cost, not just speed.
+                model=DRAFT_MODEL,
                 max_tokens=2500,
                 system=[{"type": "text", "text": REPO_OUTLINE_PROMPT,
                          "cache_control": {"type": "ephemeral"}}],
@@ -1197,7 +1237,8 @@ def write_note_bodies(repo: str, meta: str, outline: list,
                 timeout=NOTE_BODY_TIMEOUT,
                 max_retries=REASONING_MAX_RETRIES,
             ).messages.create(
-                model=MODEL,
+                # Same SERVANT_GEN fallback rationale as plan_repo_outline.
+                model=DRAFT_MODEL,
                 max_tokens=max_tokens,
                 system=[{"type": "text", "text": NOTE_BODY_PROMPT,
                          "cache_control": {"type": "ephemeral"}}],
@@ -1310,7 +1351,9 @@ def deliberate(request: str, context: str = "", *,
             timeout=DELIBERATE_TIMEOUT,
             max_retries=REASONING_MAX_RETRIES,
         ).messages.create(
-            model=MODEL,
+            # Escalation-only, so the judgement model's latency is nearly free
+            # here — nothing reaches this path on an ordinary voice turn.
+            model=BRAIN_MODEL,
             # Room to actually think, unlike the 1600-token routing envelope.
             max_tokens=4000,
             system=[{"type": "text", "text": AKIRA_PROMPT,
@@ -1511,7 +1554,10 @@ def _routing_call(messages: list[dict], date_block: str):
     global _structured_output_ok
 
     kwargs = dict(
-        model=MODEL,
+        # BRAIN tier, but NOT BRAIN_MODEL — see the tier table. This runs on
+        # every utterance; the judgement model belongs on paths a user reaches
+        # rarely, not on the one between the wake word and the reply.
+        model=ROUTING_MODEL,
         # 1600, not 600: the routing envelope is small, but a legitimate
         # multi-step response with a confirmation_message ran out of budget and
         # ended mid-string, which reached the user as an unparseable reply.
