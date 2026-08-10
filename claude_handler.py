@@ -1649,7 +1649,7 @@ def record_action_results(results: list) -> None:
         if isinstance(r, dict):
             status = "ok" if r.get("success") else "FAILED"
             # "detail" carries the FULL data (e.g. list_folder's complete
-            # file list) while "message" is the short spoken form — the LLM
+            # file list) while "message" is the short spoken form ��� the LLM
             # must get the full version to reason over every item
             lines.append(f"{status}: {r.get('detail') or r.get('message', '')}")
         elif isinstance(r, str) and r.strip():
@@ -1669,14 +1669,50 @@ def record_action_results(results: list) -> None:
         conversation_history.append(_ACK_STUB.copy())
 
 
+_ACTION_REPLY_PROMPT = (
+    "You are Akira, a voice assistant. The last [ACTION RESULT] message "
+    "contains the raw data an action just returned for the user's request. "
+    "Answer their request using that data, in 2 to 6 short spoken sentences. "
+    "Plain conversational language — no markdown, no bullet points, no lists, "
+    "nothing that sounds broken read aloud. For email or event lists, "
+    "summarize the senders, subjects, and anything urgent naturally; never "
+    "read raw JSON or ids aloud.")
+
+# Servant budget, and the wider brain-tier budget its fallback gets. The gap is
+# deliberate: a servant reply that stops at finish_reason=length raises
+# ServantUnavailable, and retrying on the same ceiling would truncate again.
+_ACTION_REPLY_TOKENS = 300
+_ACTION_REPLY_TOKENS_BRAIN = 450
+
+
+def _synthesize_on_servant(servant, messages: list) -> str | None:
+    """SERVANT_MECH attempt at the spoken synthesis. None means fall back.
+
+    Split out so the brain-tier path below stays a single unindented block:
+    this is the only tiered site that passes a full history turn list rather
+    than one user string, so it needs the messages= form of the servant call.
+    """
+    import servant_clients
+    try:
+        return servant_clients.call_openai_compatible(
+            servant, system=_ACTION_REPLY_PROMPT, messages=messages,
+            max_tokens=_ACTION_REPLY_TOKENS,
+            label="synthesize_action_reply").strip() or None
+    except servant_clients.ServantUnavailable as e:
+        print(f"[synthesize_action_reply] {e} — retrying on cheap brain tier")
+        return None
+
+
 def synthesize_action_reply() -> str | None:
     """Same-turn spoken synthesis of the latest ACTION RESULT. Fixes the
     'let me check your inbox' bug: workspace reads returned raw API dumps
     that only became usable on the NEXT turn, forcing the user to ask again.
     Call AFTER record_action_results so the result is already in history.
-    Haiku — summarization quality is plenty, and this runs on every
-    workspace read so it must stay cheap. Returns None on any failure so
-    the caller keeps the routing call's original spoken response."""
+    SERVANT_MECH — reading a raw dump back as prose is a mechanical reduction,
+    and this runs on every workspace read so it must stay cheap; Haiku is the
+    fallback when the servant key is unset or the servant truncates. Returns
+    None on any failure so the caller keeps the routing call's original spoken
+    response."""
     with _history_lock:
         messages = list(conversation_history)
         # drop the trailing ack stub — claude-sonnet-5 rejects a request whose
@@ -1686,20 +1722,16 @@ def synthesize_action_reply() -> str | None:
     if not messages:
         return None
     try:
-        message = client.messages.create(
-            model=HAIKU_MODEL,
-            max_tokens=300,
-            system="You are Akira, a voice assistant. The last [ACTION RESULT] "
-                   "message contains the raw data an action just returned for the "
-                   "user's request. Answer their request using that data, in 2 to 6 "
-                   "short spoken sentences. Plain conversational language — no "
-                   "markdown, no bullet points, no lists, nothing that sounds "
-                   "broken read aloud. For email or event lists, summarize the "
-                   "senders, subjects, and anything urgent naturally; never read "
-                   "raw JSON or ids aloud.",
-            messages=messages,
-        )
-        text = response_text(message).strip()
+        servant = servant_or_none("synthesize_action_reply")
+        text = _synthesize_on_servant(servant, messages) if servant else None
+        if text is None:
+            message = client.messages.create(
+                model=HAIKU_MODEL,
+                max_tokens=_ACTION_REPLY_TOKENS_BRAIN,
+                system=_ACTION_REPLY_PROMPT,
+                messages=messages,
+            )
+            text = response_text(message).strip()
         if not text:
             return None
         # keep history honest: what Akira actually SAID replaces the stub ack —
@@ -1764,6 +1796,10 @@ def ask_confirmation(text: str, pending_description: str | None = None) -> bool:
                   f"{'YES' if verdict else 'NO'} for {text!r}")
             return verdict
         except servant_clients.ServantUnavailable as e:
+            # Covers a truncated verdict too: a servant that spent its 10
+            # tokens on a preamble never reached YES/NO, so the ambiguous text
+            # must not be read as agreement — it falls through to the brain
+            # tier below with room to answer.
             print(f"[ask_confirmation] {e} — retrying on cheap brain tier")
         except Exception as e:
             print(f"[ask_confirmation] servant error, defaulting NO: {e!r}")
@@ -1772,7 +1808,7 @@ def ask_confirmation(text: str, pending_description: str | None = None) -> bool:
     try:
         message = client.messages.create(
             model=HAIKU_MODEL,
-            max_tokens=10,
+            max_tokens=16,
             system=system,
             messages=[{"role": "user", "content": text}],
         )
@@ -1794,7 +1830,10 @@ _SUMMARIZE_TEXT_PROMPT = (
 def summarize_text(text: str, filename: str = "") -> str:
     """4-5 line spoken summary of file content, for executor.summarize_file.
     SERVANT_MECH — a mechanical reduction, so the cheapest tier that can read
-    is the right one. Falls back to Haiku when the servant key is unset."""
+    is the right one. Falls back to Haiku when the servant key is unset or the
+    servant reply is truncated (ServantUnavailable covers both), and the
+    fallback gets a wider token budget so a length-capped retry cannot repeat
+    the same truncation."""
     user = f"File: {filename}\n\n{text}"
     servant = servant_or_none("summarize_text")
     if servant is not None:
@@ -1808,7 +1847,7 @@ def summarize_text(text: str, filename: str = "") -> str:
 
     message = client.messages.create(
         model=HAIKU_MODEL,
-        max_tokens=300,
+        max_tokens=450,
         system=_SUMMARIZE_TEXT_PROMPT,
         messages=[{"role": "user", "content": user}],
     )
