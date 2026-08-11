@@ -472,8 +472,8 @@ def _guard_flag_pending(action: str, outcome) -> str:
 
     HONEST LIMIT, stated rather than papered over: this repo has no per-action
     undo implementations. The rollback-safe table records that an undo is
-    POSSIBLE (unlink the file just created, restore the previous wallpaper), not
-    that one is written. So this does NOT fabricate a rollback callable it
+    POSSIBLE (unlink the file create_file just made, re-read and reset the volume
+    we changed), not that one is written. So this does NOT fabricate a rollback callable it
     cannot honour, and therefore does not set pending_execute — it reports the
     flag and halts the chain. Writing the undo closures is a separate per-action
     job, and the ROLLBACK table is the specification for it. Claiming a rollback
@@ -1005,7 +1005,7 @@ def _build_session_context() -> str:
         return ""
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# ── Main loop ──────────���──────────────────────────────────────────────────────
 
 def _process_command(text: str, inject_context: bool = False) -> bool:
     """

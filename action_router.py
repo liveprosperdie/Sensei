@@ -154,11 +154,35 @@ ROLLBACK: dict[str, Rollback] = {
     "open_system_tool": Rollback.SAFE,
     "bookmark_page": Rollback.SAFE,     # a bookmark is removable and carries no side effect
 
-    # ── device/session settings: we can read-then-restore, so genuinely undoable
+    # ── device/session settings ──
+    # SAFE here means the prior value is RECOVERABLE AT UNDO TIME from the OS
+    # itself, with no capture required: volume and brightness are readable at any
+    # moment, so an undo can learn the old value even after the fact. That is the
+    # only justification that survives scrutiny, and it does not generalise.
     "adjust_volume": Rollback.SAFE,
     "adjust_brightness": Rollback.SAFE,
-    "set_wallpaper": Rollback.SAFE,     # previous wallpaper path is recoverable
-    "write_clipboard": Rollback.SAFE,   # clobbers prior clipboard, but restorable and low-stakes
+
+    # ── destroy-on-write: prior value is NOT captured, VERIFIED in executor ──
+    # Both of these were initially marked SAFE on the assumption that the prior
+    # value could be restored. Reading the implementations disproved it, so they
+    # are serial. "Restorable in principle" is not rollback-safe; only "the old
+    # value still exists somewhere after the write" is.
+    #
+    # set_wallpaper (executor.py:4102) calls SystemParametersInfoW(SPI_SET...)
+    # with SPIF_UPDATEINIFILE, which OVERWRITES the stored value, and performs no
+    # SPI_GETDESKWALLPAPER read first. Even a pre-read would be lossy: Windows
+    # serves a transcoded copy from Themes\TranscodedWallpaper, and a
+    # slideshow/Spotlight desktop has no single path to put back at all.
+    "set_wallpaper": Rollback.UNSAFE,
+    #
+    # write_clipboard (executor.py:4173) calls Set-Clipboard directly. It DOES
+    # read back at :4197, but that verifies the NEW value — the old one is
+    # already gone. A pre-read would also be text-only (Get-Clipboard -Raw), so
+    # restoring would silently discard an image, file list, or rich-text
+    # clipboard. Serial also matters on its own merits: this is the clipboard
+    # hijacking seam (swapped wallet address, a command staged for the user's
+    # next paste), so the guard must clear it BEFORE the content lands, not after.
+    "write_clipboard": Rollback.UNSAFE,
 
     # ── NOT ROLLBACK-SAFE ────────────────────────────────────────────────
     # Every entry below is forced serial by parallel_ok(), even though several
