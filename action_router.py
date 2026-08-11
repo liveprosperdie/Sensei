@@ -377,8 +377,24 @@ class Outcome:
 
 # ── the timing policy ────────────────────────────────────────────────────────
 
-def run_guarded(step: dict, execute, *, timeout: float | None = None) -> Outcome:
+def run_guarded(step: dict, execute, *, timeout: float | None = None,
+                confirmed: bool = False) -> Outcome:
     """Run one step against the guard with the timing its tier calls for.
+
+    `confirmed=True` means the human has ALREADY approved this gated step at the
+    spoken confirmation prompt, so this call is the post-approval execution pass
+    rather than the pre-approval review. Without it a gated action can never run
+    at all: sensei re-enters run_actions with the approved steps, tier() still
+    reports GATED (the action is still dangerous — approval does not change what
+    it is), and the pre-approval branch below returns executed=False. The user
+    says "yes" to deleting a file and hears "I didn't run delete files".
+
+    Confirmed gated steps take the SERIAL path: guard blocking, then execute only
+    if it cleared. Not the parallel path, because gated actions are the least
+    rollback-safe things here; and not an unguarded straight-through call,
+    because the guard is the net that catches a malformed parameter the human
+    could not evaluate from a spoken summary. It costs one extra guard call on a
+    path that already did a spoken round-trip, which is not worth optimising.
 
     `execute` is a zero-arg callable that performs the step. It is invoked on
     the CALLING thread in every path, so Selenium's driver, COM apartments and
@@ -401,13 +417,16 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None) -> Outcome
     step_tier = tier(step)
     kwargs = {"timeout": timeout} if timeout is not None else {}
 
-    # ── Gated: serial, blocking, and we do NOT execute ───────────────────
-    if step_tier is Tier.GATED:
+    # ── Gated, NOT yet approved: review only, never execute ──────────────
+    if step_tier is Tier.GATED and not confirmed:
         verdict = guard.review(action, parameter, label="guard:gated", **kwargs)
         print(f"[router] {action} tier=gated {verdict}")
         return Outcome(step_tier, verdict, executed=False)
 
-    # ── Not rollback-safe: serial, and execution is conditional ──────────
+    # ── Not rollback-safe (or gated and approved): serial ────────────────
+    # Gated+confirmed lands here deliberately: same blocking-guard-then-execute
+    # shape, and parallel_ok() already excludes every gated action, so no extra
+    # condition is needed to keep an approved delete off the racing path.
     if not parallel_ok(step):
         why = rollback(action).value
         verdict = guard.review(action, parameter, label="guard:serial", **kwargs)
