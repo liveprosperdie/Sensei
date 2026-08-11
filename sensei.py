@@ -472,8 +472,8 @@ def _guard_flag_pending(action: str, outcome) -> str:
 
     HONEST LIMIT, stated rather than papered over: this repo has no per-action
     undo implementations. The rollback-safe table records that an undo is
-    POSSIBLE (unlink the file just created, restore the previous wallpaper), not
-    that one is written. So this does NOT fabricate a rollback callable it
+    POSSIBLE (unlink the file create_file just made, re-read and reset the volume
+    we changed), not that one is written. So this does NOT fabricate a rollback callable it
     cannot honour, and therefore does not set pending_execute — it reports the
     flag and halts the chain. Writing the undo closures is a separate per-action
     job, and the ROLLBACK table is the specification for it. Claiming a rollback
@@ -528,7 +528,8 @@ def _guard_gated(actions: list[dict]) -> tuple[list[dict], list[str]]:
     return kept, notes
 
 
-def run_actions(response: dict, step_results: dict | None = None) -> list:
+def run_actions(response: dict, step_results: dict | None = None,
+                confirmed: bool = False) -> list:
     """
     Execute one or many actions with dependency graph support.
     - id / depends_on for chaining
@@ -628,7 +629,8 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
         # one lives in _guard_gated(), called before the confirmation is spoken.
         guard_step = {"action": step["action"], "parameter": parameter}
         outcome = action_router.run_guarded(
-            guard_step, lambda a=step["action"], p=parameter: execute(a, p))
+            guard_step, lambda a=step["action"], p=parameter: execute(a, p),
+            confirmed=confirmed)
         result = outcome.result
 
         if not outcome.executed:
@@ -922,7 +924,11 @@ def get_akira_response(text: str) -> dict | None:
                     pending_action if isinstance(pending_action, list)
                     else [{"action": pending_action, "parameter": pending_parameter}]
                 )
-                confirm_results = run_actions({"actions": actions})
+                # confirmed=True: the human just approved these gated steps, so
+                # the router must EXECUTE them rather than review them again.
+                # Without this the approval is silently discarded.
+                confirm_results = run_actions({"actions": actions},
+                                              confirmed=True)
                 speak_text = "Done."
                 for r in reversed(confirm_results):
                     if isinstance(r, str) and r.startswith(FAILURE_PREFIXES):
@@ -1005,7 +1011,7 @@ def _build_session_context() -> str:
         return ""
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
+# ── Main loop ──────────���──────────────────────────────────────────────────────
 
 def _process_command(text: str, inject_context: bool = False) -> bool:
     """
