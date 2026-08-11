@@ -17,6 +17,8 @@ import claude_handler
 import llm_json
 import action_guard
 import action_router
+import tiers
+import reliability
 import background_tasks
 import system_control
 import office_control
@@ -57,6 +59,23 @@ _WAKE_KEY = next(iter(oww_model.models.keys()), None)
 if _WAKE_KEY is None:
     raise SystemExit(f"Wake model {_WAKE_MODEL} loaded no usable model.")
 print(f"[wake] model '{_WAKE_KEY}' loaded, threshold {WAKE_THRESHOLD}")
+
+# Resolved tier config, printed once at startup. The five layers are independent
+# env vars, so the effective configuration is not readable from any single one —
+# without this banner, diagnosing "why is delete_files not being offered" means
+# guessing which of five variables is set to what.
+#
+# warnings() reports cross-tier combinations that are broken or untested. They
+# are printed, never enforced: mixing tiers is an explicit requirement, and a
+# maintainer testing a specific pairing must be able to run it.
+_tier_config = tiers.summary()
+print(f"[tiers] {_tier_config['plans']}")
+print(f"[tiers] head={_tier_config['head']}")
+print(f"[tiers] servant={_tier_config['servant']}")
+print(f"[tiers] gated={_tier_config['servant_gated']}")
+print(f"[tiers] reliability={_tier_config['reliability']}")
+for _w in _tier_config["warnings"]:
+    print(f"[tiers] WARNING: {_w}")
 
 mic = pyaudio.PyAudio()
 stream = mic.open(format=pyaudio.paInt16, channels=1, rate=16000,
@@ -504,6 +523,23 @@ def _guard_gated(actions: list[dict]) -> tuple[list[dict], list[str]]:
     A FLAG is deliberately NOT filtered: flag means "a human should decide", and
     the confirmation prompt this sits in front of IS that human deciding.
 
+    THE TIER GATE RUNS FIRST, BEFORE THE GUARD
+    ------------------------------------------
+    tiers.gated_available() answers "may this action be OFFERED at all on the
+    current config" — Gated is off entirely on Free, and on Pro each action type
+    must have cleared the reliability bar. That is a config question with a
+    local answer, so it is settled before spending a guard API call on a step
+    that cannot be offered regardless of the verdict.
+
+    Ordering matters for a second reason: the guard's job is judging THIS
+    step's shape, while the tier's job is judging whether the capability is
+    available. Letting a guard ALLOW precede a tier refusal would produce a log
+    line saying an action was approved immediately before it was withheld, which
+    reads as a contradiction to anyone debugging it.
+
+    A tier refusal is spoken, not silent, for the same reason a guard BLOCK is:
+    the user asked for something and must hear why it is not happening.
+
     Returns (steps_still_offered, spoken_notes).
     """
     kept: list[dict] = []
@@ -511,6 +547,15 @@ def _guard_gated(actions: list[dict]) -> tuple[list[dict], list[str]]:
     for step in actions:
         if not isinstance(step, dict):
             continue
+
+        action = str(step.get("action") or "").strip()
+        unavailable = tiers.gated_available(action)
+        if unavailable is not None:
+            print(f"[tier] not offering {action}: {unavailable.reason}")
+            notes.append(f"I can't do {action.replace('_', ' ')} right now — "
+                         f"{unavailable.reason}")
+            continue
+
         # execute=no-op: this is a validation pass only. Nothing may run before
         # the user has confirmed, so the callable must be inert by construction
         # rather than by the router happening not to call it.
@@ -699,6 +744,41 @@ def run_actions(response: dict, step_results: dict | None = None,
                  (isinstance(result, dict) and result.get("success") is False)
         if failed and step_id:
             failed_ids.add(step_id)
+
+        # RELIABILITY LEDGER — the only place a run is recorded.
+        #
+        # Placed HERE, at the bottom of the loop, because this is the first point
+        # where the outcome is actually known and the step actually ran. Every
+        # earlier exit path is deliberately NOT recorded, and each omission is a
+        # correctness requirement rather than an oversight:
+        #
+        #   * outcome.executed == False   — the guard refused before running.
+        #     Nothing executed, so there is no reliability evidence either way.
+        #     Recording it as a failure would let a strict guard permanently
+        #     suppress an action that has never once misbehaved.
+        #   * needs_click_confirmation / needs_confirmation — the action returned
+        #     a PLAN instead of acting. Recording a success here would credit a
+        #     streak for work that never happened, which is precisely how a
+        #     destructive action could unlock without ever having run correctly.
+        #   * backgrounded steps — they return an acknowledgement, not a result,
+        #     so their true outcome is not observable from this frame at all.
+        #
+        # `confirmed` scoping: only confirmed gated executions count toward the
+        # Gated unlock bar. An unconfirmed pass never reaches this line, so no
+        # extra condition is needed — but the ledger is written for ALL tiers,
+        # not just Pro, so that history accumulates BEFORE an operator switches
+        # to Pro. Otherwise flipping to Pro would reset every action to 20 runs
+        # remaining and look like the gate was broken.
+        #
+        # Guarded because a ledger write must never take down a completed action:
+        # the action already happened, and a disk error here is not the user's
+        # problem. A dropped record only makes the action MORE gated, which is
+        # the safe direction.
+        if confirmed and step["action"]:
+            try:
+                reliability.record(step["action"], success=not failed)
+            except Exception as e:
+                print(f"[reliability] failed to record {step['action']}: {e!r}")
 
         results.append(result)
 

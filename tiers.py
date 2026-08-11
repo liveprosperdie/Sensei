@@ -27,12 +27,13 @@ combinations still run, because a maintainer testing a specific pairing needs
 them to. The concrete failures:
 
 1. HEAD=free + SERVANT=free/standard  ->  NOTHING WORKS.
-   servant_clients' documented policy is that ServantUnavailable makes the
-   CALLER fall back to its brain-tier model. That fallback assumes a working
-   brain. Free Head is inert (no Gemini routing adapter, see head() below) and
-   Free/Standard Servant is inert (no local runtime), so the fallback chain
-   terminates in nothing. This is the default-install state and it is why Free
-   tier is not a usable configuration today.
+   Free Head is inert (no Gemini routing adapter, see head() below) and
+   Free/Standard Servant is inert (no local runtime, and servant_allowed()
+   refuses to escalate to hosted inference on those tiers). Neither layer can
+   serve and neither may substitute for the other, so this configuration does
+   nothing at all. This is the default-install state, and it is why Free tier is
+   not a usable configuration today. That is a true statement about the current
+   build, not a defect introduced here.
 
 2. GUARD_MODE=standard|pro + SERVANT_GATED=free  ->  CONTRADICTION.
    Guard mode enables the serial Gated path while the Servant layer says Gated
@@ -151,6 +152,26 @@ class ServantSpec:
 
 
 @dataclass(frozen=True)
+class GatedSeat:
+    """Permission to OFFER Gated actions at a tier. Deliberately not a model spec.
+
+    A distinct type from ServantSpec because the two answer different questions
+    and share no field that would make sense in both. Truthy whenever it exists:
+    the only way for Gated to be unpermitted is Free, which returns Unavailable
+    instead of a seat — so there is no falsy GatedSeat and no ambiguous middle
+    state for a caller to misread.
+    """
+    plan: str
+    adapters: bool = False
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __str__(self) -> str:
+        return f"Gated actions available on {self.plan} tier"
+
+
+@dataclass(frozen=True)
 class GuardMode:
     plan: str
     parallel: bool            # race guard with execution for A / A-adjacent
@@ -256,16 +277,9 @@ def guard(plan: str | None = None):
 def servant(plan: str | None = None) -> ServantSpec:
     """Servant for A / A-adjacent work.
 
-    Per the tier table, hosted fallback exists on PRO only. The brief's
-    fallthrough rule is "hosted if available, otherwise a clear error" — on
-    Free and Standard no hosted row is configured, so those resolve to no
-    server. That is the strict reading of the table.
-
-    CONSEQUENCE, stated plainly: on Free/Standard every servant call site raises
-    ServantUnavailable and falls back to its brain-tier model per
-    servant_clients' documented policy. That is the pre-existing fail-open path,
-    so nothing breaks silently — calls get pricier, and on Free (inert Head)
-    they fail outright. See warnings() combination 1.
+    Per the tier table, hosted fallback exists on PRO only. On Free and Standard
+    the row is local-only, and no local runtime exists, so those resolve to no
+    server at all — the strict reading of the table.
     """
     plan = plan or plan_for(Layer.SERVANT)
     slot = LocalModel(plan, adapters=(plan in (STANDARD, PRO)))
@@ -273,8 +287,85 @@ def servant(plan: str | None = None) -> ServantSpec:
     return ServantSpec(plan, slot, hosted, adapters=slot.adapters)
 
 
+def servant_allowed(plan: str | None = None) -> Unavailable | None:
+    """May a servant-tier LLM call proceed on hosted infrastructure right now?
+
+    None = yes, Unavailable = no, with a reason.
+
+    WHY THIS EXISTS AS A SEPARATE GATE, AND WHY IT IS THE OPPOSITE OF
+    servant_clients' POLICY
+    ----------------------------------------------------------------
+    servant_clients documents a fail-OPEN policy: ServantUnavailable makes the
+    caller fall back to its brain-tier model (claude_handler.servant_or_none
+    returns None, and the call runs on paid Claude). That is correct for the
+    failure it was written for — a revoked GLM_API_KEY should degrade to
+    working-but-pricier, not to a broken feature.
+
+    It is the WRONG behaviour for a tier decision, and the difference is intent.
+    An unset key is an accident, so absorbing it is a kindness. A Free tier is a
+    deliberate instruction not to spend money. Routing a Free-tier servant call
+    up to paid Claude would honour the letter of "the feature still works" while
+    breaking the only promise the Free tier actually makes. Cost surprise is the
+    worst failure mode a tier system has, because the user cannot see it happen
+    and finds out from a bill.
+
+    So on Free/Standard this returns Unavailable and the call site must FAIL,
+    not escalate. That is a deliberate fail-CLOSED override of the module-level
+    fail-open policy, scoped to the tier check alone: a genuine mid-flight
+    ServantUnavailable on Pro still falls back exactly as before, because Pro
+    resolves to a hosted spec and never reaches this branch.
+
+    Consequence, stated plainly rather than softened: Free and Standard cannot
+    run servant-tier work at all today. Every such call fails with the reason
+    below. This is the intended meaning of "structurally present but inert" and
+    it is temporary — it resolves when a local runtime is wired to
+    LocalModel.resolve(), with no change to this function.
+    """
+    plan = plan or plan_for(Layer.SERVANT)
+    spec = servant(plan)
+    if spec:
+        return None  # Pro with a hosted key: proceed, normal fallback applies.
+
+    local = spec.local.resolve()
+    if plan == PRO:
+        # Pro is entitled to hosted fallback but no provider key is set. Distinct
+        # reason from Free/Standard: this is a missing-config problem the operator
+        # can fix, not a tier that forbids the spend.
+        return Unavailable(
+            "servant", plan,
+            f"{local.reason} Pro allows a hosted fallback, but neither "
+            f"TOGETHER_API_KEY nor FIREWORKS_API_KEY is set, so there is "
+            f"nothing to fall back to.")
+    return Unavailable(
+        "servant", plan,
+        f"{local.reason} The {plan} tier has no hosted servant fallback by "
+        f"design — it is not permitted to spend money on hosted inference. "
+        f"Set SENSEI_SERVANT_TIER=pro and a TOGETHER_API_KEY/FIREWORKS_API_KEY "
+        f"to allow hosted servant calls.")
+
+
 def servant_gated(plan: str | None = None):
-    """Servant for Gated work. Not available on Free, per the table."""
+    """Is the GATED CAPABILITY permitted at this tier? Not available on Free.
+
+    WHAT THIS DOES NOT ANSWER, and why that distinction is load-bearing
+    ------------------------------------------------------------------
+    This is a question about the CONFIRMATION FLOW, not about servant inference.
+    A Gated action is a destructive local operation — delete_files, shutdown_pc —
+    dispatched by executor.py after a spoken yes. Executing one needs no servant
+    model at all; the servant tier only matters for LLM sub-calls some of those
+    actions happen to make.
+
+    An earlier version returned servant(plan) here, which conflated the two: a
+    ServantSpec is falsy when no hosted servant is configured, so on Standard and
+    Pro this reported "Gated unavailable" for the unrelated reason that no local
+    runtime exists. That suppressed the ENTIRE Gated path — including the
+    reliability gate, which was never even consulted because the caller returned
+    early. verify_tiers caught it as three failures.
+
+    So tier permission is answered from the plan alone. Whether a servant model
+    can be reached is servant_allowed()'s question, asked separately by the call
+    sites that actually need inference.
+    """
     plan = plan or plan_for(Layer.SERVANT_GATED)
     if plan == FREE:
         return Unavailable(
@@ -282,7 +373,7 @@ def servant_gated(plan: str | None = None):
             "Gated actions are not available on the Free tier. Set "
             "SENSEI_SERVANT_GATED_TIER=standard to enable them with the full "
             "confirmation flow.")
-    return servant(plan)
+    return GatedSeat(plan, adapters=(plan == PRO))
 
 
 def guard_mode(plan: str | None = None) -> GuardMode:
@@ -353,9 +444,9 @@ def warnings() -> list[str]:
 
     if h == FREE and s in (FREE, STANDARD):
         out.append(
-            "HEAD=free + SERVANT=%s: nothing will work. Servant failures fall "
-            "back to the brain, and the Free brain is inert, so the fallback "
-            "chain ends nowhere. Set SENSEI_HEAD_TIER=standard." % s)
+            "HEAD=free + SERVANT=%s: nothing will work. The Free Head is inert "
+            "and the %s Servant may not escalate to hosted inference, so "
+            "neither layer can serve. Set SENSEI_HEAD_TIER=standard." % (s, s))
     if sg == FREE and gm in (STANDARD, PRO):
         out.append(
             f"GUARD_MODE={gm} + SERVANT_GATED=free: the serial Gated path and "
@@ -376,7 +467,7 @@ def summary() -> dict:
         "plans": {l.value: plan_for(l) for l in Layer},
         "head": str(head()),
         "guard": str(guard()),
-        "servant": str(servant().hosted or servant().local.resolve()),
+        "servant": str(servant_allowed() or servant().hosted),
         "servant_gated": str(servant_gated()),
         "guard_mode": guard_mode(),
         "reliability": {"mode": reliability.MODE,
