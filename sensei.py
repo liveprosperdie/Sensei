@@ -16,6 +16,7 @@ import openwakeword
 import claude_handler
 import llm_json
 import action_guard
+import action_router
 import background_tasks
 import system_control
 import office_control
@@ -439,6 +440,94 @@ def _announce_background() -> bool:
 
 # ── Action execution ───────────────────────────────────────────────────────��──
 
+def _guard_refusal_text(action: str, outcome) -> str:
+    """Spoken text for a step the guard stopped BEFORE it ran.
+
+    Worded so the failure scan in handle_response sees it as a failure: a
+    refusal that read as success would let the LLM's pre-baked "doing it now"
+    text be spoken over an action that never happened.
+    """
+    why = "; ".join(outcome.verdict.reasons) or "it looked unsafe"
+    return f"I didn't run {action.replace('_', ' ')} — {why}."
+
+
+def _guard_flag_pending(action: str, outcome) -> str:
+    """Handle a guard flag that arrived on a step which ALREADY ran.
+
+    WHY NO NEW STATE IS NEEDED. The existing machine has exactly three shapes,
+    and this case fits the first without extension:
+
+      pending_action = "click_confirmed" + pending_execute = <callable>
+          "I have one concrete thing to do once you say yes."
+      pending_action = [steps]        "run these once you say yes."
+      pending_action = <action name>  same, single step.
+
+    A mid-flight flag needs "here is what I'd do about it once you say yes" —
+    the first shape exactly, with the callable being a ROLLBACK rather than the
+    original action. So no fourth state is introduced.
+
+    Reached only for rollback-safe steps: action_router.parallel_ok() lets the
+    guard race execution only where ROLLBACK says the effect is undoable.
+    Everything else was resolved serially before anything ran.
+
+    HONEST LIMIT, stated rather than papered over: this repo has no per-action
+    undo implementations. The rollback-safe table records that an undo is
+    POSSIBLE (unlink the file just created, restore the previous wallpaper), not
+    that one is written. So this does NOT fabricate a rollback callable it
+    cannot honour, and therefore does not set pending_execute — it reports the
+    flag and halts the chain. Writing the undo closures is a separate per-action
+    job, and the ROLLBACK table is the specification for it. Claiming a rollback
+    that does not exist would be worse than not offering one.
+    """
+    why = "; ".join(outcome.verdict.reasons) or "it may not have been safe"
+    verb = action.replace("_", " ")
+    if outcome.blocked:
+        print(f"[guard] BLOCK arrived after {action} executed: {why}")
+        return (f"Heads up — I already ran {verb}, but on review it shouldn't "
+                f"have gone through: {why}. I've stopped there.")
+    print(f"[guard] FLAG arrived after {action} executed: {why}")
+    return (f"I ran {verb}, but worth flagging: {why}. "
+            "I've stopped there rather than carrying on.")
+
+
+def _guard_gated(actions: list[dict]) -> tuple[list[dict], list[str]]:
+    """Guard gated steps BEFORE their confirmation is spoken.
+
+    The rule that does NOT change: a gated action still never skips
+    confirmation, whatever the guard says. Clearing the guard does not grant
+    permission — it only earns the step the right to be OFFERED. So an ALLOW
+    changes nothing observable; only a BLOCK does, by dropping the step so the
+    user is never asked to approve something malformed. Asking for consent to a
+    broken step would launder a bug into approval — the same reasoning
+    guard_rules uses for static BLOCK.
+
+    A FLAG is deliberately NOT filtered: flag means "a human should decide", and
+    the confirmation prompt this sits in front of IS that human deciding.
+
+    Returns (steps_still_offered, spoken_notes).
+    """
+    kept: list[dict] = []
+    notes: list[str] = []
+    for step in actions:
+        if not isinstance(step, dict):
+            continue
+        # execute=no-op: this is a validation pass only. Nothing may run before
+        # the user has confirmed, so the callable must be inert by construction
+        # rather than by the router happening not to call it.
+        outcome = action_router.run_guarded(step, lambda: None)
+        if outcome.blocked:
+            why = "; ".join(outcome.verdict.reasons) or "it looked malformed"
+            name = str(step.get("action") or "that").replace("_", " ")
+            print(f"[guard] gated BLOCK, not offering {name}: {why}")
+            notes.append(f"I'm not going to offer {name} — {why}.")
+            continue
+        if outcome.flagged:
+            print(f"[guard] gated FLAG on {step.get('action')}: "
+                  f"{'; '.join(outcome.verdict.reasons)}")
+        kept.append(step)
+    return kept, notes
+
+
 def run_actions(response: dict, step_results: dict | None = None) -> list:
     """
     Execute one or many actions with dependency graph support.
@@ -528,11 +617,38 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
             results.append(result)
             continue
 
-        try:
-            result = execute(step["action"], parameter)
-        except Exception as e:
-            print(f"[run_actions] EXCEPTION in execute: {e!r}")
-            result = f"Something went wrong running {step['action']}: {e}"
+        # GUARD + EXECUTE, timed by the step's tier (action_router).
+        # For Tier A / A-adjacent rollback-safe steps the guard runs on a worker
+        # thread WHILE this executes, so the cost is max(guard, execute) rather
+        # than the sum. For everything else the guard runs first and blocking.
+        # The router owns that decision; run_actions only reacts to the outcome.
+        #
+        # Gated steps never reach here un-confirmed — handle_response routes them
+        # into pending_actions above — so this is not the gated guard seam. That
+        # one lives in _guard_gated(), called before the confirmation is spoken.
+        guard_step = {"action": step["action"], "parameter": parameter}
+        outcome = action_router.run_guarded(
+            guard_step, lambda a=step["action"], p=parameter: execute(a, p))
+        result = outcome.result
+
+        if not outcome.executed:
+            # Serial path refused before running. Nothing happened, so this is a
+            # clean failure: report it and let depends_on skip the rest.
+            result = _guard_refusal_text(step["action"], outcome)
+            if step_id:
+                step_results[step_id] = None
+                failed_ids.add(step_id)
+            results.append(result)
+            continue
+
+        # NOTE ON ORDER: the mid-flight guard flag is handled AFTER the two
+        # confirmation-pause branches below, not before them. A self-gating
+        # action (delete_files, move_files, organize_*) returns
+        # needs_confirmation INSTEAD of acting, and those same actions are
+        # FLAG-prone. Checking the flag first would break the chain and discard
+        # the spoken enumeration the user needs to answer — turning a working
+        # confirmation into silence. Since nothing has actually happened in that
+        # case, the existing pause is both safe and strictly more useful.
 
         # click confirmation — pause chain
         if isinstance(result, dict) and result.get("needs_click_confirmation"):
@@ -562,6 +678,17 @@ def run_actions(response: dict, step_results: dict | None = None) -> list:
 
         if step_id:
             step_results[step_id] = result
+
+        # Mid-flight guard flag: the step already ran and did NOT pause for
+        # confirmation, so this is the genuine race outcome. Reuses the existing
+        # pending_action machinery rather than adding a fourth state — see
+        # _guard_flag_pending for why, and for the rollback limitation.
+        # step_results is populated above first, so a later step that already
+        # consumed this value is unaffected by the halt.
+        if not outcome.verdict.allowed:
+            msg = _guard_flag_pending(step["action"], outcome)
+            results.append(msg)
+            break
 
         # AUDIT FIX: dict failures ({"success": False}) never entered
         # failed_ids — depends_on only skipped on string failures, so e.g.
@@ -611,6 +738,21 @@ def handle_response(response: dict) -> bool:
         # (includes risky shopping steps like checkout / place order / address)
         unsafe = [a for a in actions_to_run if _is_dangerous_step(a)]
         safe   = [a for a in actions_to_run if not _is_dangerous_step(a)]
+
+        # GATED GUARD SEAM — serial and blocking, before confirmation is built.
+        # Placed here, above BOTH confirmation branches, so it applies whether
+        # the safety net caught the step or the LLM gated it itself. The guard
+        # can only REMOVE a malformed step from the offer; it can never approve
+        # one into running, so the confirmation flow's behaviour is unchanged.
+        guard_notes_gated: list[str] = []
+        if unsafe:
+            unsafe, guard_notes_gated = _guard_gated(unsafe)
+            if not unsafe:
+                # Every gated step was refused on shape. There is nothing left to
+                # confirm, so do not ask a question with no action behind it.
+                response.pop("confirmation_required", None)
+                response.pop("pending_actions", None)
+                response["actions"] = safe
 
         if unsafe and not response.get("confirmation_required"):
             print(f"[handle_response] safety net caught: {[a['action'] for a in unsafe]}")
@@ -670,6 +812,14 @@ def handle_response(response: dict) -> bool:
         elif unverified:
             # can't confirm the outcome — don't let pre-baked text claim success
             response["response"] = "I ran that, but I couldn't verify it completed."
+
+        # A gated step the guard refused on shape must be SAID, not dropped in
+        # silence — otherwise the user hears a confirmation for two steps when
+        # three were planned and has no idea the third was discarded. Prepended
+        # so the refusal precedes whatever question or outcome follows it.
+        if guard_notes_gated:
+            response["response"] = " ".join(
+                [*guard_notes_gated, response.get("response", "")]).strip()
 
         # feed execution outcomes back into LLM history — without this the
         # next turn can't see what list_folder/read_clipboard/delete_files
