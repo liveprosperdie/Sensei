@@ -19,6 +19,7 @@ import action_guard
 import action_router
 import tiers
 import reliability
+import hardware_gate
 import background_tasks
 import system_control
 import office_control
@@ -76,6 +77,26 @@ print(f"[tiers] gated={_tier_config['servant_gated']}")
 print(f"[tiers] reliability={_tier_config['reliability']}")
 for _w in _tier_config["warnings"]:
     print(f"[tiers] WARNING: {_w}")
+
+# Detected local-inference hardware, printed once alongside the tier banner and
+# for the same reason: when local models are eventually wired up, "why is it not
+# using the local model" will be answered by RAM/VRAM/GPU facts that are
+# otherwise invisible. Printing the real measured numbers at boot means the
+# answer is already in the log rather than requiring a repro.
+#
+# can_serve_local is always False in this build (no local inference runtime
+# exists) and the banner says so explicitly, so an operator reading capable
+# hardware here does not conclude a local model is running.
+_hw_config = hardware_gate.summary()
+print(f"[hardware] capability={_hw_config['capability']} "
+      f"detected={_hw_config['detected']}")
+print(f"[hardware] local_serving={_hw_config['can_serve_local']} "
+      f"({_hw_config['runtime']})")
+if not _hw_config["thresholds"]["measured"]:
+    print("[hardware] NOTE: capability thresholds are placeholder estimates, "
+          "not measured against a real local model")
+for _e in _hw_config["probe_errors"]:
+    print(f"[hardware] PROBE: {_e}")
 
 mic = pyaudio.PyAudio()
 stream = mic.open(format=pyaudio.paInt16, channels=1, rate=16000,
