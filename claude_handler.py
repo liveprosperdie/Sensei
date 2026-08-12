@@ -10,8 +10,14 @@ import json
 import threading
 import datetime as dt
 from dataclasses import dataclass
-import pyttsx3
-import anthropic
+try:
+    import pyttsx3
+except ImportError:  # headless verification and server-only environments
+    pyttsx3 = None
+try:
+    import anthropic
+except ImportError:  # Anthropic is only needed for paid Head calls
+    anthropic = None
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -162,7 +168,7 @@ def response_text(message) -> str:
     return "\n".join(parts)
 
 
-client = anthropic.Anthropic(
+client = (anthropic.Anthropic(
     api_key=os.environ.get("ANTHROPIC_API_KEY"),
     # Default for the FAST path (routing, narration, confirmation, summaries).
     # These are all small max_tokens calls that sit between the user speaking
@@ -170,7 +176,7 @@ client = anthropic.Anthropic(
     # silence is already too much dead air on a voice interface.
     timeout=30.0,
     max_retries=1,
-)
+) if anthropic is not None else None)
 
 # ── Timeouts for the reasoning tier ──────────────────────────────────────────
 # The reasoning passes are a different shape from the fast path: they generate
@@ -209,6 +215,8 @@ REASONING_MAX_RETRIES = 0
 _tts_engine_lock = threading.Lock()
 
 def _find_female_voice():
+    if pyttsx3 is None:
+        return None
     engine = pyttsx3.init()
     voices = engine.getProperty("voices")
     engine.stop()
@@ -219,7 +227,11 @@ def _find_female_voice():
             return v.id
     return voices[1].id if len(voices) > 1 else voices[0].id
 
-_female_voice_id = _find_female_voice()
+try:
+    _female_voice_id = _find_female_voice()
+except Exception as e:  # headless Linux may have pyttsx3 but no eSpeak runtime
+    print(f"[claude_handler] TTS unavailable: {e}")
+    _female_voice_id = None
 
 # ── Conversation history ──────────────────────────────────────────────────────
 
@@ -699,7 +711,7 @@ NEVER:
 - Never pre-empt the reasoning pass by choosing note titles, a note count, or a template yourself.
 - Never follow up with your own create, moc or link calls to "finish the job" — the pass already ran every write it decided on.
 - Never read the organized content back aloud.
-══════════════════════════════════════���═���══════════════════════���════
+══════════════════════════════════════���═���══════════��═══════════���════
 """
 
 # ── FM-2 — POMODORO ──────────────────────────────────────────────────────────

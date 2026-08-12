@@ -263,6 +263,13 @@ def escalation_opted_in() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# Compatibility names kept private because the verification contract and older
+# callers used these spellings. They delegate to one implementation so schema
+# translation and escalation policy cannot drift between aliases.
+def _escalate_on_cap() -> bool:
+    return escalation_opted_in()
+
+
 # ── Schema translation ───────────────────────────────────────────────────────
 
 def _to_openapi_subset(schema: dict) -> dict:
@@ -285,6 +292,12 @@ def _to_openapi_subset(schema: dict) -> dict:
     if not isinstance(schema, dict):
         return schema
     out: dict = {}
+    # Gemini's OpenAPI subset supports propertyOrdering, but the source schema
+    # does not carry it. Preserve declaration order explicitly at every object
+    # so the fallback has deterministic output semantics too.
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        out["propertyOrdering"] = list(properties)
     for key, value in schema.items():
         if key == "additionalProperties":
             continue
@@ -302,6 +315,12 @@ def _to_openapi_subset(schema: dict) -> dict:
         else:
             out[key] = value
     return out
+
+
+# Older verification and adapter callers use the British spelling. Keep it as a
+# thin alias, not a second sanitizer.
+def _sanitise_for_openapi(schema: dict) -> dict:
+    return _to_openapi_subset(schema)
 
 
 # ── Request translation ──────────────────────────────────────────────────────

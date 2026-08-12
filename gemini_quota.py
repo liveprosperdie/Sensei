@@ -46,7 +46,7 @@ DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", "250"))
 # in-flight turn to finish.
 STOP_AT = max(1, (DAILY_LIMIT * 9) // 10)
 
-QUOTA_FILE = os.path.join(
+QUOTA_FILE = os.environ.get("SENSEI_GEMINI_QUOTA_FILE") or os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
     "Sensei", "gemini_quota.json")
 
