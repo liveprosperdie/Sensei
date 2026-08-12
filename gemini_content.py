@@ -13,8 +13,6 @@ https://aistudio.google.com/apikey. This is a different product and key
 type from the Workspace OAuth client id/secret; the two are unrelated.
 """
 
-import datetime
-import json
 import os
 
 import requests
@@ -89,7 +87,10 @@ def generate(brief: str, format_instructions: str = "",
     except requests.RequestException as e:
         return {"success": False, "message": f"Gemini request failed: {e}"}
 
-    _bump_quota()  # count every attempt that reached Google, including errors
+    # Count every attempt that reached Google, including errors. purpose= is
+    # recorded so the shared counter can say WHICH consumer spent the
+    # allowance — "quota gone, no idea what used it" is not debuggable.
+    gemini_quota.record(_PURPOSE)
 
     if resp.status_code == 429:
         return {"success": False,
