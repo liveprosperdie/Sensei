@@ -7,8 +7,14 @@ WHAT THIS CAN AND CANNOT PROVE
 CAN, with no API key and no network:
   - translation of ROUTING_SCHEMA into what Gemini accepts, including the two
     constructs the OpenAPI-subset `responseSchema` rejects outright
-    (additionalProperties, union "type" lists)
+    (additionalProperties, union "type" lists) — against BOTH a hostile fixture
+    and the real ROUTING_SCHEMA, since those can drift apart
+  - FAIL-CLOSED parsing: every malformed, blocked or truncated Gemini response
+    becomes a spoken refusal, never {"mode": "command", "actions": []}, which
+    would be indistinguishable from deciding to do nothing
   - the shared daily counter is genuinely shared, and attributes by purpose
+  - every `gemini_quota.<attr>` call site in the tree resolves against the real
+    module, so the record()/bump() mismatch class of bug cannot reappear
   - every refusal path returns a SPOKEN, conversation-mode envelope rather than
     raising into the voice loop or executing actions
   - NO SILENT ESCALATION: a misconfigured/exhausted Free Head never quietly
@@ -25,6 +31,7 @@ than mocked into a false pass. A mocked HTTP 200 would only prove the mock.
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import sys
@@ -126,6 +133,61 @@ def test_schema_translation() -> None:
           "propertyOrdering keeps generated key order deterministic")
 
 
+def test_real_routing_schema() -> None:
+    """The hand-written fixture above proves the sanitiser's rules. This proves
+    it against the ACTUAL ROUTING_SCHEMA the adapter will be handed — the two
+    can diverge the moment someone edits the real schema, and a fixture-only
+    test would keep passing while production broke."""
+    try:
+        import claude_handler as ch
+    except ModuleNotFoundError as e:
+        skip("real-schema/translates", f"{e} (third-party dep)")
+        return
+
+    real = ch.ROUTING_SCHEMA
+
+    def walk(node, found):
+        if isinstance(node, dict):
+            if "additionalProperties" in node:
+                found["addl"] = True
+            if isinstance(node.get("type"), list):
+                found["union"] = True
+            for v in node.values():
+                walk(v, found)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, found)
+        return found
+
+    before = walk(real, {})
+    # If this ever fails, the premise of the whole responseJsonSchema decision
+    # has changed and the fallback path needs revisiting, not silently trusting.
+    check("real-schema/uses-constructs-openapi-rejects",
+          before.get("addl") or before.get("union"),
+          "ROUTING_SCHEMA is why responseJsonSchema is the primary path; if it "
+          "no longer uses these, re-evaluate that choice deliberately")
+
+    after = walk(gemini_head._sanitise_for_openapi(real), {})
+    check("real-schema/translates",
+          not after.get("addl") and not after.get("union"),
+          "the OpenAPI fallback must accept the real schema, not just a fixture")
+
+    # responseJsonSchema is sent verbatim, so it must at least be JSON-encodable.
+    try:
+        json.dumps(gemini_head._generation_config(real))
+        check("real-schema/generation-config-serialises", True)
+    except (TypeError, ValueError) as e:
+        check("real-schema/generation-config-serialises", False, repr(e))
+
+    cfg = gemini_head._generation_config(real)
+    check("real-schema/primary-path-is-responseJsonSchema",
+          "responseJsonSchema" in cfg and "responseSchema" not in cfg,
+          "responseSchema would reject this schema outright — it is the "
+          "fallback, never the default")
+    check("real-schema/requests-json-mimetype",
+          cfg.get("responseMimeType") == "application/json")
+
+
 # --------------------------------------------------------------------------
 # Shared quota. Two private counters would each think they owned the whole
 # allowance and together permit ~2x the real cap.
@@ -159,6 +221,39 @@ def test_shared_quota() -> None:
     check("quota/corrupt-file-reads-as-zero",
           _corrupt_reads_zero(),
           "a corrupt counter must never be the reason a turn dies")
+
+
+def test_quota_call_sites_exist() -> None:
+    """A `gemini_quota.bump()` call against a module that only defines
+    `record()` shipped once and was caught only by running the code. Compiling
+    cannot catch it: an attribute error on a module is a RUNTIME error, and the
+    call site sits behind a network round trip that never executes offline.
+
+    So: parse every module for `gemini_quota.<attr>` references and assert each
+    one actually exists. This is cheap, and it fails at verification time
+    instead of on the user's first quota-consuming turn.
+    """
+    api = set(dir(gemini_quota))
+    bad: list[str] = []
+    seen = 0
+    for fname in sorted(f for f in os.listdir(".") if f.endswith(".py")):
+        try:
+            with open(fname, encoding="utf-8") as f:
+                tree = ast.parse(f.read(), filename=fname)
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "gemini_quota"):
+                seen += 1
+                if node.attr not in api:
+                    bad.append(f"{fname}:{node.lineno} gemini_quota.{node.attr}")
+
+    check("quota/every-call-site-resolves", not bad,
+          "; ".join(bad) or f"{seen} references checked against the real module")
+    check("quota/call-sites-actually-found", seen > 0,
+          "if this finds nothing the check is vacuous and would pass forever")
 
 
 def _corrupt_reads_zero() -> bool:
@@ -281,6 +376,173 @@ def test_reply_duck_type() -> None:
         skip("shape/claude-shim-matches", f"{e} (third-party dep)")
 
 
+class _FakeResp:
+    """The narrow slice of requests.Response that _parse touches.
+
+    Deliberately NOT a mocked HTTP 200 with a valid body — that would only prove
+    the mock. These are the MALFORMED shapes Google really returns (safety
+    blocks, truncation, empty candidates), where the dangerous outcome is an
+    empty plan being read as 'correctly decided to do nothing'.
+    """
+
+    def __init__(self, payload, *, raw: str | None = None):
+        self._payload = payload
+        self.status_code = 200
+        self.text = raw if raw is not None else json.dumps(payload)
+
+    def json(self):
+        if self._payload is _INVALID:
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+        return self._payload
+
+
+_INVALID = object()
+
+
+def _refused(reply) -> bool:
+    """True if this reply is a spoken, non-executable refusal."""
+    try:
+        payload = json.loads(reply.content[0].text)
+    except (AttributeError, IndexError, ValueError):
+        return False
+    return (payload.get("mode") == "conversation"
+            and bool(payload.get("response"))
+            and not payload.get("actions")
+            and not payload.get("action"))
+
+
+def test_parse_fails_closed() -> None:
+    """Every malformed response must become a refusal, never an empty plan.
+
+    {"mode": "command", "actions": []} reaching the executor is indistinguishable
+    from a correct decision to do nothing — that is the silent failure this whole
+    layer exists to prevent.
+    """
+    cases = [
+        ("non-json-body", _FakeResp(_INVALID, raw="<html>502</html>")),
+        ("prompt-blocked", _FakeResp({"promptFeedback": {"blockReason": "SAFETY"}})),
+        ("no-candidates", _FakeResp({"candidates": []})),
+        ("missing-candidates-key", _FakeResp({})),
+        ("empty-parts", _FakeResp(
+            {"candidates": [{"content": {"parts": []}, "finishReason": "STOP"}]})),
+        ("whitespace-only-text", _FakeResp(
+            {"candidates": [{"content": {"parts": [{"text": "   \n"}]},
+                             "finishReason": "STOP"}]})),
+        ("safety-finish", _FakeResp(
+            {"candidates": [{"content": {"parts": [{"text": "{}"}]},
+                             "finishReason": "SAFETY"}]})),
+        ("recitation-finish", _FakeResp(
+            {"candidates": [{"content": {"parts": [{"text": "{}"}]},
+                             "finishReason": "RECITATION"}]})),
+        ("truncated-before-any-text", _FakeResp(
+            {"candidates": [{"content": {"parts": []},
+                             "finishReason": "MAX_TOKENS"}]})),
+        ("candidate-not-a-dict-shaped-content", _FakeResp(
+            {"candidates": [{"content": None, "finishReason": "STOP"}]})),
+    ]
+    for name, resp in cases:
+        try:
+            reply = gemini_head._parse(resp, used=1)
+        except Exception as e:                                    # noqa: BLE001
+            check(f"failclosed/{name}", False,
+                  f"raised {e!r} into the voice loop instead of refusing")
+            continue
+        check(f"failclosed/{name}", _refused(reply),
+              "a malformed response must refuse, not become an empty plan")
+
+    # Truncation WITH partial text is the one case that passes text through —
+    # but it must be flagged as max_tokens so downstream refuses to execute it.
+    trunc = gemini_head._parse(_FakeResp(
+        {"candidates": [{"content": {"parts": [{"text": '{"mode": "comm'}]},
+                         "finishReason": "MAX_TOKENS"}]}), used=1)
+    check("failclosed/truncated-marks-max-tokens",
+          trunc.stop_reason == "max_tokens",
+          "ask_akira keys on this exact string to reject a cut-off envelope; "
+          "'end_turn' here would hand a half-parsed plan to the executor")
+
+    # And a genuinely well-formed response must NOT be refused, or the gate
+    # above would pass trivially by refusing everything.
+    good = gemini_head._parse(_FakeResp(
+        {"candidates": [{"content": {"parts": [{"text": '{"mode": "conversation",'
+                                                        ' "response": "hi"}'}]},
+                         "finishReason": "STOP"}]}), used=1)
+    check("failclosed/valid-response-passes-through",
+          good.stop_reason == "end_turn",
+          "if this fails the fail-closed checks are vacuous — everything refuses")
+
+
+def test_capped_head_refuses_end_to_end() -> None:
+    """Cap exhaustion driven through route(), not just the policy helper.
+
+    The pre-flight cap check sits before the HTTP call, so this runs fully
+    offline with a bogus key: if it ever reached the network the test would fail
+    loudly rather than quietly passing.
+    """
+    saved_key = os.environ.get("GEMINI_API_KEY")
+    saved_esc = os.environ.get("SENSEI_HEAD_ESCALATE_ON_CAP")
+    path = os.environ["SENSEI_GEMINI_QUOTA_FILE"]
+    try:
+        os.environ["GEMINI_API_KEY"] = "bogus-key-must-not-be-used"
+        os.environ.pop("SENSEI_HEAD_ESCALATE_ON_CAP", None)
+        # Exhaust the counter directly rather than making STOP_AT real calls.
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"date": __import__("datetime").date.today().isoformat(),
+                       "count": gemini_quota.STOP_AT + 5,
+                       "by_purpose": {"head_routing": gemini_quota.STOP_AT + 5}}, f)
+        check("cap/exhausted-precondition", gemini_quota.exhausted(),
+              "the rest of this test is meaningless if the cap isn't reached")
+
+        reply = gemini_head.route([{"role": "user", "content": "open notepad"}],
+                                  [{"text": "system"}], None)
+        check("cap/capped-route-refuses", _refused(reply),
+              "a capped Free Head must speak a refusal, not execute or raise")
+        spoken = json.loads(reply.content[0].text)["response"].lower()
+        check("cap/refusal-mentions-the-cap",
+              "limit" in spoken or "allowance" in spoken or "used up" in spoken,
+              f"user must hear WHY: {spoken[:70]}")
+        check("cap/refusal-does-not-auto-upgrade",
+              "won't do that on my own" in spoken or "switch to the paid" in spoken,
+              "the refusal must state that it is NOT silently upgrading")
+
+        # Opted in -> raises the explicit escalation signal, never a silent switch.
+        os.environ["SENSEI_HEAD_ESCALATE_ON_CAP"] = "1"
+        try:
+            gemini_head.route([{"role": "user", "content": "x"}],
+                              [{"text": "s"}], None)
+            check("cap/optin-raises-explicit-signal", False,
+                  "escalation must be an exception a caller opts into catching")
+        except gemini_head.CapReachedEscalate:
+            check("cap/optin-raises-explicit-signal", True,
+                  "loud, catchable, and impossible to reach by accident")
+    finally:
+        for k, v in (("GEMINI_API_KEY", saved_key),
+                     ("SENSEI_HEAD_ESCALATE_ON_CAP", saved_esc)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def test_no_key_route_refuses_offline() -> None:
+    """No key -> refuse before any network attempt."""
+    saved = os.environ.get("GEMINI_API_KEY")
+    try:
+        os.environ.pop("GEMINI_API_KEY", None)
+        reply = gemini_head.route([{"role": "user", "content": "x"}],
+                                  [{"text": "s"}], None)
+        check("failclosed/no-key-refuses-without-network", _refused(reply),
+              "must not attempt a request it knows cannot succeed")
+    finally:
+        if saved is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = saved
+
+
 def test_readiness_is_offline() -> None:
     saved = os.environ.get("GEMINI_API_KEY")
     try:
@@ -336,8 +598,11 @@ def main() -> int:
     print("=" * 68)
     print("Gemini Head adapter verification (Prompt 6)")
     print("=" * 68)
-    for fn in (test_schema_translation, test_shared_quota,
+    for fn in (test_schema_translation, test_real_routing_schema,
+               test_shared_quota, test_quota_call_sites_exist,
                test_no_silent_escalation, test_cap_refuses_by_default,
+               test_parse_fails_closed, test_capped_head_refuses_end_to_end,
+               test_no_key_route_refuses_offline,
                test_reply_duck_type, test_readiness_is_offline,
                test_tiers_integration):
         print(f"\n--- {fn.__name__} ---")
