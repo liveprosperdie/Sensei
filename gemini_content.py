@@ -20,6 +20,8 @@ import os
 import requests
 from dotenv import load_dotenv
 
+import gemini_quota
+
 load_dotenv()
 
 # "gemini-flash-latest" is Google's ROLLING alias for the current Flash
@@ -32,40 +34,18 @@ _MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
 _URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-# Google no longer publishes fixed free-tier RPD in the docs — limits are
-# per-project and shown only in the AI Studio dashboard. 250/day is the most
-# conservative figure the 2.5-flash free tier has carried, so it's the safe
-# default; set GEMINI_DAILY_LIMIT to your project's real number from AI
-# Studio. We hard-stop at 90% of the limit to leave a safety margin.
-_DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", "250"))
-_STOP_AT = max(1, (_DAILY_LIMIT * 9) // 10)
-
-_QUOTA_FILE = os.path.join(
-    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-    "Sensei", "gemini_quota.json")
+# QUOTA MOVED TO gemini_quota (2026-08). The limit, the 90% safety stop and the
+# counter file all live there now, unchanged in format and path, because ROUTING
+# (gemini_head) draws on the SAME per-project daily allowance as this module.
+# Two private counters would each have believed they owned the whole allowance
+# and together sailed through roughly twice the real cap — see that module's
+# docstring. Names kept as aliases so the call sites below read the same.
+_STOP_AT = gemini_quota.STOP_AT
+_PURPOSE = "content_generation"
 
 # "short" is the default everywhere so a plain "make me a doc about X"
 # never triggers a 20-page generation nobody asked for.
 _LENGTH_WORDS = {"short": 400, "detailed": 2500}
-
-
-def _quota_used_today() -> int:
-    try:
-        with open(_QUOTA_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        if data.get("date") == datetime.date.today().isoformat():
-            return int(data.get("count", 0))
-    except (OSError, ValueError):
-        pass
-    return 0
-
-
-def _bump_quota() -> None:
-    os.makedirs(os.path.dirname(_QUOTA_FILE), exist_ok=True)
-    data = {"date": datetime.date.today().isoformat(),
-            "count": _quota_used_today() + 1}
-    with open(_QUOTA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f)
 
 
 def generate(brief: str, format_instructions: str = "",
@@ -80,11 +60,15 @@ def generate(brief: str, format_instructions: str = "",
                 "message": "GEMINI_API_KEY isn't set. Get a free key at "
                            "aistudio.google.com/apikey and add it to the .env file."}
 
-    used = _quota_used_today()
+    used = gemini_quota.used_today()
     if used >= _STOP_AT:
+        # Wording now says "free Gemini quota" rather than
+        # "content-generation quota": the allowance is shared with routing, so
+        # naming only this module's use of it would misdescribe what ran out.
         return {"success": False,
-                "message": "Free content-generation quota reached for today, "
-                           "try again tomorrow or ask for something shorter."}
+                "message": "Free Gemini quota reached for today (shared with "
+                           "voice routing), try again tomorrow or ask for "
+                           "something shorter."}
 
     words = _LENGTH_WORDS.get(length, _LENGTH_WORDS["short"])
     prompt = (f"Write the following content in roughly {words} words or fewer. "

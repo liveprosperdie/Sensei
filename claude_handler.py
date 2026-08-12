@@ -9,6 +9,7 @@ import copy
 import json
 import threading
 import datetime as dt
+from dataclasses import dataclass
 import pyttsx3
 import anthropic
 from dotenv import load_dotenv
@@ -698,7 +699,7 @@ NEVER:
 - Never pre-empt the reasoning pass by choosing note titles, a note count, or a template yourself.
 - Never follow up with your own create, moc or link calls to "finish the job" — the pass already ran every write it decided on.
 - Never read the organized content back aloud.
-══════════════════════════════════════���═���═══════════════════════════
+══════════════════════════════════════���═���══════════════════════���════
 """
 
 # ── FM-2 — POMODORO ──────────────────────────────────────────────────────────
@@ -1509,17 +1510,25 @@ def _action_enum() -> list[str] | None:
     return _action_enum_cache
 
 
+_routing_schema_cache: dict | None = None
 _routing_output_config_cache: dict | None = None
 
 
-def _routing_output_config() -> dict:
+def _routing_schema() -> dict:
     """ROUTING_SCHEMA with every "action" field pinned to the real action list.
+
+    PROVIDER-NEUTRAL ON PURPOSE. Anthropic wraps this in output_config.format
+    (see _routing_output_config), Gemini sends the same dict as
+    responseJsonSchema (see gemini_head.route). One builder, one cache, so the
+    two providers cannot drift onto different grammars — a Gemini-only copy of
+    this schema would go stale the first time an action was added, and the
+    symptom would be Free tier accepting an action name Standard tier rejects.
 
     Built lazily and cached because the enum needs executor imported, and
     module import time is too early for that (see _action_enum).
     """
-    global _routing_output_config_cache
-    if _routing_output_config_cache is None:
+    global _routing_schema_cache
+    if _routing_schema_cache is None:
         schema = copy.deepcopy(ROUTING_SCHEMA)
         names = _action_enum()
         if names:
@@ -1532,8 +1541,16 @@ def _routing_output_config() -> dict:
             props["action"]["enum"] = names
             props["actions"]["items"]["properties"]["action"]["enum"] = names
             props["pending_actions"]["items"]["properties"]["action"]["enum"] = names
+        _routing_schema_cache = schema
+    return _routing_schema_cache
+
+
+def _routing_output_config() -> dict:
+    """Anthropic's structured-output wrapper around _routing_schema()."""
+    global _routing_output_config_cache
+    if _routing_output_config_cache is None:
         _routing_output_config_cache = {
-            "format": {"type": "json_schema", "schema": schema}}
+            "format": {"type": "json_schema", "schema": _routing_schema()}}
     return _routing_output_config_cache
 
 # Flipped to False the first time the API rejects the schema, so a bad schema or
@@ -1543,8 +1560,84 @@ def _routing_output_config() -> dict:
 _structured_output_ok = True
 
 
+@dataclass(frozen=True)
+class _TextBlockShim:
+    """Minimal stand-in for an Anthropic TextBlock (see _refusal_reply)."""
+    text: str
+    type: str = "text"
+
+
+@dataclass(frozen=True)
+class _RefusalReply:
+    """A Claude-shaped reply carrying a spoken refusal.
+
+    Same duck-type as gemini_head.HeadReply and for the same reason: response_text
+    and ask_akira must not need to know a provider failed. Defined here rather
+    than imported from gemini_head because the refusal path exists precisely for
+    the case where gemini_head could not be imported or configured.
+    """
+    content: list
+    stop_reason: str | None = "end_turn"
+
+
+def _refusal_reply(spoken: str):
+    """conversation-mode envelope -> no actions can execute. See
+    gemini_head._refuse for the full reasoning on why this is an envelope
+    rather than a raised exception."""
+    print(f"[routing_call] refusing: {spoken}")
+    return _RefusalReply([_TextBlockShim(json.dumps(
+        {"mode": "conversation", "response": spoken, "end_session": False},
+        ensure_ascii=False))])
+
+
+def _head_dispatch() -> tuple[str, object]:
+    """Which provider serves Head this turn: ("claude"|"gemini"|"refuse", payload).
+
+    THE "refuse" BRANCH IS THE WHOLE POINT OF THIS FUNCTION. If the operator set
+    SENSEI_HEAD_TIER=free and GEMINI_API_KEY is missing, the honest answer is a
+    spoken "you are not set up", NOT a quiet promotion to paid Claude. Returning
+    "claude" there would be exactly the silent escalation the tier table, the
+    Guard, and the servant fallthrough all refuse to do — and it would be
+    invisible, because the assistant would simply work and the bill would arrive
+    later.
+
+    Any failure to resolve tiers at all degrades to Claude deliberately: that is
+    the pre-existing behaviour of this build, and a tier-config bug must not be
+    able to take the voice loop down. Free is the only plan that can refuse,
+    and it can only refuse when explicitly selected.
+    """
+    try:
+        import tiers
+    except Exception as e:                                        # noqa: BLE001
+        print(f"[routing_call] tiers unavailable, using Claude: {e!r}")
+        return "claude", None
+
+    try:
+        plan = tiers.plan_for(tiers.Layer.HEAD)
+        if plan != tiers.FREE:
+            return "claude", None
+        spec = tiers.head(plan)
+        if not spec:
+            return "refuse", str(getattr(spec, "reason", spec))
+        if getattr(spec, "provider", None) != "gemini":
+            return "claude", None
+        import gemini_head
+        return "gemini", gemini_head
+    except Exception as e:                                        # noqa: BLE001
+        # A resolution error on the FREE path must not fall through to paid
+        # Claude either — same cost-surprise reasoning as above.
+        print(f"[routing_call] Free Head resolution failed: {e!r}")
+        return "refuse", (f"I couldn't set up the free Gemini brain ({e}). "
+                          f"Switch to the paid tier if you want me to keep "
+                          f"going — I won't do that on my own.")
+
+
 def _routing_call(messages: list[dict], date_block: str):
     """The routing model call, schema-constrained where the API allows it.
+
+    Dispatches on the configured Head provider first. The Gemini path returns a
+    reply that duck-types this function's Anthropic return value, so ask_akira
+    and everything downstream are provider-agnostic — see gemini_head.
 
     output_config goes through extra_body rather than a named kwarg on purpose:
     requirements.txt pins no anthropic version, and extra_body is forwarded as
@@ -1552,6 +1645,19 @@ def _routing_call(messages: list[dict], date_block: str):
     this into a TypeError.
     """
     global _structured_output_ok
+
+    provider, payload = _head_dispatch()
+    if provider == "refuse":
+        return _refusal_reply(str(payload))
+    if provider == "gemini":
+        try:
+            return payload.route(messages, system_blocks(date_block),
+                                 _routing_schema())
+        except payload.CapReachedEscalate as e:
+            # Reached ONLY with SENSEI_HEAD_ESCALATE_ON_CAP explicitly on.
+            # Falling through to the paid Claude call below is the opted-in
+            # behaviour; gemini_head has already logged it loudly.
+            print(f"[routing_call] {e} — continuing on paid Claude")
 
     kwargs = dict(
         # BRAIN tier, but NOT BRAIN_MODEL — see the tier table. This runs on

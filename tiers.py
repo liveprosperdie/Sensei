@@ -26,14 +26,20 @@ Not softened, and not blocked — `warnings()` reports them at startup and the
 combinations still run, because a maintainer testing a specific pairing needs
 them to. The concrete failures:
 
-1. HEAD=free + SERVANT=free/standard  ->  NOTHING WORKS.
-   Free Head is inert (no Gemini routing adapter, see head() below) and
-   Free/Standard Servant is inert (no local runtime, and servant_allowed()
-   refuses to escalate to hosted inference on those tiers). Neither layer can
-   serve and neither may substitute for the other, so this configuration does
-   nothing at all. This is the default-install state, and it is why Free tier is
-   not a usable configuration today. That is a true statement about the current
-   build, not a defect introduced here.
+1. HEAD=free + SERVANT=free/standard  ->  ROUTING WORKS, SERVANT WORK DOES NOT.
+   This entry USED to read "nothing works", because Free Head was an inert slot
+   with no Gemini routing adapter. That is no longer true: gemini_head.py seats
+   Gemini as a real Head, so with GEMINI_API_KEY set the routing layer resolves
+   and voice turns are planned normally.
+
+   What remains genuinely broken is the SERVANT half — Free/Standard Servant is
+   still inert (no local runtime, and servant_allowed() refuses to escalate to
+   hosted inference on those tiers). So Akira can work out what to do and run
+   anything the executor handles directly, but any step needing servant
+   inference cannot serve. Free tier is now PARTIALLY usable rather than
+   entirely unusable, and the Free Head has a hard per-day request cap
+   (gemini_quota) shared with content generation — roughly 225 turns/day at the
+   conservative default, which caching cannot extend.
 
 2. GUARD_MODE=standard|pro + SERVANT_GATED=free  ->  CONTRADICTION.
    Guard mode enables the serial Gated path while the Servant layer says Gated
@@ -221,29 +227,46 @@ class LocalModel:
 def head(plan: str | None = None) -> HeadSpec | Unavailable:
     """Head (brain) for a plan.
 
-    FREE is inert BY VERIFICATION, not by omission. The table specifies the
-    Gemini free tier, and gemini_content.py does hold a working Gemini client
-    with the daily-cap pattern this row needs — but it is a CONTENT GENERATOR:
-    prompt in, prose out. The Head role needs tool/action routing, strict JSON
-    schema output, and the prompt-caching path claude_handler's routing depends
-    on. None of those exist for Gemini here, so there is no honest way to seat
-    it as Head.
+    FREE IS LIVE. It was an inert slot until the Gemini routing adapter existed;
+    gemini_head.py now provides the three things the Head role needs and
+    gemini_content.py never had — strict JSON-schema output matching
+    ROUTING_SCHEMA, the action-name grammar, and a documented prompt-caching
+    story (Gemini's implicit prefix caching, see that module's docstring).
 
-    It therefore returns Unavailable rather than quietly falling through to paid
-    Claude. Silent escalation would mean a user who chose Free to avoid spending
-    money spends it without being told, and cost surprise is the worst failure
-    mode a tier system can have.
+    The only remaining way for Free Head to be Unavailable is CONFIGURATION:
+    no GEMINI_API_KEY. That is a state the user can fix, and the reason says how.
+    Readiness is a config check only — no network call — because this function
+    is called from a startup banner and a status command.
+
+    Still no silent escalation to paid Claude, on either path: a user who chose
+    Free to avoid spending money must not be billed for crossing a line they
+    never saw. Mid-session cap exhaustion is handled in gemini_head (spoken
+    refusal; opt-in escalation only), not here — an exhausted daily allowance
+    means "set up and used up", which is not the same as "not set up", and
+    reporting it as layer-level unavailability would conflate the two.
     """
     plan = plan or plan_for(Layer.HEAD)
     if plan == FREE:
-        return Unavailable(
-            "Head", FREE,
-            "the Free Head is Gemini, but no Gemini routing adapter exists in "
-            "this build (gemini_content.py generates prose only — it has no "
-            "tool-routing or JSON-schema path). Set SENSEI_HEAD_TIER=standard "
-            "to use paid Claude, or build the adapter. Not falling back to paid "
-            "Claude automatically, because that would spend money you did not "
-            "agree to.")
+        # Imported lazily: gemini_head pulls in requests, and tiers is imported
+        # by headless verification that must not require it at module scope.
+        try:
+            import gemini_head
+        except Exception as e:                                    # noqa: BLE001
+            return Unavailable("Head", FREE,
+                               f"the Gemini Head adapter could not be imported "
+                               f"({e!r}). Set SENSEI_HEAD_TIER=standard to use "
+                               f"paid Claude.")
+        ok, reason = gemini_head.readiness()
+        if not ok:
+            return Unavailable("Head", FREE, reason)
+        return HeadSpec(FREE, "gemini", "GEMINI_HEAD_MODEL", "GEMINI_API_KEY",
+                        # 0.0, not None: None means UNMETERED in this dataclass,
+                        # and the free tier is the opposite of unmetered. It is
+                        # capped in REQUESTS PER DAY rather than dollars, which
+                        # no USD field can express — gemini_quota owns that
+                        # count. 0.0 states the true dollar budget: zero.
+                        daily_budget_usd=0.0,
+                        priority=False)
     if plan == STANDARD:
         return HeadSpec(STANDARD, "anthropic", "CLAUDE_MODEL", "ANTHROPIC_API_KEY",
                         daily_budget_usd=_budget("SENSEI_HEAD_BUDGET_USD", 5.0),
@@ -443,10 +466,15 @@ def warnings() -> list[str]:
                  plan_for(Layer.GUARD))
 
     if h == FREE and s in (FREE, STANDARD):
+        # No longer "nothing will work" — the Free Head is live. Reporting a
+        # stale catastrophic warning would train the operator to ignore this
+        # list, which is worse than not printing it at all.
         out.append(
-            "HEAD=free + SERVANT=%s: nothing will work. The Free Head is inert "
-            "and the %s Servant may not escalate to hosted inference, so "
-            "neither layer can serve. Set SENSEI_HEAD_TIER=standard." % (s, s))
+            "HEAD=free + SERVANT=%s: routing works (Gemini Head), but the %s "
+            "Servant may not escalate to hosted inference and has no local "
+            "runtime, so any step needing servant inference cannot serve. The "
+            "Free Head is also capped per day (shared with content generation). "
+            "Set SENSEI_SERVANT_TIER=pro for servant work." % (s, s))
     if sg == FREE and gm in (STANDARD, PRO):
         out.append(
             f"GUARD_MODE={gm} + SERVANT_GATED=free: the serial Gated path and "
