@@ -342,13 +342,42 @@ def rollback(action: str) -> Rollback:
 def parallel_ok(step: dict) -> bool:
     """Whether guard and execution may race for this step.
 
-    Requires BOTH a non-gated tier AND provable rollback safety. UNKNOWN counts
+    Requires THREE things: the tier policy must permit racing at all, the step
+    must be non-gated, and its rollback safety must be provable. UNKNOWN counts
     as unsafe, so adding an action to executor without a ROLLBACK entry makes it
     serial rather than silently racing — the failure direction that costs
     latency instead of correctness.
+
+    tiers.guard_mode().parallel is consulted rather than assumed. Every tier
+    currently sets it True, so this changes no behaviour today; it exists
+    because the flag was already declared as policy and a policy switch nothing
+    reads is worse than no switch — it reports a guarantee it cannot deliver.
+    Setting it False now genuinely forces every step onto the serial path, which
+    is the kill-switch you want when a guard starts flagging after the fact.
     """
+    if not _parallel_permitted():
+        return False
     return tier(step) is not Tier.GATED and \
         rollback(step.get("action")) is Rollback.SAFE
+
+
+def _parallel_permitted() -> bool:
+    """Tier policy on racing, resolved defensively.
+
+    Imported lazily: tiers pulls in servant_clients and reads the environment at
+    call time, and this module is deliberately importable (and unit-testable)
+    without that chain being live.
+
+    Any failure answers False — serial. That direction costs latency and never
+    correctness, matching how UNKNOWN rollback is treated above. A config module
+    that raises must not be able to widen what runs concurrently.
+    """
+    try:
+        import tiers
+        return bool(tiers.guard_mode().parallel)
+    except Exception as e:  # noqa: BLE001 - policy lookup must never propagate
+        print(f"[router] guard_mode unavailable ({e}); forcing serial")
+        return False
 
 
 @dataclass(frozen=True, slots=True)
