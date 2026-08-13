@@ -65,18 +65,41 @@ a single step is well-formed belongs in guard_rules. The two do not currently
 overlap — action_guard names search_image/download_image only to relate them,
 guard_rules only to type their parameters.
 
-NOT WIRED YET
--------------
-Nothing calls review() from the execution flow. Which actions consult the guard,
-and whether they do so before dispatch or alongside it, is the classification
-and timing work that comes next. This module is callable and testable on its
-own, and deliberately has no import of, or effect on, executor's dispatch.
+HOW THIS IS WIRED (an earlier "unwired" note here outlived the work it described)
+--------------------------------------------------------------------------------
+review() is never called from here by the execution flow directly. action_router
+owns every call, because "should the guard run before dispatch or alongside it"
+is a timing question and the router is what holds the tier table that answers
+it. This module still has no import of, and no effect on, executor's dispatch —
+the seam is sensei, exactly as originally predicted, not executor's ~83 call
+sites.
 
-When that wiring happens, sensei.run_actions() around the existing
-action_guard.sanitize_actions() call (sensei.py:462) is the natural seam: it is
-already the one place every chain passes through before anything executes, and it
-already returns spoken notes, which is the channel a FLAG needs. Guarding inside
-executor's dispatch instead would mean auditing ~83 call sites.
+There are four call sites, all in action_router, and they differ only in timing:
+
+  guard:gated    action_router.run_guarded, gated + not yet confirmed. Blocking,
+                 execute never invoked. Reached from sensei._guard_gated, which
+                 runs BEFORE the spoken confirmation is offered, so a malformed
+                 gated step is dropped instead of being read out for approval.
+                 An ALLOW here grants nothing: confirmation still happens.
+  guard:serial   run_guarded for anything not rollback-safe, AND for gated steps
+                 that the human has now approved (confirmed=True). Blocking;
+                 execute runs only if the verdict cleared.
+  guard:parallel run_guarded for Tier A / A-adjacent rollback-safe steps. Guard
+                 goes to a worker thread, execute stays on the caller's thread.
+  the same, via sensei.get_akira_response's confirmed branch, which routes the
+                 post-approval CLOSURE (the resolved targets, which no earlier
+                 guard call has seen) back through run_guarded(confirmed=True).
+
+Entry points into that machinery, for anyone tracing coverage:
+sensei.run_actions (every chain step) and sensei.get_akira_response (both
+post-confirmation shapes). verify_guard_wiring.py asserts there is no fifth
+path that reaches an executor closure without passing one of these.
+
+NOTES CHANNEL: guard refusals are appended to the same spoken-notes list that
+action_guard.sanitize_actions returns — chain-level notes first, then per-step
+guard notes in execution order. Concatenation, not merge: nothing is dropped or
+overwritten, and Verdict.merge already tightened static-vs-model disagreement
+within a single step before it got here.
 
 VERIFICATION STATUS
 -------------------

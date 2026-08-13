@@ -119,6 +119,12 @@ session_start_time   = 0.0
 pending_action    = None   # action name or list of actions
 pending_parameter = None
 pending_execute   = None   # callable for click confirmation
+# The action name a "click_confirmed" pause CAME FROM. pending_action is the
+# literal string "click_confirmed" for both self-gating shapes, which erases
+# which action is actually about to run — and the guard needs that name to pick
+# a rule. Kept as a separate slot rather than overloading pending_action,
+# because the confirmation branch dispatches on that exact string.
+pending_origin    = None
 
 # VAD barge-in state
 akira_speaking  = False
@@ -603,7 +609,7 @@ def run_actions(response: dict, step_results: dict | None = None,
     - click confirmation pause
     - failure tracking per step id
     """
-    global pending_action, pending_parameter, pending_execute
+    global pending_action, pending_parameter, pending_execute, pending_origin
 
     if step_results is None:
         step_results = {}
@@ -723,6 +729,7 @@ def run_actions(response: dict, step_results: dict | None = None,
             pending_action    = "click_confirmed"
             pending_parameter = result["retry_parameter"]
             pending_execute   = result["_execute"]
+            pending_origin    = step["action"]
             msg = f"Are you sure you want to click '{result['element_text']}'?"
             results.append(msg)
             if step_id:
@@ -737,6 +744,7 @@ def run_actions(response: dict, step_results: dict | None = None,
             pending_action    = "click_confirmed"
             pending_parameter = result["confirm_message"]
             pending_execute   = result["_execute"]
+            pending_origin    = step["action"]
             print(f"[run_actions] gated plan from {step['action']}: {result['confirm_message'][:80]!r}")
             results.append(result["confirm_message"])
             if step_id:
@@ -991,7 +999,7 @@ def get_akira_response(text: str) -> dict | None:
     Handles pending confirmation state before calling the LLM.
     Returns parsed dict or None (when confirmation was handled inline).
     """
-    global pending_action, pending_parameter, pending_execute
+    global pending_action, pending_parameter, pending_execute, pending_origin
 
     # handle pending confirmation
     if pending_action is not None:
@@ -1006,14 +1014,50 @@ def get_akira_response(text: str) -> dict | None:
         confirmed = claude_handler.ask_confirmation(text, pending_desc)
         if confirmed:
             if pending_action == "click_confirmed" and pending_execute is not None:
+                # The closure — not the original step — is what finally touches
+                # the world, and it carries the targets the executor RESOLVED
+                # (which files matched, which element was picked). The guard has
+                # only ever seen the unresolved request, so this is the last and
+                # only point where it can judge what will actually happen. Going
+                # through the router (rather than calling the closure directly)
+                # also keeps this path under the same serial-guard policy as the
+                # steps branch below; a bare call here was a hole through which
+                # every self-gating file op reached the disk unreviewed.
+                #
+                # pending_parameter is deliberately what gets screened: for a
+                # click it is the retry parameter, and for a file op it is the
+                # executor's RESOLVED enumeration. Screening the original request
+                # instead would show the guard nothing it had not already seen.
+                # guard_rules is arity-only, so prose passes; a '|' inside it
+                # would read as a second field and refuse. That is fail-closed,
+                # and '|' is illegal in Windows filenames, so the enumeration
+                # cannot grow one from a path.
+                #
+                # A missing origin also fails closed: "click_confirmed" is not a
+                # real action, so it has no rule and BLOCKs. verify_guard_wiring
+                # asserts the origin is always recorded, so that is a backstop
+                # rather than a path anyone should reach.
+                origin = pending_origin or "click_confirmed"
                 try:
-                    exec_result = pending_execute()
-                    # gated file-op closures return {"success", "message"} —
-                    # speak the real outcome instead of a generic "Done."
-                    if isinstance(exec_result, dict) and exec_result.get("message"):
-                        speak_text = exec_result["message"]
+                    outcome = action_router.run_guarded(
+                        {"action": origin, "parameter": pending_parameter},
+                        pending_execute, confirmed=True)
+                    if not outcome.executed:
+                        speak_text = _guard_refusal_text(origin, outcome)
+                        exec_result = speak_text
                     else:
-                        speak_text = "Done."
+                        exec_result = outcome.result
+                        # gated file-op closures return {"success", "message"} —
+                        # speak the real outcome instead of a generic "Done."
+                        if isinstance(exec_result, dict) and exec_result.get("message"):
+                            speak_text = exec_result["message"]
+                        else:
+                            speak_text = "Done."
+                        # Ran, then the guard objected. Say so instead of
+                        # reporting a clean success — there is no undo here, so
+                        # an accurate report is the only remedy available.
+                        if not outcome.verdict.allowed:
+                            speak_text = _guard_flag_pending(origin, outcome)
                     try:
                         claude_handler.record_action_results([exec_result if isinstance(exec_result, dict) else speak_text])
                     except Exception as e:
@@ -1050,10 +1094,12 @@ def get_akira_response(text: str) -> dict | None:
                     except Exception as e:
                         print(f"[v0] record_action_results failed: {e}")
             pending_action = pending_parameter = pending_execute = None
+            pending_origin = None
             speak_and_wait(speak_text)
             return None
         else:
             pending_action = pending_parameter = pending_execute = None
+            pending_origin = None
             # fall through to normal LLM call (user said something else)
 
     try:
