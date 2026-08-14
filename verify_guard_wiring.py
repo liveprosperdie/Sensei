@@ -258,6 +258,44 @@ def check_navigation_waits_for_verdict() -> None:
               "an allowed navigation still runs after the guard clears")
 
 
+def check_ledger_records_on_closure_path() -> None:
+    """Both execution paths must feed the reliability ledger, not just one.
+
+    reliability.record had exactly one call site, in run_actions, below a `break`
+    that every self-gating file action takes: delete_files and friends return a
+    needs_confirmation PLAN, the chain stops, and the real work happens later in
+    get_akira_response through the stored closure. Those action types therefore
+    accumulated zero history however many times they ran correctly — which turns
+    into a permanent lockout the moment they are classified Gated, because
+    tiers.gated_available() consults a bar nothing can ever record against.
+
+    Asserted STRUCTURALLY, and the reason is worth stating rather than hiding:
+    this path cannot be driven behaviourally in an offline gate, because reaching
+    it means importing sensei, which opens audio devices at import. The ledger's
+    own behaviour (streak, reset, threshold, persistence) is proved behaviourally
+    in verify_tiers.check_ledger; what is proved here is that the second
+    execution path actually calls it. Both halves are needed, and neither
+    substitutes for the other.
+    """
+    wanted = {"run_actions", "get_akira_response"}
+    found: set[str] = set()
+    for node in ast.walk(_sensei_tree()):
+        if not isinstance(node, ast.FunctionDef) or node.name not in wanted:
+            continue
+        for inner in ast.walk(node):
+            if (isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Attribute)
+                    and inner.func.attr == "record"
+                    and isinstance(inner.func.value, ast.Name)
+                    and inner.func.value.id == "reliability"):
+                found.add(node.name)
+                break
+    missing = sorted(wanted - found)
+    check("ledger/recorded-on-both-paths", not missing,
+          f"both of {sorted(wanted)} record to the reliability ledger"
+          if not missing else f"no reliability.record call in {missing}")
+
+
 def check_no_direct_closure_call() -> None:
     """`pending_execute()` must never be invoked directly in sensei.
 
@@ -360,6 +398,7 @@ def main() -> int:
     check_confirmed_gated_can_run()
     check_parallel_switch()
     check_navigation_waits_for_verdict()
+    check_ledger_records_on_closure_path()
     check_no_direct_closure_call()
     check_router_is_the_only_seam()
     check_origin_is_recorded()
