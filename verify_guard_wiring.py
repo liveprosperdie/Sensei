@@ -215,6 +215,49 @@ def _sensei_tree() -> ast.Module:
     return ast.parse(_read("sensei.py"))
 
 
+def check_navigation_waits_for_verdict() -> None:
+    """URL navigation must not start before the guard verdict resolves.
+
+    Regression gate for the audit's critical finding: open_url was ROLLBACK.SAFE
+    on the reasoning that "a page load is undoable". The tab is; the remote effect
+    is not. A one-click unsubscribe, a "confirm delete" link or a webhook URL has
+    already fired against a third party by the time a raced verdict is read, and
+    _handle_open_url screens nothing beyond the http(s) prefix.
+
+    Asserted by ORDERING rather than wall-clock timing, which is the stronger
+    claim available here: the guard stub records the moment it is consulted and
+    the closure records the moment it runs, so "execution began before a verdict
+    existed" is detectable directly instead of being inferred from elapsed time.
+    A BLOCK is used so the requirement is the one that actually matters — the
+    navigation must be WITHHELD, not merely sequenced after the call.
+    """
+    for action in ("open_url", "open_site_tab", "web_search"):
+        step = {"action": action, "parameter": "https://example.com/unsubscribe"}
+
+        # 1. Not racing: the parallel path is what allowed the request to leave
+        #    the machine before review returned.
+        check(f"nav/{action}-serial", not action_router.parallel_ok(step),
+              f"{action} is not eligible for the parallel path "
+              f"(rollback={action_router.rollback(action).value})")
+
+        # 2. A refusal withholds the navigation entirely.
+        outcome, stub, ran = _drive(step, decision=BLOCK)
+        label = stub.calls[0][2] if stub.calls else "none"
+        check(f"nav/{action}-blocked", (not ran) and (not outcome.executed),
+              f"BLOCK withheld navigation (label={label}, raced={outcome.raced})")
+
+        # 3. The verdict was reached serially, not concurrently. raced=False is
+        #    the router's own report that execute did not overlap review.
+        check(f"nav/{action}-not-raced", outcome.raced is False,
+              "router reports the verdict was resolved before execution")
+
+        # 4. The mirror: a clear verdict must still let navigation through, so
+        #    this fix cannot be "passing" because it broke open_url outright.
+        outcome_ok, _stub_ok, ran_ok = _drive(step, decision=ALLOW)
+        check(f"nav/{action}-allowed", ran_ok and outcome_ok.executed,
+              "an allowed navigation still runs after the guard clears")
+
+
 def check_no_direct_closure_call() -> None:
     """`pending_execute()` must never be invoked directly in sensei.
 
@@ -316,6 +359,7 @@ def main() -> int:
     check_refusal_withholds()
     check_confirmed_gated_can_run()
     check_parallel_switch()
+    check_navigation_waits_for_verdict()
     check_no_direct_closure_call()
     check_router_is_the_only_seam()
     check_origin_is_recorded()

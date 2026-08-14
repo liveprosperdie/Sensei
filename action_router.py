@@ -142,11 +142,8 @@ ROLLBACK: dict[str, Rollback] = {
     "minimize_window": Rollback.SAFE,
     "switch_window": Rollback.SAFE,     # focus is user-visible but carries no data
     "scroll": Rollback.SAFE,
-    "new_tab": Rollback.SAFE,           # closable
-    "open_site_tab": Rollback.SAFE,
+    "new_tab": Rollback.SAFE,           # closable, and opens no URL of its own
     "switch_tab": Rollback.SAFE,
-    "open_url": Rollback.SAFE,          # a page LOAD is undoable; see the fill/click note
-    "web_search": Rollback.SAFE,
     "open_folder": Rollback.SAFE,       # opens Explorer; no state change
     "open_file": Rollback.SAFE,         # opens in the default app; no content change
     "open_application": Rollback.SAFE,  # closable, though see close_application (gated)
@@ -197,6 +194,23 @@ ROLLBACK: dict[str, Rollback] = {
     # submit on Enter in several site paths. Cannot separate the two from here.
     "fill": Rollback.UNSAFE,
     "site_search": Rollback.UNSAFE,     # drives a real remote query through the page
+    # URL navigation. These were SAFE on the reasoning that "a page LOAD is
+    # undoable" — true of the TAB, and irrelevant to the REMOTE EFFECT the load
+    # may trigger. A GET is not guaranteed side-effect-free in practice: one-click
+    # unsubscribe links, "confirm this action" / "verify your email" links,
+    # account-delete confirmations and webhook trigger URLs all act on load, and
+    # closing the tab afterwards undoes none of it. _handle_open_url
+    # (executor.py:5171) forwards anything starting http:// or https:// straight
+    # to _navigate with no screening, and the URL can originate from the model or
+    # from page content, so the parameter is not trusted input.
+    #
+    # Same class as click/fill above: the request has already left the machine
+    # before the verdict is read, so the guard must clear it FIRST. Serial costs
+    # one guard latency on a navigation that is about to wait on the network
+    # anyway, which is the cheap side of this trade.
+    "open_url": Rollback.UNSAFE,
+    "open_site_tab": Rollback.UNSAFE,   # same, with the URL built from a site name
+    "web_search": Rollback.UNSAFE,      # issues a real query to a remote engine
     # Closing a tab discards unsaved page state (half-written form, draft).
     # Re-opening the URL is not a rollback — the state is gone.
     "close_tab": Rollback.UNSAFE,
@@ -280,6 +294,9 @@ A_ADJACENT: frozenset[str] = frozenset({
     "adjust_volume", "adjust_brightness",
     "open_application", "open_settings", "open_system_tool",
     "toggle_wifi", "toggle_bluetooth",
+    # Navigation reaches a third party on load, so the guard's opinion matters
+    # here for the same reason it does for click/fill.
+    "open_url", "open_site_tab", "web_search",
     "click", "fill", "site_search", "close_tab", "browser_control",
     "youtube_control", "netflix_control", "meet_control",
     "amazon_control", "flipkart_control", "github_control",
