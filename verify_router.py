@@ -143,8 +143,12 @@ def check_policy(failures: list[str]) -> None:
         failures.append("unlisted actions must classify as UNKNOWN")
 
     # The entries most likely to be wrongly "optimised" into the parallel path.
+    # open_url/open_site_tab/web_search are here because "a page load is
+    # undoable" made them SAFE once: the tab is undoable, the remote effect the
+    # load triggers is not.
     for action in ("click", "fill", "gmail_compose", "write_file",
-                   "delete_files", "office_control", "calendar_control"):
+                   "delete_files", "office_control", "calendar_control",
+                   "open_url", "open_site_tab", "web_search"):
         if action_router.rollback(action) is Rollback.SAFE:
             failures.append(f"{action} must NOT be rollback-SAFE")
     print("[policy] fail-closed and rollback positions as expected")
