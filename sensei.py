@@ -29,7 +29,7 @@ import soundfile as sf
 from executor import execute, get_all_tabs, get_pc_context
 from openwakeword import Model as WakeModel
 
-# ── Init ──────────────────────────────────────────────────────────────────────
+# ── Init ─────────────────────────────────────────────────────────────────────
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 openwakeword.utils.download_models()
@@ -106,7 +106,7 @@ vad_model, _ = torch.hub.load(
     repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=False
 )
 
-# ── Session state ─────────────────────────────────────────────────────────────
+# ── Session state ───────────────────────────────────────────────────────────
 
 COOLDOWN_TIME   = 3.0
 SESSION_TIMEOUT = 45  # seconds — enough for natural pauses
@@ -213,7 +213,7 @@ def _is_dangerous_step(step: dict) -> bool:
     return False
 
 
-# ── Deliberation tier ────────────────────────────────────────────────────────
+# ── Deliberation tier ───────────────────────────────────────────────────────
 # "deliberate" is not a real executor action — it is an ABSTAIN signal from the
 # router meaning "I'm not confident this maps to one action". It is expanded
 # here, BEFORE the safety net, into the concrete steps a proper reasoning pass
@@ -365,7 +365,7 @@ except Exception as e:
 print("Listening for 'Sensei'...")
 
 
-# ── Audio utilities ───────────────────────────────────────────────────────────
+# ── Audio utilities ─────────────────────────────────────────────────────────
 
 def record_command(pre_audio: np.ndarray | None = None) -> np.ndarray | None:
     """
@@ -427,7 +427,7 @@ def flush_stream() -> None:
             stream.read(available, exception_on_overflow=False)
 
 
-# ── VAD barge-in listener ─────────────────────────────────────────────────────
+# ── VAD barge-in listener ─────────────────────────────────────────────────
 
 def _vad_listener() -> None:
     """Daemon thread: runs VAD while Akira is speaking to detect barge-in."""
@@ -484,7 +484,7 @@ def _announce_background() -> bool:
     return spoke
 
 
-# ── Action execution ───────────────────────────────────────────────────────��──
+# ── Action execution ────────────────────────────────────────────────────────
 
 def _guard_refusal_text(action: str, outcome) -> str:
     """Spoken text for a step the guard stopped BEFORE it ran.
@@ -814,7 +814,7 @@ def run_actions(response: dict, step_results: dict | None = None,
     return results
 
 
-# ── Response handling ────────────────────────────────���───────────────��────────
+# ── Response handling ───────────────────────────────────────────────────────
 
 def handle_response(response: dict) -> bool:
     """
@@ -991,7 +991,7 @@ def handle_response(response: dict) -> bool:
     return True
 
 
-# ── LLM query ─────────────────────────────────────────────────────────────────
+# ── LLM query ─────────────────────────────────────────────────────────────
 
 def get_akira_response(text: str) -> dict | None:
     """
@@ -1062,6 +1062,49 @@ def get_akira_response(text: str) -> dict | None:
                         claude_handler.record_action_results([exec_result if isinstance(exec_result, dict) else speak_text])
                     except Exception as e:
                         print(f"[v0] record_action_results failed: {e}")
+
+                    # RELIABILITY LEDGER — the closure/self-gating path.
+                    #
+                    # run_actions records at the bottom of its loop, but a
+                    # self-gating file action (delete_files, move_files,
+                    # organize_files, organize_folder, bulk_rename_files) never
+                    # reaches that line: it returns a needs_confirmation PLAN
+                    # instead of acting, run_actions breaks out of the loop
+                    # ABOVE the record call, and the real execution happens here
+                    # instead, through the closure. Without this call those
+                    # action types accumulate no history at all, ever — and once
+                    # they are classified Gated, tiers.gated_available() refuses
+                    # them forever on Pro, because a bar that is never recorded
+                    # against can never be cleared. That is a permanent lockout,
+                    # not a slow unlock, which is why this lands BEFORE the
+                    # classification change rather than after it.
+                    #
+                    # Same semantics as run_actions and deliberately the same
+                    # function, not a second mechanism: only a run that actually
+                    # EXECUTED is recorded (a guard refusal is evidence about the
+                    # guard, not about the action), and failure is read from the
+                    # same two result shapes the chain loop uses. This path is
+                    # post-confirmation by construction, so reaching it is the
+                    # equivalent of run_actions' `confirmed` scoping.
+                    #
+                    # On this path executed=True already implies the verdict
+                    # allowed it — run_guarded's serial branch withholds
+                    # execution otherwise — so no separate flag check is needed
+                    # to match run_actions, which breaks before recording when a
+                    # verdict arrives late.
+                    #
+                    # origin is skipped while it is still the "click_confirmed"
+                    # placeholder: that is not an action type, so a streak under
+                    # that name would be history no tier gate ever consults.
+                    if outcome.executed and origin != "click_confirmed":
+                        failed = (isinstance(exec_result, str)
+                                  and exec_result.startswith(FAILURE_PREFIXES)) or \
+                                 (isinstance(exec_result, dict)
+                                  and exec_result.get("success") is False)
+                        try:
+                            reliability.record(origin, success=not failed)
+                        except Exception as e:
+                            print(f"[reliability] failed to record {origin}: {e!r}")
                 except Exception as e:
                     speak_text = f"Couldn't do that: {e}"
             else:
@@ -1158,7 +1201,7 @@ def _build_session_context() -> str:
         return ""
 
 
-# ── Main loop ──────────���──────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────
 
 def _process_command(text: str, inject_context: bool = False) -> bool:
     """
@@ -1194,7 +1237,7 @@ while True:
     try:
         current_time = time.time()
 
-        # ── Active session ────────────────────────────────────────────
+        # ── Active session ─────────────────────────────────────────────────
         if session_active and (current_time - session_start_time) < SESSION_TIMEOUT:
 
             with vad_buffer_lock:
@@ -1219,7 +1262,7 @@ while True:
             else:
                 oww_model.reset()
 
-        # ── Idle — listening for wake word ────────────────────────────
+        # ── Idle — listening for wake word ──────────────────────────────────
         else:
             session_active = False
 
