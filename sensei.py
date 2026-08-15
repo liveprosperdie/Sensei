@@ -576,12 +576,32 @@ def _guard_gated(actions: list[dict]) -> tuple[list[dict], list[str]]:
             continue
 
         action = str(step.get("action") or "").strip()
-        unavailable = tiers.gated_available(action)
+
+        # supervised=True is a statement of fact about this function, not a
+        # convenience: everything kept here goes on to the confirmation prompt
+        # (see the docstring above — clearing the guard "only earns the step the
+        # right to be OFFERED"). Nothing reaches execution from here without a
+        # human yes, which is exactly the condition the probation provision
+        # requires. Passing False would reinstate the deadlock documented in
+        # tiers.gated_available: an unproven action would be dropped before it
+        # could ever record the runs the bar demands.
+        unavailable = tiers.gated_available(action, supervised=True)
         if unavailable is not None:
             print(f"[tier] not offering {action}: {unavailable.reason}")
             notes.append(f"I can't do {action.replace('_', ' ')} right now — "
                          f"{unavailable.reason}")
             continue
+
+        # Offered, but not yet proven. Say so at the prompt rather than letting
+        # the difference be silent — the user is being asked to supervise
+        # precisely because the action has no track record yet.
+        if tiers.on_probation(action):
+            left = reliability.remaining(action)
+            print(f"[tier] {action} on probation: {left} clean run(s) to go")
+            notes.append(
+                f"Heads up: {action.replace('_', ' ')} hasn't cleared the "
+                f"{reliability.THRESHOLD}-run reliability protocol yet "
+                f"({left} to go), so I'll keep asking you to confirm it.")
 
         # execute=no-op: this is a validation pass only. Nothing may run before
         # the user has confirmed, so the callable must be inert by construction
@@ -991,7 +1011,7 @@ def handle_response(response: dict) -> bool:
     return True
 
 
-# ── LLM query ────────────────────────────────────────────────���────────────────
+# ── LLM query ────────────────────────────────────────────────�����────────────────
 
 def get_akira_response(text: str) -> dict | None:
     """

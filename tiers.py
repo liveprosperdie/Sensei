@@ -421,7 +421,8 @@ def guard_mode(plan: str | None = None) -> GuardMode:
 
 # ── The one composite decision ───────────────────────────────────────────────
 
-def gated_available(action: str) -> Unavailable | None:
+def gated_available(action: str, *,
+                    supervised: bool = False) -> Unavailable | None:
     """May this Gated action be OFFERED to the user right now?
 
     Returns None when it may, or an Unavailable explaining why not. Two gates,
@@ -435,6 +436,39 @@ def gated_available(action: str) -> Unavailable | None:
     actions available than Standard. That inversion is what the table specifies
     and it is intentional: Standard trades the per-action bar for the
     confirmation flow alone.
+
+    `supervised` — THE BOOTSTRAP PROVISION, and why it has to exist
+    --------------------------------------------------------------
+    Without it this function is a deadlock, not a gate. Traced end to end:
+
+        no history -> cleared() is False -> Unavailable
+                   -> _guard_gated drops the step (`continue`)
+                   -> the action never executes
+                   -> reliability.record is never called
+                   -> streak stays 0 -> no history ... forever
+
+    Every Gated action on a fresh Pro install is therefore withheld
+    permanently, with no reachable path to the runs it is being asked to
+    produce. Verified live at RELIABILITY_RUNS=3 before this parameter existed:
+    delete_files, shutdown_pc and write_file all reported "3 more successful
+    runs needed" with no way to earn even one. It was invisible only because
+    the gate is off by default on Free/Standard.
+
+    The resolution is to notice WHAT the bar is actually protecting against.
+    An unproven destructive action is dangerous when it runs UNATTENDED. It is
+    not meaningfully dangerous when a human is shown the resolved plan and
+    types yes first — that human IS the supervision, and it is the same
+    supervision Standard relies on with no bar at all.
+
+    So the bar governs autonomy, not existence. Under supervision an unproven
+    action is offered ON PROBATION: it still requires confirmation, it still
+    cannot run silently, and each confirmed outcome is recorded, so the streak
+    can actually be earned. Unsupervised, the bar is enforced exactly as before.
+
+    Default False so the strict reading stays the default and every existing
+    caller keeps its current behaviour; only a caller that can prove a human is
+    in the loop may pass True. The tier gate is NOT relaxed by supervision — a
+    Free tier still has no Gated actions no matter who is watching.
     """
     seat = servant_gated()
     if not seat:
@@ -443,6 +477,9 @@ def gated_available(action: str) -> Unavailable | None:
 
     mode = guard_mode()
     if mode.reliability_gate and not reliability.cleared(action):
+        if supervised:
+            # Probation: offered, but only ever behind the confirmation flow.
+            return None
         left = reliability.remaining(action)
         return Unavailable(
             action.replace("_", " "), mode.plan,
@@ -450,6 +487,19 @@ def gated_available(action: str) -> Unavailable | None:
             f"protocol yet — {left} more successful run"
             f"{'s' if left != 1 else ''} needed.")
     return None
+
+
+def on_probation(action: str) -> bool:
+    """Is this action being offered only because a human is supervising it?
+
+    True when the tier permits Gated, the reliability gate is live, and this
+    action type has not cleared the bar yet. Drives the honest wording at the
+    confirmation prompt — the user is told the action is still on probation
+    rather than being handed a silent difference in enforcement.
+    """
+    if not servant_gated():
+        return False
+    return guard_mode().reliability_gate and not reliability.cleared(action)
 
 
 # ── Diagnostics ──────────────────────────────────────────────────────────────

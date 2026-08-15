@@ -539,6 +539,87 @@ def check_gate_integration() -> None:
     os.environ.pop("SENSEI_RELIABILITY_GATE", None)
 
 
+def check_probation_bootstrap() -> None:
+    """The reliability bar must be EARNABLE, not a permanent lockout.
+
+    THE DEADLOCK THIS GATES AGAINST
+    -------------------------------
+    gated_available() withholds an action with no history; _guard_gated drops a
+    withheld step with `continue` before it can execute; reliability.record only
+    fires on execution. So:
+
+        no history -> withheld -> never runs -> no history -> ... forever
+
+    Every Gated action on a fresh Pro install was withheld permanently with no
+    reachable path to the runs being demanded. Confirmed live at
+    RELIABILITY_RUNS=3 before the fix: delete_files, shutdown_pc and write_file
+    all reported "3 more successful runs needed" and could never earn one.
+
+    The resolution is that the bar governs AUTONOMY, not existence: an unproven
+    action is offered on probation to a supervising human, and each confirmed
+    outcome is recorded until the streak is genuinely earned. These checks pin
+    both halves — that probation opens the path, and that it does not quietly
+    become a bypass.
+    """
+    reliability.MODE = "consecutive"
+    reliability.THRESHOLD = 5
+    set_tiers(all="pro")
+    reliability.reset()
+
+    # The deadlock itself: unsupervised is strict, supervised is earnable.
+    check("probation/unsupervised-still-strict",
+          tiers.gated_available("delete_files") is not None,
+          "an unproven action is still withheld from UNSUPERVISED execution")
+    check("probation/supervised-offered",
+          tiers.gated_available("delete_files", supervised=True) is None,
+          "an unproven action IS offered when a human is confirming it")
+    check("probation/flagged-as-probation", tiers.on_probation("delete_files"),
+          "the action reports itself as on probation so the user can be told")
+
+    # The bar must actually be reachable through the supervised path — this is
+    # the check that would have caught the permanent lockout.
+    for _ in range(5):
+        reliability.record("delete_files", True)
+    check("probation/earnable",
+          tiers.gated_available("delete_files") is None
+          and not tiers.on_probation("delete_files"),
+          "runs earned under supervision must clear the bar for good")
+
+    # Probation is per action type, exactly like the unlock it leads to.
+    check("probation/per-action",
+          tiers.gated_available("shutdown_pc") is not None
+          and tiers.on_probation("shutdown_pc"),
+          "one action clearing the bar must not graduate another")
+
+    # A failure must send a cleared action back to probation, or the streak
+    # reset in reliability.record would be cosmetic.
+    reliability.record("delete_files", False)
+    check("probation/failure-demotes",
+          tiers.gated_available("delete_files") is not None
+          and tiers.on_probation("delete_files"),
+          "a failure returns a graduated action to probation")
+
+    # Supervision relaxes the RELIABILITY bar only. It must never relax the
+    # TIER gate — otherwise "supervised" becomes a Free-tier Gated bypass.
+    set_tiers(all="free")
+    refusal = tiers.gated_available("delete_files", supervised=True)
+    check("probation/never-bypasses-tier",
+          refusal is not None and "Free tier" in refusal.reason,
+          "supervision must not grant Gated actions on a tier that lacks them")
+    check("probation/no-probation-when-tier-forbids",
+          not tiers.on_probation("delete_files"),
+          "an action the tier forbids is not 'on probation', it is unavailable")
+
+    # Standard has no bar at all, so nothing is ever on probation there.
+    set_tiers(all="standard")
+    check("probation/standard-has-no-probation",
+          not tiers.on_probation("delete_files"),
+          "Standard trades the per-action bar for confirmation alone")
+
+    set_tiers(all="pro")
+    reliability.reset()
+
+
 def check_failsafe() -> None:
     """An unset or misspelled tier must default to FREE, never PRO."""
     for value, label in ((None, "unset"), ("", "empty"),
@@ -566,6 +647,7 @@ def main() -> int:
     check_ledger()
     check_closure_ledger()
     check_gate_integration()
+    check_probation_bootstrap()
     check_failsafe()
 
     failed = [r for r in RESULTS if r[0] == "FAIL"]
