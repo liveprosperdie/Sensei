@@ -337,6 +337,157 @@ def check_ledger() -> None:
               "records must survive on disk")
 
 
+# ── 5b. the closure / self-gating path actually records ─────────────────────
+
+# The self-gating file actions. These execute through the stored-closure path in
+# get_akira_response, NOT through the bottom of run_actions' loop, so they are the
+# exact set that accumulated zero ledger history before this gate existed.
+SELF_GATING = ("delete_files", "move_files", "organize_files",
+               "organize_folder", "bulk_rename_files")
+
+
+def _closure_path_source() -> str:
+    """The REAL post-confirmation closure branch, lifted out of sensei.py.
+
+    Why AST extraction instead of importing sensei or hand-rolling an equivalent:
+
+      * sensei cannot be imported here — it opens audio devices at import, which
+        is why verify_guard_wiring reads its source by AST too. Same approach.
+      * a hand-written "equivalent" of the branch is the failure mode this gate
+        exists to prevent. It would pass while the shipped code recorded nothing,
+        which is precisely the bug being fixed. Executing the real statements is
+        the only version of this test that can actually fail correctly.
+
+    So the branch's own statements are extracted verbatim and executed against
+    stubs. If someone deletes the reliability.record call from sensei.py, the
+    extracted source no longer contains it and these checks fail.
+    """
+    import ast
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "sensei.py"), encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef)
+                and node.name == "get_akira_response"):
+            continue
+        # The branch guarded by `pending_action == "click_confirmed" and
+        # pending_execute is not None` — the closure path.
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.If):
+                continue
+            src = ast.unparse(inner.test)
+            if "click_confirmed" in src and "pending_execute" in src:
+                return "\n".join(ast.unparse(s) for s in inner.body)
+    return ""
+
+
+def _run_closure_path(*, action: str, exec_result, executed: bool = True,
+                      allowed: bool = True):
+    """Execute the extracted branch with everything it touches stubbed.
+
+    Returns the ledger entry recorded for `action`, or None if nothing was
+    recorded — which is the pre-fix behaviour and the thing under test.
+    """
+    import types
+
+    outcome = types.SimpleNamespace(
+        executed=executed, result=exec_result,
+        verdict=types.SimpleNamespace(allowed=allowed, reasons=("stubbed",)),
+        blocked=not allowed, flagged=False, raced=False)
+
+    ns = {
+        "pending_action": "click_confirmed",
+        "pending_parameter": "resolved enumeration of 3 files",
+        "pending_execute": lambda: exec_result,
+        "pending_origin": action,
+        "action_router": types.SimpleNamespace(
+            run_guarded=lambda step, ex, confirmed=False: outcome),
+        "claude_handler": types.SimpleNamespace(
+            record_action_results=lambda results: None),
+        "reliability": reliability,
+        "FAILURE_PREFIXES": ("Couldn't", "Failed", "Error", "I couldn't"),
+        "_guard_refusal_text": lambda a, o: f"I didn't run {a}.",
+        "_guard_flag_pending": lambda a, o: f"I ran {a}, but flagging.",
+        "speak_text": None,
+    }
+    exec(_closure_path_source(), ns)          # noqa: S102 — real shipped source
+    return reliability.status(action)
+
+
+def check_closure_ledger() -> None:
+    """FIX 1 GATE: the closure/self-gating path must record to the ledger.
+
+    Before this fix, reliability.record had exactly ONE call site — the bottom of
+    run_actions' loop, guarded by `if confirmed`. The self-gating file actions
+    return a needs_confirmation PLAN and `break` out of that loop ABOVE the
+    record line, then execute later through the stored closure, which recorded
+    nothing. Net effect: these five action types accumulated zero history, ever.
+
+    That was masked while they were classified A-adjacent, because nothing
+    consulted their history. Once they are classified Gated (Fix 2) an
+    permanently-empty ledger becomes a permanent Pro lockout with no unlock path.
+    This gate is the reason Fix 2 is safe to ship.
+    """
+    reliability.MODE = "consecutive"
+    reliability.THRESHOLD = 5
+
+    src = _closure_path_source()
+    check("closure/branch-located", bool(src),
+          "the post-confirmation closure branch was found in sensei.py")
+    check("closure/records-in-source", "reliability.record" in src,
+          "the shipped closure branch contains a reliability.record call")
+
+    # Each self-gating type must accumulate history through the closure path.
+    for action in SELF_GATING:
+        reliability.reset()
+        entry = _run_closure_path(
+            action=action, exec_result={"success": True, "message": "Deleted 3 files."})
+        check(f"closure/records/{action}",
+              entry["runs"] == 1 and entry["successes"] == 1
+              and entry["streak"] == 1,
+              f"one closure execution recorded one success "
+              f"(runs={entry['runs']}, streak={entry['streak']})")
+
+    # A dict failure must record as a FAILURE, matching run_actions' semantics.
+    reliability.reset()
+    entry = _run_closure_path(
+        action="delete_files",
+        exec_result={"success": False, "message": "Couldn't delete."})
+    check("closure/dict-failure-recorded",
+          entry["runs"] == 1 and entry["successes"] == 0 and entry["streak"] == 0,
+          f"a {{'success': False}} result records a failure "
+          f"(successes={entry['successes']})")
+
+    # A failure-prefixed string must also record as a failure.
+    reliability.reset()
+    entry = _run_closure_path(action="move_files",
+                              exec_result="Couldn't move those files.")
+    check("closure/string-failure-recorded",
+          entry["runs"] == 1 and entry["successes"] == 0,
+          "a FAILURE_PREFIXES string result records a failure")
+
+    # A guard refusal must NOT record: nothing ran, so there is no evidence
+    # either way, and recording it would let a strict guard permanently suppress
+    # an action that never once misbehaved.
+    reliability.reset()
+    entry = _run_closure_path(action="delete_files", exec_result="irrelevant",
+                              executed=False)
+    check("closure/refusal-not-recorded", entry["runs"] == 0,
+          "a guard refusal records nothing (nothing executed)")
+
+    # The end-to-end claim: repeated closure executions actually clear the bar,
+    # so a Pro user is not locked out forever.
+    reliability.reset()
+    for _ in range(5):
+        _run_closure_path(action="delete_files",
+                          exec_result={"success": True, "message": "ok"})
+    check("closure/accumulates-to-unlock", reliability.cleared("delete_files"),
+          "history from the closure path alone can clear the reliability bar")
+
+    reliability.reset()
+
+
 # ── 6. tier-blindness and the fail-safe default ─────────────────────────────
 
 def check_gate_integration() -> None:
@@ -413,6 +564,7 @@ def main() -> int:
     check_inert()
     check_no_spend()
     check_ledger()
+    check_closure_ledger()
     check_gate_integration()
     check_failsafe()
 

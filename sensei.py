@@ -991,7 +991,7 @@ def handle_response(response: dict) -> bool:
     return True
 
 
-# ── LLM query ─────────────────────────────────────────────────────────────────
+# ── LLM query ────────────────────────────────────────────────���────────────────
 
 def get_akira_response(text: str) -> dict | None:
     """
@@ -1058,6 +1058,51 @@ def get_akira_response(text: str) -> dict | None:
                         # an accurate report is the only remedy available.
                         if not outcome.verdict.allowed:
                             speak_text = _guard_flag_pending(origin, outcome)
+
+                    # RELIABILITY LEDGER — closure/self-gating path.
+                    #
+                    # run_actions records at the bottom of its loop, but the
+                    # self-gating file actions (delete_files, move_files,
+                    # organize_files, organize_folder, bulk_rename_files) never
+                    # reach that line: they return a needs_confirmation PLAN and
+                    # `break` out of the loop ABOVE it, then finally execute
+                    # HERE, through the stored closure. Without this call those
+                    # action types accumulate zero history for as long as they
+                    # exist — and once they are classified Gated (and therefore
+                    # checked against tiers.gated_available) a permanently empty
+                    # ledger means a permanent lockout with no way to unlock.
+                    #
+                    # Recorded under `origin`, not the literal "click_confirmed"
+                    # pending_action, because the ledger is per action TYPE and
+                    # "click_confirmed" is not a real action. This is the same
+                    # name the guard screened above, so the ledger and the gate
+                    # agree on what ran.
+                    #
+                    # Semantics deliberately mirror run_actions:
+                    #   * only counted when it ACTUALLY ran (outcome.executed) —
+                    #     a guard refusal is not reliability evidence, and
+                    #     recording one would let a strict guard suppress an
+                    #     action that never misbehaved.
+                    #   * failure detected with the same two shapes run_actions
+                    #     uses: a FAILURE_PREFIXES string or {"success": False}.
+                    #   * confirmed=True by construction on this path (the human
+                    #     just approved), matching run_actions' `confirmed` scope.
+                    #
+                    # Guarded for the same reason: the action already happened,
+                    # and a ledger write must never take down a completed action.
+                    # A dropped record only makes the action MORE gated.
+                    if outcome.executed and origin:
+                        _failed = (
+                            (isinstance(exec_result, str)
+                             and exec_result.startswith(FAILURE_PREFIXES))
+                            or (isinstance(exec_result, dict)
+                                and exec_result.get("success") is False)
+                        )
+                        try:
+                            reliability.record(origin, success=not _failed)
+                        except Exception as e:
+                            print(f"[reliability] failed to record {origin}: {e!r}")
+
                     try:
                         claude_handler.record_action_results([exec_result if isinstance(exec_result, dict) else speak_text])
                     except Exception as e:
