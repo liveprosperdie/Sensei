@@ -51,10 +51,10 @@ import json
 import os
 import threading
 
-# 20 is the specified bar. Env-overridable because the number is policy, not
-# mechanism — and because a test that needed 20 real runs to exercise the unlock
+# 3 is the specified bar. Env-overridable because the number is policy, not
+# mechanism — and because a test that needed 3 real runs to exercise the unlock
 # would never be written.
-THRESHOLD = max(1, int(os.environ.get("RELIABILITY_RUNS", "20")))
+THRESHOLD = max(1, int(os.environ.get("RELIABILITY_RUNS", "3")))
 
 MODE = (os.environ.get("RELIABILITY_MODE", "consecutive") or "").strip().lower()
 

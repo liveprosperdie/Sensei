@@ -475,6 +475,14 @@ def obsidian_control(action: str, parameter: str | None = None) -> dict:
     if action == "focus":
         import obsidian_context
         want = (parts[0] if parts else "").strip().lower() not in ("off", "false", "stop", "end", "0")
+        
+        if want:
+            import tiers
+            # Use HEAD tier as the primary indicator for general app features like Focus Mode
+            if tiers.plan_for(tiers.Layer.HEAD) != tiers.PRO:
+                return {"success": False, "speak": True, 
+                        "message": "Focus mode is a Pro tier feature. Please upgrade your subscription to unlock full vault restructuring."}
+                        
         state = obsidian_context.set_focus_mode(want)
         return {"success": True, "speak": True,
                 "message": "Focus mode on." if state else "Focus mode off."}

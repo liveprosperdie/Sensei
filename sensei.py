@@ -701,6 +701,14 @@ def run_actions(response: dict, step_results: dict | None = None,
                   f"step {step_id} feeds a later step")
             bg_label = None
         if bg_label:
+            if tiers.plan_for(tiers.Layer.SERVANT) != tiers.PRO:
+                print(f"[run_actions] refusing background task {step['action']}: not on PRO tier")
+                result = {"success": False, "speak": True, "message": "Background tasks are only available on the Pro tier."}
+                if step_id:
+                    step_results[step_id] = result
+                results.append(result)
+                continue
+
             result = background_tasks.start(
                 bg_label,
                 # bound now, not at call time — the loop variables move on
