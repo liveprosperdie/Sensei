@@ -7,8 +7,13 @@
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <div id="avatar-container" data-tauri-drag-region>
-      <img id="avatar" src="assets/akira.png" alt="Akira" draggable="false" />
+    <div id="stage">
+      <div id="speech-bubble" role="status" aria-live="polite"></div>
+      <div id="avatar-container" data-tauri-drag-region>
+        <img id="avatar" src="assets/akira.png" alt="Akira" draggable="false" />
+      </div>
+      <div id="particles" aria-hidden="true"></div>
     </div>
+    <script src="script.js"></script>
   </body>
 </html>
