@@ -1,6 +1,7 @@
 "use client"
 
 import { SENSEI_STATES, STATE_LABELS, useMockSenseiState } from "./state"
+import Scholar from "./avatars/Scholar"
 import HoodedSpirit from "./avatars/HoodedSpirit"
 import FoxSage from "./avatars/FoxSage"
 import OrbSpirit from "./avatars/OrbSpirit"
@@ -32,10 +33,10 @@ export default function App() {
   return (
     <main className="page">
       <header className="header">
-        <h1 className="title">Sensei avatar concepts</h1>
+        <h1 className="title">Sensei — The Scholar</h1>
         <p className="subtitle">
-          Three animatable directions, driven by the same mock state machine the backend will replace over WebSocket.
-          Move your cursor — the eyes follow it.
+          Primary avatar built from your reference: the cozy library scholar. Driven by the same mock state machine
+          the backend will replace over WebSocket. Move your cursor — her eyes follow it.
         </p>
       </header>
 
@@ -59,7 +60,22 @@ export default function App() {
         </label>
       </section>
 
-      <section className="gallery" aria-label="Avatar concepts">
+      <section className="featured" aria-label="Primary avatar">
+        <article className="card featured-card">
+          <div className="stage featured-stage">
+            <Scholar state={state} />
+          </div>
+          <div className="card-meta">
+            <h2 className="card-name">The Scholar</h2>
+            <p className="card-tagline">
+              Chestnut bob, round wire glasses, rust cable-knit over teal. Blinks, breathes, tracks your cursor, and
+              changes expression per state — brows, eyelids, gaze, and mouth are all independent layers.
+            </p>
+          </div>
+        </article>
+      </section>
+
+      <section className="gallery" aria-label="Earlier concepts">
         {CONCEPTS.map(({ id, name, tagline, Component }) => (
           <article key={id} className="card">
             <div className="stage">
