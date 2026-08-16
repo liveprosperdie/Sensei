@@ -104,5 +104,69 @@ function scheduleRemark() {
 }
 scheduleRemark()
 
+// ---------- Eye tracking: pupils + body lean follow the cursor ----------
+const lean = document.getElementById("lean")
+const avatar = document.getElementById("avatar")
+const pupilLeft = document.getElementById("pupil-left")
+const pupilRight = document.getElementById("pupil-right")
+
+let cursorInside = false
+let glanceTimer = null
+
+function setGaze(nx, ny) {
+  // nx, ny are normalized -1..1 from the face center
+  const maxX = avatar.clientWidth * 0.011
+  const maxY = avatar.clientHeight * 0.007
+  // Quantize to 2px steps to keep the pixel-art feel
+  const px = Math.round((nx * maxX) / 2) * 2
+  const py = Math.round((ny * maxY) / 2) * 2
+  for (const p of [pupilLeft, pupilRight]) {
+    p.style.setProperty("--px", px + "px")
+    p.style.setProperty("--py", py + "px")
+  }
+  if (!reducedMotion) {
+    lean.style.transform = `translateX(${(nx * 5).toFixed(1)}px) rotate(${(nx * 1.2).toFixed(2)}deg)`
+  }
+}
+
+function resetGaze() {
+  setGaze(0, 0)
+  lean.style.transform = ""
+}
+
+window.addEventListener("mousemove", (e) => {
+  cursorInside = true
+  const rect = avatar.getBoundingClientRect()
+  // Face center: between the eyes, ~33% down the sprite
+  const cx = rect.left + rect.width * 0.445
+  const cy = rect.top + rect.height * 0.334
+  const nx = Math.max(-1, Math.min(1, (e.clientX - cx) / (rect.width * 0.6)))
+  const ny = Math.max(-1, Math.min(1, (e.clientY - cy) / (rect.height * 0.5)))
+  setGaze(nx, ny)
+})
+
+// When the cursor leaves the window, drift back to center after a beat
+document.addEventListener("mouseleave", () => {
+  cursorInside = false
+  setTimeout(() => {
+    if (!cursorInside) resetGaze()
+  }, 900)
+})
+
+// Idle glances: when the cursor is away, occasionally look around
+function scheduleGlance() {
+  clearTimeout(glanceTimer)
+  glanceTimer = setTimeout(() => {
+    if (!cursorInside && !reducedMotion) {
+      setGaze(Math.random() * 2 - 1, Math.random() * 1.2 - 0.4)
+      setTimeout(() => {
+        if (!cursorInside) resetGaze()
+      }, 1200 + Math.random() * 1500)
+    }
+    scheduleGlance()
+  }, 8000 + Math.random() * 12000)
+}
+scheduleGlance()
+
 // Greet on launch
 setTimeout(() => say("Hey there!"), 800)

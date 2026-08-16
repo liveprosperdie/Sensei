@@ -10,7 +10,13 @@
     <div id="stage">
       <div id="speech-bubble" role="status" aria-live="polite"></div>
       <div id="avatar-container" data-tauri-drag-region>
-        <img id="avatar" src="assets/akira.png" alt="Akira" draggable="false" />
+        <div id="lean">
+          <div id="avatar-wrap">
+            <img id="avatar" src="assets/akira.png" alt="Akira" draggable="false" />
+            <span class="pupil" id="pupil-left" aria-hidden="true"></span>
+            <span class="pupil" id="pupil-right" aria-hidden="true"></span>
+          </div>
+        </div>
       </div>
       <div id="particles" aria-hidden="true"></div>
     </div>
