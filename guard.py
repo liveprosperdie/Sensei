@@ -129,24 +129,22 @@ GUARD_MAX_TOKENS = 400
 # user long before it ever blocks anything.
 GUARD_TIMEOUT = 20.0
 
-GUARD_SYSTEM = """You are a safety guard for a voice assistant that controls a \
-Windows PC. You are given ONE planned action and its parameter. Decide whether \
-executing it is safe.
+GUARD_SYSTEM = (
+    "You are a safety guard for a voice assistant that controls a Windows PC. "
+    "You are given ONE planned action and its parameter. "
+    "Decide whether it is safe to execute automatically (ALLOW), requires explicit "
+    "user confirmation first (FLAG), or is dangerously malformed (BLOCK). "
+    "Output JSON ONLY: {\"decision\": \"allow|flag|block\", \"reasons\": [\"...\"]}."
+)
 
-Reply with JSON only, no prose:
-{"decision": "allow" | "flag" | "block", "reasons": ["short reason", ...]}
-
-  allow — routine and reversible; no confirmation needed.
-  flag  — plausible but consequential: spends money, sends or publishes \
-something, deletes or overwrites data, or changes system power state. The user \
-will be asked to confirm.
-  block — the action is malformed, contradicts its stated intent, or targets \
-something it has no business touching.
-
-Judge ONLY the action in front of you. Do not assume unstated context makes it \
-safe. If you are unsure, answer flag — never allow. Keep each reason under 12 \
-words."""
-
+GUARD_SHAPE_SYSTEM = (
+    "You are the shape and routing validator for a voice assistant. "
+    "You are given ONE planned action and its parameter. "
+    "You must output JSON with a 'decision' (allow/flag/block) and 'reasons'. "
+    "Block if the action is unknown or the parameter shape is completely wrong. "
+    "Flag if the action touches a risky system component but is structurally valid. "
+    "Output JSON ONLY: {\"decision\": \"allow|flag|block\", \"reasons\": [\"...\"]}."
+)
 _DECISIONS = {ALLOW, FLAG, BLOCK}
 
 
@@ -175,21 +173,26 @@ def _parse(payload) -> Verdict:
     return Verdict(decision, reasons, source="model")
 
 
-def review(action: str, parameter=None, *, timeout: float = GUARD_TIMEOUT,
-           label: str = "guard") -> Verdict:
-    """Validate one action step statically, then with the guard model.
-
-    Returns a Verdict; never raises. The static verdict is computed first and
-    can only be tightened by the model, never loosened — see Verdict.merge.
-    """
-    static = guard_rules.validate(action, parameter)
-    if static.decision == BLOCK:
-        # Already refused on shape or an unknown action name. Spending a model
-        # call to re-litigate a malformed step would cost money to reach the
-        # same answer, and a model that disagreed could not be honoured anyway.
-        return static
-
     user = f"action: {action}\nparameter: {parameter!r}"
+
+    # 1. Structural Validation (via guard-shape LoRA)
+    try:
+        shape_payload, _info = servant_clients.call_json(
+            servant_clients.GUARD_SHAPE, system=GUARD_SHAPE_SYSTEM, user=user,
+            max_tokens=GUARD_MAX_TOKENS, timeout=timeout, label="guard_shape")
+        shape_verdict = _parse(shape_payload)
+    except ServantUnavailable as e:
+        kind = "truncated" if "truncated" in str(e) else "unavailable"
+        shape_verdict = _failed_closed(f"guard_shape {kind}: {e}")
+    except ServantJSONError as e:
+        shape_verdict = _failed_closed(f"guard_shape reply unusable: {e}")
+
+    if shape_verdict.decision == BLOCK:
+        # Already refused on shape or an unknown action name. Spending a second model
+        # call to re-litigate a malformed step would cost time/money.
+        return shape_verdict
+
+    # 2. Safety Judgement (via guard-safety LoRA)
     try:
         payload, _info = servant_clients.call_json(
             GUARD, system=GUARD_SYSTEM, user=user,
@@ -207,9 +210,9 @@ def review(action: str, parameter=None, *, timeout: float = GUARD_TIMEOUT,
         # allowed to fail the call loudly — the guard cannot afford to convert a
         # bug into an exception the caller might not catch. It is reported in the
         # reasons and fails closed.
-        return static.merge(_failed_closed(f"guard reply unusable: {e}"))
+        return shape_verdict.merge(_failed_closed(f"guard reply unusable: {e}"))
 
-    return static.merge(_parse(payload))
+    return shape_verdict.merge(_parse(payload))
 
 
 def available() -> bool:

@@ -82,7 +82,11 @@ class Tier:
 
     @property
     def api_key(self) -> str | None:
-        return (os.environ.get(self.key_env) or "").strip() or None
+        key = (os.environ.get(self.key_env) or "").strip() or None
+        # Local endpoints don't need API keys; return a dummy string so it registers as available.
+        if not key and ("localhost" in self.base_url or "127.0.0.1" in self.base_url or "ngrok" in self.base_url):
+            return "local-no-key"
+        return key
 
     @property
     def available(self) -> bool:
@@ -92,47 +96,39 @@ class Tier:
         return f"<Tier {self.name} {self.model}>"
 
 
-# NOTE ON COST: Qwen's free tier ended April 2026 — qwen2.5-max is paid, just
-# very cheap, so SERVANT_MECH reduces spend rather than eliminating it.
-# DashScope's maintained line has since moved to Qwen3.x (qwen3-flash and
-# similar); qwen2.5-max still serves and is what was specified, but the
-# QWEN_MODEL override below is the migration path when that changes.
+# ── LOCAL LLM ADAPTERS (Llama 3.2 8B + LoRA) ──────────────────────────────────
+# Defaulted to a local vLLM server (e.g. running on Colab) with LoRA adapters.
+# The 'model' parameter maps to the LoRA adapter name.
+_LOCAL_BASE = os.environ.get("SENSEI_LOCAL_BASE_URL", "http://localhost:8000/v1")
+_LOCAL_KEY_ENV = "SENSEI_LOCAL_API_KEY"
+
 SERVANT_GEN = Tier(
     "SERVANT_GEN",
-    os.environ.get("GLM_MODEL", "glm-5.2"),
-    os.environ.get("GLM_BASE_URL", "https://api.z.ai/api/paas/v4/"),
-    "GLM_API_KEY",
+    os.environ.get("SERVANT_GEN_MODEL", "servant-gen"),
+    os.environ.get("SERVANT_GEN_BASE_URL", _LOCAL_BASE),
+    os.environ.get("SERVANT_GEN_KEY_ENV", _LOCAL_KEY_ENV),
 )
 
 SERVANT_MECH = Tier(
     "SERVANT_MECH",
-    os.environ.get("QWEN_MODEL", "qwen2.5-max"),
-    os.environ.get("QWEN_BASE_URL",
-                   "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
-    "QWEN_API_KEY",
+    os.environ.get("SERVANT_MECH_MODEL", "servant-mech"),
+    os.environ.get("SERVANT_MECH_BASE_URL", _LOCAL_BASE),
+    os.environ.get("SERVANT_MECH_KEY_ENV", _LOCAL_KEY_ENV),
 )
 
-# GUARD is a fourth ROLE, not a third servant. It shares the servant wire
-# format and this module's Tier plumbing, but its failure policy is the exact
-# inverse (see guard.py): a servant that cannot answer falls back to the brain
-# and the task still completes, whereas a guard that cannot answer must never
-# resolve to "approved".
-#
-# Pointed at Qwen and keyed on the EXISTING QWEN_API_KEY on purpose: adding a
-# second secret would mean the guard is unrunnable until someone provisions it,
-# and an unprovisioned guard is the one failure mode most likely to get it
-# switched off. GUARD_MODEL/GUARD_BASE_URL/GUARD_API_KEY_ENV are separate
-# overrides so repointing at Kimi (or any OpenAI-compatible endpoint) is a .env
-# edit, not a code change — same migration path the QWEN_MODEL override exists
-# for. Sharing SERVANT_MECH's key does mean one revoked key takes out both the
-# mechanical tier and the guard at once; GUARD_API_KEY_ENV is how you split
-# them without touching this file.
+# GUARD has been split into two LoRA adapters: shape (replaces static rules) and safety
 GUARD = Tier(
     "GUARD",
-    os.environ.get("GUARD_MODEL", "qwen2.5-max"),
-    os.environ.get("GUARD_BASE_URL",
-                   "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
-    os.environ.get("GUARD_API_KEY_ENV", "QWEN_API_KEY"),
+    os.environ.get("GUARD_SAFETY_MODEL", "guard-safety"),
+    os.environ.get("GUARD_BASE_URL", _LOCAL_BASE),
+    os.environ.get("GUARD_KEY_ENV", _LOCAL_KEY_ENV),
+)
+
+GUARD_SHAPE = Tier(
+    "GUARD_SHAPE",
+    os.environ.get("GUARD_SHAPE_MODEL", "guard-shape"),
+    os.environ.get("GUARD_SHAPE_BASE_URL", _LOCAL_BASE),
+    os.environ.get("GUARD_SHAPE_KEY_ENV", _LOCAL_KEY_ENV),
 )
 
 DEFAULT_TIMEOUT = 90.0
