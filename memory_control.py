@@ -24,6 +24,39 @@ def log_action(text: str) -> None:
     except Exception as e:
         print(f"[memory_control] failed to log action: {e}")
 
+def save_memory(parameter) -> dict:
+    """Autonomously saves memory to either core profile (forever) or daily log (30 days)."""
+    import json
+    
+    if not parameter:
+        return {"success": False, "message": "Nothing to remember."}
+        
+    try:
+        # Check if parameter is a JSON dict (e.g. {"type": "core", "content": "..."})
+        if isinstance(parameter, str):
+            try:
+                data = json.loads(parameter)
+            except json.JSONDecodeError:
+                data = {"type": "log", "content": parameter}
+        else:
+            data = parameter
+            
+        mem_type = data.get("type", "log")
+        content = data.get("content", str(data))
+        
+        if mem_type == "core":
+            core_path = os.path.join(MEMORY_DIR, "core_profile.md")
+            with open(core_path, "a", encoding="utf-8") as f:
+                f.write(f"\n- {content}\n")
+            msg = "Saved to core memory."
+        else:
+            log_action(content)
+            msg = "Saved to daily memory."
+            
+        return {"success": True, "speak": False, "message": msg}
+    except Exception as e:
+        return {"success": False, "message": f"Failed to save memory: {e}"}
+
 def search_memory(query: str) -> dict:
     """Searches past daily logs for the query."""
     if not query:
