@@ -23,7 +23,6 @@ class AvatarWindow(QWidget):
         
         self.dragging = False
         self.offset = QPoint()
-        self.click_through = False
         
         # States
         self.is_speaking = False
@@ -72,6 +71,7 @@ class AvatarWindow(QWidget):
         show_action = QAction("Show Avatar", self)
         show_action.triggered.connect(self.show_avatar)
         tray_menu.addAction(show_action)
+        
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(QApplication.instance().quit)
         tray_menu.addAction(quit_action)
@@ -102,10 +102,10 @@ class AvatarWindow(QWidget):
     def setup_animations(self):
         # Crossfade animation
         self.fade_anim = QPropertyAnimation(self.opacity_effect, b"opacity")
-        self.fade_anim.setDuration(150)
+        self.fade_anim.setDuration(300) # Increased for smoother gliding
         self.fade_anim.setStartValue(0.0)
         self.fade_anim.setEndValue(1.0)
-        self.fade_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self.fade_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
         
         # Breathing animation (moves the window Y slightly)
         self.breath_anim = QPropertyAnimation(self, b"pos")
@@ -138,6 +138,11 @@ class AvatarWindow(QWidget):
         self.breath_loop_timer.timeout.connect(self.trigger_breath)
         self.breath_loop_timer.start(3000)
         self.base_pos = self.pos()
+        
+        # Happy timer
+        self.happy_timer = QTimer(self)
+        self.happy_timer.setSingleShot(True)
+        self.happy_timer.timeout.connect(self.end_happy)
 
     def trigger_breath(self):
         if self.dragging: return
@@ -172,6 +177,9 @@ class AvatarWindow(QWidget):
         self.fade_anim.start()
 
     def physics_loop(self):
+        if self.is_speaking:
+            return # Speaking has highest priority, bypasses everything
+            
         if self.is_sleeping or self.is_patting or self.is_blinking:
             return
             
@@ -184,10 +192,8 @@ class AvatarWindow(QWidget):
         if abs(dx) > 5 or abs(dy) > 5:
             self.idle_timer.start(IDLE_SLEEP_MS)
             
-        if self.is_speaking:
-            return
-            
-        if abs(dx) < 100 and abs(dy) < 100:
+        # Larger deadzone in the center so she doesn't jitter when mouse is close
+        if abs(dx) < 150 and abs(dy) < 150:
             self.transition_sprite("idle.png")
         else:
             angle = math.degrees(math.atan2(dy, dx))
@@ -224,6 +230,8 @@ class AvatarWindow(QWidget):
         if is_speaking:
             if self.is_sleeping:
                 self.handle_sleep_state(False)
+            if self.is_patting:
+                self.end_happy() # Speaking overrides happy
             self.lip_sync_timer.start(150)
             self.talk_toggle = True
             self.transition_sprite("talk_open.png", instant=True)
@@ -248,12 +256,24 @@ class AvatarWindow(QWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             if event.position().y() < self.height() * 0.3:
-                self.is_patting = True
-                self.handle_sleep_state(False)
-                self.transition_sprite("happy.png", instant=False)
+                self.trigger_happy()
             else:
                 self.dragging = True
                 self.offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+                
+    def trigger_happy(self):
+        if self.is_speaking:
+            return
+        self.is_patting = True
+        self.handle_sleep_state(False)
+        self.transition_sprite("happy.png", instant=False)
+        self.happy_timer.start(4000) # Stay happy for 4 seconds
+        
+    def end_happy(self):
+        self.is_patting = False
+        self.happy_timer.stop()
+        if not self.is_speaking:
+            self.transition_sprite("idle.png")
                 
     def mouseMoveEvent(self, event):
         if self.dragging:
@@ -264,9 +284,6 @@ class AvatarWindow(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self.dragging = False
-            if self.is_patting:
-                self.is_patting = False
-                self.transition_sprite("idle.png")
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -274,10 +291,6 @@ class AvatarWindow(QWidget):
         sleep_act = QAction("Wake Up" if self.is_sleeping else "Go to Sleep", self)
         sleep_act.triggered.connect(lambda: self.handle_sleep_state(not self.is_sleeping))
         menu.addAction(sleep_act)
-        
-        click_act = QAction("Toggle Click-Through", self)
-        click_act.triggered.connect(self.toggle_clickthrough)
-        menu.addAction(click_act)
         
         hide_act = QAction("Hide Avatar (To Tray)", self)
         hide_act.triggered.connect(self.hide)
@@ -288,17 +301,6 @@ class AvatarWindow(QWidget):
         menu.addAction(quit_act)
         
         menu.exec(event.globalPos())
-
-    def toggle_clickthrough(self):
-        hwnd = int(self.winId())
-        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        if self.click_through:
-            ex_style &= ~win32con.WS_EX_TRANSPARENT
-            self.click_through = False
-        else:
-            ex_style |= win32con.WS_EX_TRANSPARENT
-            self.click_through = True
-        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
 
     def start_udp_listener(self):
         def listener():
@@ -316,6 +318,10 @@ class AvatarWindow(QWidget):
                         self.sleep_signal.emit(True)
                     elif msg == "SLEEP_STOP":
                         self.sleep_signal.emit(False)
+                    elif msg == "HAPPY_START":
+                        # We must emit a signal or call via QMetaObject since this is a thread
+                        # But since it's simple, we can just use QTimer.singleShot in main thread
+                        QTimer.singleShot(0, self.trigger_happy)
                 except Exception as e:
                     print(f"UDP Error: {e}")
         

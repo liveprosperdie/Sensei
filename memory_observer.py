@@ -20,7 +20,10 @@ RULES:
 4. If the user explicitly tells you to wake up, output exactly this JSON:
 {"action": "SLEEP_STOP"}
 
-5. If the user is just chatting, asking a question, or giving a normal command (e.g. "search the web", "open youtube", "how are you"), output exactly:
+5. If the user praises, thanks, compliments, or expresses appreciation to you (e.g., "good job", "thank you", "you're the best"), output exactly this JSON:
+{"action": "HAPPY_START"}
+
+6. If the user is just chatting, asking a question, or giving a normal command (e.g. "search the web", "open youtube", "how are you"), output exactly:
 NONE
 
 You MUST output ONLY the JSON object or NONE. No prose, no thinking."""
@@ -53,7 +56,7 @@ def _observe_turn_blocking(user_text: str):
         
         # Handle Avatar State
         action = data.get("action")
-        if action in ("SLEEP_START", "SLEEP_STOP"):
+        if action in ("SLEEP_START", "SLEEP_STOP", "HAPPY_START"):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.sendto(action.encode('utf-8'), ("127.0.0.1", 55555))
