@@ -11,6 +11,7 @@ WATCHED_FILES = [
     "SETUP_OBSIDIAN_FOCUS_MODE.md",
     "action_guard.py",
     "action_router.py",
+    "avatar_ui.py",
     "background_tasks.py",
     "calendar_control.py",
     "chunked_read.py",

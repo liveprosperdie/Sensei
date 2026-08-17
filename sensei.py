@@ -25,6 +25,7 @@ import system_control
 import office_control
 import obsidian_context
 from groq import Groq
+import subprocess
 import soundfile as sf
 from executor import execute, get_all_tabs, get_pc_context
 from openwakeword import Model as WakeModel
@@ -33,6 +34,16 @@ from openwakeword import Model as WakeModel
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 openwakeword.utils.download_models()
+
+# Spawn Avatar UI
+try:
+    _avatar_proc = subprocess.Popen(["python", "avatar_ui.py"])
+except Exception as e:
+    print(f"[avatar] failed to launch avatar: {e}")
+
+# Avatar UDP Socket
+import socket
+_avatar_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 # Score above which "Sensei" counts as heard. Defined here because the startup
 # banner reports it — set SENSEI_WAKE_DEBUG=1 to print live scores and tune it.
@@ -453,9 +464,17 @@ def speak_and_wait(text: str) -> None:
     """Speak text while VAD listens for barge-in. Blocks until done."""
     global akira_speaking
     akira_speaking = True
+    try:
+        _avatar_sock.sendto(b"SPEAK_START", ("127.0.0.1", 55555))
+    except Exception:
+        pass
     thread = claude_handler.speak_async(text)
     thread.join()
     akira_speaking = False
+    try:
+        _avatar_sock.sendto(b"SPEAK_STOP", ("127.0.0.1", 55555))
+    except Exception:
+        pass
     user_speaking.clear()
 
 
