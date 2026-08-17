@@ -1,10 +1,11 @@
 import threading
 import json
+import socket
 import servant_clients
 import memory_control
 import llm_json
 
-_OBSERVER_PROMPT = """You are a background memory observer. Your job is to extract important information from the user's message.
+_OBSERVER_PROMPT = """You are a background memory and state observer. Your job is to extract important information or state changes from the user's message.
 
 RULES:
 1. If the user states a permanent preference, identity fact, or boundary, output exactly this JSON:
@@ -13,7 +14,13 @@ RULES:
 2. If the user mentions a notable daily event or task, or explicitly says "remember this", output exactly this JSON:
 {"type": "log", "content": "The event..."}
 
-3. If the user is just chatting, asking a question, or giving a normal command (e.g. "search the web", "open youtube", "how are you"), output exactly:
+3. If the user explicitly tells you to go to sleep or take a rest, output exactly this JSON:
+{"action": "SLEEP_START"}
+
+4. If the user explicitly tells you to wake up, output exactly this JSON:
+{"action": "SLEEP_STOP"}
+
+5. If the user is just chatting, asking a question, or giving a normal command (e.g. "search the web", "open youtube", "how are you"), output exactly:
 NONE
 
 You MUST output ONLY the JSON object or NONE. No prose, no thinking."""
@@ -43,13 +50,25 @@ def _observe_turn_blocking(user_text: str):
             return
             
         data = json.loads(parsed)
+        
+        # Handle Avatar State
+        action = data.get("action")
+        if action in ("SLEEP_START", "SLEEP_STOP"):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.sendto(action.encode('utf-8'), ("127.0.0.1", 55555))
+                print(f"[observer] Triggered avatar {action}")
+            except Exception as e:
+                print(f"[observer] UDP failed: {e}")
+                
+        # Handle Memory
         mem_type = data.get("type")
         content = data.get("content")
         
         if mem_type and content:
             # We reuse memory_control.save_memory because it handles the file IO
             memory_control.save_memory(data)
-            print(f"[memory_observer] Extracted {mem_type} memory: {content}")
+            print(f"[observer] Extracted {mem_type} memory: {content}")
             
     except Exception as e:
         print(f"[memory_observer] extraction failed silently: {e}")
