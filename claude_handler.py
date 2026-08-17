@@ -741,6 +741,23 @@ def system_blocks(date_block: str) -> list[dict]:
     """
     blocks = [{"type": "text", "text": AKIRA_PROMPT,
                "cache_control": {"type": "ephemeral"}}]
+               
+    # INJECT LOCAL CORE PROFILE (Layer A Memory)
+    import os
+    profile_path = os.path.join(os.path.dirname(__file__), "memory", "core_profile.md")
+    if os.path.exists(profile_path):
+        try:
+            with open(profile_path, "r", encoding="utf-8") as f:
+                core_memory = f.read().strip()
+                if core_memory:
+                    blocks.append({
+                        "type": "text", 
+                        "text": f"--- CORE PROFILE MEMORY ---\n{core_memory}\n---------------------------\n",
+                        "cache_control": {"type": "ephemeral"}
+                    })
+        except Exception as e:
+            print(f"[system_blocks] could not read core profile: {e}")
+
     try:
         import obsidian_context
         if obsidian_context.is_focus_mode():
