@@ -20,6 +20,7 @@ import win32gui
 import requests
 import pygetwindow as gw
 import tkinter as tk
+import memory_control
 from PIL import ImageGrab
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -5391,6 +5392,10 @@ _ACTION_MAP = {
     "open_url":          _handle_open_url,
     "web_search":        _handle_web_search,
     "site_search":       _handle_site_search,
+    "search_memory":     lambda p: memory_control.search_memory(p),
+    "forget_today":      lambda _: memory_control.forget_today(),
+    "wipe_all_memory":   lambda _: memory_control.wipe_all_memory(),
+
     "fill":              fill,
     "scroll":            scroll,
     "new_tab":           new_tab,
