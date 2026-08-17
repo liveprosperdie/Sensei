@@ -1254,6 +1254,9 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
         print("[v0] session context done")
 
     print("[v0] calling LLM...")
+    import memory_observer
+    memory_observer.observe_turn_async(text)
+    
     response = get_akira_response(text)
     print("[v0] LLM returned")
     if response is None:
