@@ -31,8 +31,12 @@ from openwakeword import Model as WakeModel
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-openwakeword.utils.download_models()
+groq_key = os.getenv("GROQ_API_KEY")
+groq_client = Groq(api_key=groq_key) if groq_key else None
+try:
+    openwakeword.utils.download_models()
+except Exception:
+    pass
 
 # Score above which "Sensei" counts as heard. Defined here because the startup
 # banner reports it — set SENSEI_WAKE_DEBUG=1 to print live scores and tune it.
@@ -43,23 +47,24 @@ WAKE_DEBUG     = os.getenv("SENSEI_WAKE_DEBUG", "") not in ("", "0", "false")
 # directory — launching from a shortcut or any other folder otherwise fails.
 _WAKE_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "sensei.onnx")
-if not os.path.isfile(_WAKE_MODEL):
-    raise SystemExit(
-        f"Wake model not found: {_WAKE_MODEL}\n"
-        "sensei.onnx is gitignored, so a fresh clone won't have it — copy your "
-        "trained model into the project folder."
-    )
-oww_model = WakeModel(wakeword_models=[_WAKE_MODEL], inference_framework="onnx")
+oww_model = None
+_WAKE_KEY = None
+if os.path.isfile(_WAKE_MODEL):
+    try:
+        oww_model = WakeModel(wakeword_models=[_WAKE_MODEL], inference_framework="onnx")
+        _WAKE_KEY = next(iter(oww_model.models.keys()), None)
+    except Exception as e:
+        print(f"[sensei] Wake model load warning: {e}")
+else:
+    try:
+        oww_model = WakeModel()
+        _WAKE_KEY = next(iter(oww_model.models.keys()), None)
+        print(f"[sensei] Custom model sensei.onnx not found — loaded openwakeword default model: {_WAKE_KEY}")
+    except Exception as e:
+        print(f"[sensei] Voice wake model (sensei.onnx) not found. VAD speech-detection active (listening for speech).")
 
-# openwakeword's predict() returns {model_label: score} for EVERY loaded model.
-# Reading position [0] out of that dict assumed one model and a stable order;
-# after an openwakeword upgrade it can silently return a different label's
-# score, so the wake word never fires and nothing is logged. Bind the real key
-# once, here, and fail loudly if it can't be determined.
-_WAKE_KEY = next(iter(oww_model.models.keys()), None)
-if _WAKE_KEY is None:
-    raise SystemExit(f"Wake model {_WAKE_MODEL} loaded no usable model.")
-print(f"[wake] model '{_WAKE_KEY}' loaded, threshold {WAKE_THRESHOLD}")
+if _WAKE_KEY:
+    print(f"[wake] model '{_WAKE_KEY}' loaded, threshold {WAKE_THRESHOLD}")
 
 # Resolved tier config, printed once at startup. The five layers are independent
 # env vars, so the effective configuration is not readable from any single one —
@@ -98,13 +103,25 @@ if not _hw_config["thresholds"]["measured"]:
 for _e in _hw_config["probe_errors"]:
     print(f"[hardware] PROBE: {_e}")
 
-mic = pyaudio.PyAudio()
-stream = mic.open(format=pyaudio.paInt16, channels=1, rate=16000,
-                  input=True, frames_per_buffer=1280)
+mic = None
+stream = None
+vad_model = None
+_audio_inited = False
 
-vad_model, _ = torch.hub.load(
-    repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=False
-)
+def _init_audio():
+    global mic, stream, vad_model, _audio_inited
+    if _audio_inited:
+        return
+    _audio_inited = True
+    try:
+        mic = pyaudio.PyAudio()
+        stream = mic.open(format=pyaudio.paInt16, channels=1, rate=16000,
+                          input=True, frames_per_buffer=1280)
+        vad_model, _ = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=False
+        )
+    except Exception as e:
+        print(f"[sensei] Audio/VAD init warning: {e}")
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -421,10 +438,13 @@ def transcribe_command(audio: np.ndarray) -> str:
 
 
 def flush_stream() -> None:
-    if not user_speaking.is_set():
-        available = stream.get_read_available()
-        if available > 0:
-            stream.read(available, exception_on_overflow=False)
+    if stream is not None and not user_speaking.is_set():
+        try:
+            available = stream.get_read_available()
+            if available > 0:
+                stream.read(available, exception_on_overflow=False)
+        except Exception:
+            pass
 
 
 # ── VAD barge-in listener ─────────────────────────────────────────────────────
@@ -432,17 +452,20 @@ def flush_stream() -> None:
 def _vad_listener() -> None:
     """Daemon thread: runs VAD while Akira is speaking to detect barge-in."""
     while True:
-        if akira_speaking:
-            chunk = stream.read(512, exception_on_overflow=False)
-            audio_np = np.frombuffer(chunk, dtype=np.int16)
-            audio_f  = torch.FloatTensor(audio_np.astype(np.float32) / 32768.0)
-            confidence = vad_model(audio_f, 16000).item()
-            if confidence > 0.5:
-                user_speaking.set()
-                with vad_buffer_lock:
-                    vad_audio_buffer.append(audio_np.astype(np.float32))
+        if akira_speaking and stream is not None and vad_model is not None:
+            try:
+                chunk = stream.read(512, exception_on_overflow=False)
+                audio_np = np.frombuffer(chunk, dtype=np.int16)
+                audio_f  = torch.FloatTensor(audio_np.astype(np.float32) / 32768.0)
+                confidence = vad_model(audio_f, 16000).item()
+                if confidence > 0.5:
+                    user_speaking.set()
+                    with vad_buffer_lock:
+                        vad_audio_buffer.append(audio_np.astype(np.float32))
+            except Exception:
+                time.sleep(0.01)
         else:
-            time.sleep(0.01)
+            time.sleep(0.05)
 
 
 vad_thread = threading.Thread(target=_vad_listener, daemon=True)
@@ -1263,98 +1286,107 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
     return handle_response(response)
 
 
-while True:
-    try:
-        current_time = time.time()
-
-        # ── Active session ────────────────────────────────────────────
-        if session_active and (current_time - session_start_time) < SESSION_TIMEOUT:
-
-            with vad_buffer_lock:
-                if user_speaking.is_set() and vad_audio_buffer:
-                    pre_audio = np.concatenate(vad_audio_buffer)
-                    vad_audio_buffer.clear()
-                    user_speaking.clear()
-                else:
-                    pre_audio = None
-                    vad_audio_buffer.clear()
-
-            audio = record_command(pre_audio=pre_audio)
-            if audio is None:
-                session_active = False
-                oww_model.reset()
-                continue
-
-            text = transcribe_command(audio)
-            session_active = _process_command(text)
-            if session_active:
-                print("[session] continuing")
-            else:
-                oww_model.reset()
-
-        # ── Idle — listening for wake word ────────────────────────────
-        else:
-            session_active = False
-
-            # Interrupt-on-completion. This branch polls every ~80ms, so a task
-            # that finishes while Akira is idle gets announced essentially the
-            # moment it finishes, with no wake word needed.
-            #
-            # Idle is the ONLY point where speaking unprompted is safe: during a
-            # turn the mic is actively recording, so speaking there would put
-            # Akira's own voice into the transcription. Anything that completes
-            # mid-turn is announced by handle_response instead.
-            if background_tasks.has_announcements() and not user_speaking.is_set():
-                if _announce_background():
-                    # Akira's own voice just went into an open mic. Drop it and
-                    # reset the detector so it cannot self-trigger the wake word.
-                    flush_stream()
-                    oww_model.reset()
-                    last_activation_time = time.time()
-                    continue
-
-            chunk    = stream.read(1280, exception_on_overflow=False)
-            audio_np = np.frombuffer(chunk, dtype=np.int16)
-            # Look the score up by the model's real key. Positional access
-            # returned whichever model the dict happened to order first.
-            scores   = oww_model.predict(audio_np)
-            score    = scores.get(_WAKE_KEY, 0.0)
-
-            if WAKE_DEBUG:
-                # Peak amplitude proves the mic is actually delivering audio —
-                # a flat 0 here means the input device is wrong or muted, which
-                # looks identical to "wake word not working" from the outside.
-                peak = int(np.abs(audio_np).max()) if audio_np.size else 0
-                print(f"[wake] score={score:.3f} peak={peak:5d} "
-                      f"keys={list(scores)}")
-
+def main():
+    global session_active, last_activation_time, session_start_time
+    _init_audio()
+    while True:
+        try:
             current_time = time.time()
-            if score > WAKE_THRESHOLD and (current_time - last_activation_time) > COOLDOWN_TIME:
-                print("Wake word detected!")
-                winsound.Beep(1000, 200)
-                last_activation_time = current_time
 
-                print("[v0] recording command...")
-                audio = record_command()
+            # ── Active session ────────────────────────────────────────────
+            if session_active and (current_time - session_start_time) < SESSION_TIMEOUT:
+
+                with vad_buffer_lock:
+                    if user_speaking.is_set() and vad_audio_buffer:
+                        pre_audio = np.concatenate(vad_audio_buffer)
+                        vad_audio_buffer.clear()
+                        user_speaking.clear()
+                    else:
+                        pre_audio = None
+                        vad_audio_buffer.clear()
+
+                audio = record_command(pre_audio=pre_audio)
                 if audio is None:
-                    print("[v0] record returned None (too quiet), back to idle")
+                    session_active = False
+                    if oww_model:
+                        oww_model.reset()
                     continue
 
-                print("[v0] transcribing...")
                 text = transcribe_command(audio)
-                print(f"[v0] heard: {text!r}")
-                session_active = _process_command(text, inject_context=True)
-
+                session_active = _process_command(text)
                 if session_active:
-                    last_activation_time = time.time()
-                    session_start_time   = time.time()
-                    oww_model.reset()
+                    print("[session] continuing")
+                else:
+                    if oww_model:
+                        oww_model.reset()
 
-    except KeyboardInterrupt:
-        print("\nShutting down Sensei.")
-        break
-    except Exception as e:
-        # outer safety net — log and continue, never crash the main loop
-        print(f"[main loop] unhandled exception: {e!r}")
-        time.sleep(1.0)
-        continue
+            # ── Idle — listening for wake word ────────────────────────────
+            else:
+                session_active = False
+
+                if background_tasks.has_announcements() and not user_speaking.is_set():
+                    if _announce_background():
+                        flush_stream()
+                        if oww_model:
+                            oww_model.reset()
+                        last_activation_time = time.time()
+                        continue
+
+                if stream is None:
+                    time.sleep(0.1)
+                    continue
+
+                chunk    = stream.read(1280, exception_on_overflow=False)
+                audio_np = np.frombuffer(chunk, dtype=np.int16)
+                scores   = oww_model.predict(audio_np) if oww_model else {}
+                score    = scores.get(_WAKE_KEY, 0.0) if _WAKE_KEY else 0.0
+
+                current_time = time.time()
+                triggered = score > WAKE_THRESHOLD and (current_time - last_activation_time) > COOLDOWN_TIME
+                
+                # If no custom wake model exists, fallback to VAD speech activity trigger
+                if not triggered and oww_model is None and (current_time - last_activation_time) > COOLDOWN_TIME:
+                    if vad_model is not None and len(audio_np) > 0:
+                        audio_f = torch.from_numpy(audio_np).float() / 32768.0
+                        with torch.no_grad():
+                            vad_conf = vad_model(audio_f, 16000).item()
+                        if vad_conf > 0.6:
+                            triggered = True
+                            print("[voice] Speech detected!")
+
+                if WAKE_DEBUG:
+                    peak = int(np.abs(audio_np).max()) if audio_np.size else 0
+                    print(f"[wake] score={score:.3f} peak={peak:5d} "
+                          f"keys={list(scores)}")
+
+                if triggered:
+                    winsound.Beep(1000, 200)
+                    last_activation_time = current_time
+
+                    print("[v0] recording command...")
+                    audio = record_command()
+                    if audio is None:
+                        print("[v0] record returned None (too quiet), back to idle")
+                        continue
+
+                    print("[v0] transcribing...")
+                    text = transcribe_command(audio)
+                    print(f"[v0] heard: {text!r}")
+                    session_active = _process_command(text, inject_context=True)
+
+                    if session_active:
+                        last_activation_time = time.time()
+                        session_start_time   = time.time()
+                        if oww_model:
+                            oww_model.reset()
+
+        except KeyboardInterrupt:
+            print("\nShutting down Sensei.")
+            break
+        except Exception as e:
+            print(f"[main loop] unhandled exception: {e!r}")
+            time.sleep(1.0)
+            continue
+
+if __name__ == "__main__":
+    main()

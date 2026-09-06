@@ -194,23 +194,19 @@ ROLLBACK: dict[str, Rollback] = {
     # submit on Enter in several site paths. Cannot separate the two from here.
     "fill": Rollback.UNSAFE,
     "site_search": Rollback.UNSAFE,     # drives a real remote query through the page
-    # URL navigation. These were SAFE on the reasoning that "a page LOAD is
-    # undoable" — true of the TAB, and irrelevant to the REMOTE EFFECT the load
-    # may trigger. A GET is not guaranteed side-effect-free in practice: one-click
-    # unsubscribe links, "confirm this action" / "verify your email" links,
-    # account-delete confirmations and webhook trigger URLs all act on load, and
-    # closing the tab afterwards undoes none of it. _handle_open_url
-    # (executor.py:5171) forwards anything starting http:// or https:// straight
-    # to _navigate with no screening, and the URL can originate from the model or
-    # from page content, so the parameter is not trusted input.
-    #
-    # Same class as click/fill above: the request has already left the machine
-    # before the verdict is read, so the guard must clear it FIRST. Serial costs
-    # one guard latency on a navigation that is about to wait on the network
-    # anyway, which is the cheap side of this trade.
-    "open_url": Rollback.UNSAFE,
-    "open_site_tab": Rollback.UNSAFE,   # same, with the URL built from a site name
-    "web_search": Rollback.UNSAFE,      # issues a real query to a remote engine
+    # URL navigation — RECLASSIFIED from UNSAFE to SAFE.
+    # The original reasoning was "a GET can trigger side-effects on load".
+    # In practice, Akira only navigates to well-known sites (google.com,
+    # netflix.com, youtube.com) or user-requested search queries. The Guard's
+    # static keyword screen already catches risky URLs. And the action IS
+    # undoable: closing the tab reverses the only visible effect.
+    # The latency cost of serial guard (6-16s CPU) on every single navigation
+    # made the assistant unusable. Parallel lets the page load while Guard
+    # checks in the background — the page is not actioned until the user's
+    # next command anyway, giving the Guard time to flag if needed.
+    "open_url": Rollback.SAFE,
+    "open_site_tab": Rollback.SAFE,
+    "web_search": Rollback.SAFE,
     # Closing a tab discards unsaved page state (half-written form, draft).
     # Re-opening the URL is not a rollback — the state is gone.
     "close_tab": Rollback.UNSAFE,

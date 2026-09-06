@@ -72,68 +72,67 @@ class Tier:
     going stale inside one retirement cycle.
     """
 
-    __slots__ = ("name", "model", "base_url", "key_env")
+    __slots__ = ("name", "model", "base_url", "key_env", "lora_index")
 
-    def __init__(self, name: str, model: str, base_url: str, key_env: str):
+    def __init__(self, name: str, model: str, base_url: str, key_env: str,
+                 lora_index: int = -1):
         self.name = name
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.key_env = key_env
+        self.lora_index = lora_index  # -1 = no LoRA selection (remote API)
 
     @property
     def api_key(self) -> str | None:
-        return (os.environ.get(self.key_env) or "").strip() or None
+        key = (os.environ.get(self.key_env) or "").strip()
+        if key:
+            return key
+        if "localhost" in self.base_url or "127.0.0.1" in self.base_url:
+            return "local"
+        return None
 
     @property
     def available(self) -> bool:
         return self.api_key is not None
 
+    @property
+    def is_local(self) -> bool:
+        """True when this tier points at a local llama-server."""
+        return "localhost" in self.base_url or "127.0.0.1" in self.base_url
+
     def __repr__(self) -> str:
         return f"<Tier {self.name} {self.model}>"
 
 
-# NOTE ON COST: Qwen's free tier ended April 2026 — qwen2.5-max is paid, just
-# very cheap, so SERVANT_MECH reduces spend rather than eliminating it.
-# DashScope's maintained line has since moved to Qwen3.x (qwen3-flash and
-# similar); qwen2.5-max still serves and is what was specified, but the
-# QWEN_MODEL override below is the migration path when that changes.
+# NOTE ON COST: Single local llama-server on :8081 with multi-LoRA.
+# LoRA indices match the order passed to --lora in start_ai_engines.bat:
+#   --lora akira_guard.gguf  → index 0
+#   --lora akira_api.gguf    → index 1
+#   --lora akira_mech.gguf   → index 2
 SERVANT_GEN = Tier(
     "SERVANT_GEN",
-    os.environ.get("GLM_MODEL", "glm-5.2"),
-    os.environ.get("GLM_BASE_URL", "https://api.z.ai/api/paas/v4/"),
+    os.environ.get("GLM_MODEL", "akira-api"),
+    os.environ.get("GLM_BASE_URL", os.environ.get("SENSEI_LOCAL_API_URL", "http://localhost:8081/v1")),
     "GLM_API_KEY",
+    lora_index=1,
 )
 
 SERVANT_MECH = Tier(
     "SERVANT_MECH",
-    os.environ.get("QWEN_MODEL", "qwen2.5-max"),
-    os.environ.get("QWEN_BASE_URL",
-                   "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+    os.environ.get("QWEN_MODEL", "akira-mech"),
+    os.environ.get("QWEN_BASE_URL", os.environ.get("SENSEI_LOCAL_MECH_URL", "http://localhost:8081/v1")),
     "QWEN_API_KEY",
+    lora_index=2,
 )
 
-# GUARD is a fourth ROLE, not a third servant. It shares the servant wire
-# format and this module's Tier plumbing, but its failure policy is the exact
-# inverse (see guard.py): a servant that cannot answer falls back to the brain
-# and the task still completes, whereas a guard that cannot answer must never
-# resolve to "approved".
-#
-# Pointed at Qwen and keyed on the EXISTING QWEN_API_KEY on purpose: adding a
-# second secret would mean the guard is unrunnable until someone provisions it,
-# and an unprovisioned guard is the one failure mode most likely to get it
-# switched off. GUARD_MODEL/GUARD_BASE_URL/GUARD_API_KEY_ENV are separate
-# overrides so repointing at Kimi (or any OpenAI-compatible endpoint) is a .env
-# edit, not a code change — same migration path the QWEN_MODEL override exists
-# for. Sharing SERVANT_MECH's key does mean one revoked key takes out both the
-# mechanical tier and the guard at once; GUARD_API_KEY_ENV is how you split
-# them without touching this file.
 GUARD = Tier(
     "GUARD",
-    os.environ.get("GUARD_MODEL", "qwen2.5-max"),
-    os.environ.get("GUARD_BASE_URL",
-                   "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+    os.environ.get("GUARD_MODEL", "akira-guard"),
+    os.environ.get("GUARD_BASE_URL", os.environ.get("SENSEI_LOCAL_GUARD_URL", "http://localhost:8081/v1")),
     os.environ.get("GUARD_API_KEY_ENV", "QWEN_API_KEY"),
+    lora_index=0,
 )
+
 
 DEFAULT_TIMEOUT = 90.0
 
@@ -177,6 +176,12 @@ def call_openai_compatible(tier: Tier, *, system: str, user: str | None = None,
     }
     if json_mode:
         body["response_format"] = {"type": "json_object"}
+
+    # Per-request LoRA selection for the local multi-LoRA server.
+    # --lora-init-without-apply means no adapter is applied by default;
+    # each request must specify which one via the "lora" field.
+    if tier.is_local and tier.lora_index >= 0:
+        body["lora"] = [{"id": tier.lora_index, "scale": 1.0}]
 
     url = f"{tier.base_url}/chat/completions"
     started = time.monotonic()

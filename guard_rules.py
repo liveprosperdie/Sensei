@@ -136,7 +136,9 @@ IGNORED = Rule(0, 0, screen=False)   # handler takes no parameter (lambda _:)
 OPT_TEXT = Rule(0, 1)                # one optional free-text field
 TEXT = Rule(1, 1)                    # one required free-text field
 SUB = Rule(1, 2)                     # "sub" or "sub|arg"
-SUB_ARGS = Rule(1, 3)                # "app|sub|args" (office_control only)
+SUB_ARGS = Rule(1, 3)                # "app|sub|args"
+SUB_MULTI = Rule(1, 6)               # multi-field commands (e.g. gmail_compose generate|to|subject|body)
+FILL = Rule(1, 3)                    # "field|text" or "field|text|submit" (Mech Servant fill+enter)
 
 # ACTION_RULES — every key in executor._ACTION_MAP must appear here.
 # verify_guard_coverage.py enforces that statically; if you add an executor
@@ -151,11 +153,11 @@ ACTION_RULES: dict[str, Rule] = {
     "minimize_window": OPT_TEXT,
     # ── browser & web ─────────────────────────────────────────────────────
     "open_url": TEXT,
-    "web_search": TEXT,
+    "web_search": SUB,
     "site_search": SUB,
-    "fill": SUB,
+    "fill": FILL,
     "scroll": OPT_TEXT,
-    "new_tab": OPT_TEXT,
+    "new_tab": SUB,
     "open_site_tab": TEXT,
     "list_tabs": IGNORED,
     "switch_tab": TEXT,
@@ -173,27 +175,24 @@ ACTION_RULES: dict[str, Rule] = {
     "vscode_control": SUB,
     "spotify_control": SUB,
     # ── Google Workspace (MCP) ────────────────────────────────────────────
-    "calendar_control": SUB,
-    "docs_control": SUB,
-    "sheets_control": SUB,
-    "slides_control": SUB,
-    "gmail_control": SUB,
-    "gmail_compose": SUB,
+    "calendar_control": SUB_MULTI,
+    "docs_control": SUB_MULTI,
+    "sheets_control": SUB_MULTI,
+    "slides_control": SUB_MULTI,
+    "gmail_control": SUB_MULTI,
+    "gmail_compose": SUB_MULTI,
     # ── Microsoft Office (COM) ────────────────────────────────────────────
-    # The only three-field shape in the table: "app|sub|args". Field 1 is the
-    # sub-action, which is why risk classification is delegated rather than
-    # copied — see the module docstring.
-    "office_control": SUB_ARGS,
+    "office_control": SUB_MULTI,
     # ── Obsidian ──────────────────────────────────────────────────────────
-    "obsidian_control": SUB,
+    "obsidian_control": SUB_MULTI,
     # ── files ─────────────────────────────────────────────────────────────
-    "create_file": TEXT,
+    "create_file": SUB_MULTI,
     "read_file": TEXT,
-    "read_more": IGNORED,
+    "read_more": SUB,
     "stop_reading": IGNORED,
     "write_file": SUB,
-    "edit_file": SUB,
-    "search_file": TEXT,
+    "edit_file": SUB_MULTI,
+    "search_file": SUB,
     "open_file": TEXT,
     "open_folder": TEXT,
     "list_folder": OPT_TEXT,
@@ -208,14 +207,14 @@ ACTION_RULES: dict[str, Rule] = {
     "summarize_file": TEXT,
     "file_to_doc": SUB,
     # ── media & clipboard ─────────────────────────────────────────────────
-    "search_image": TEXT,
+    "search_image": SUB,
     "download_image": TEXT,
     "set_wallpaper": TEXT,
     "read_clipboard": IGNORED,
     "write_clipboard": TEXT,
     "adjust_volume": TEXT,
     "adjust_brightness": TEXT,
-    "screenshot": IGNORED,
+    "screenshot": OPT_TEXT,
     "background_status": IGNORED,
     # ── power & session (legacy aliases onto system_control) ──────────────
     "lock_screen": IGNORED,
@@ -243,6 +242,19 @@ ACTION_RULES: dict[str, Rule] = {
     "shutdown_pc": IGNORED,
     "restart_pc": IGNORED,
     "preview_temp_cleanup": IGNORED,
+    # ── clipboard output ───────────────────────────────────────────────────
+    "write_clipboard": TEXT,
+    "speak_clipboard": IGNORED,
+    # ── LLM hallucination aliases: map to real actions via pre-router ─────
+    # These entries prevent a BLOCK when Groq invents a plausible-sounding
+    # action name. The pre-router maps them BEFORE execution, but guard_rules
+    # must also accept them so static validation doesn't short-circuit first.
+    "write_text": TEXT,       # → write_clipboard (intercepted in pre-router)
+    "type_text": TEXT,        # → write_clipboard
+    "insert_text": TEXT,      # → write_clipboard
+    "fill_input": SUB_MULTI,  # → fill
+    "file_search": TEXT,      # → search_file
+    "folder_search": TEXT,    # → search_file
 }
 
 

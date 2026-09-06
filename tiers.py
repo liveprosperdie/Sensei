@@ -222,6 +222,7 @@ class LocalModel:
             f"inference runtime is wired into this build.")
 
 
+
 # ── Layer resolution ─────────────────────────────────────────────────────────
 
 def head(plan: str | None = None) -> HeadSpec | Unavailable:
@@ -308,6 +309,8 @@ def servant(plan: str | None = None) -> ServantSpec:
     slot = LocalModel(plan, adapters=(plan in (STANDARD, PRO)))
     hosted = _hosted_fallback() if plan == PRO else None
     return ServantSpec(plan, slot, hosted, adapters=slot.adapters)
+
+
 
 
 def servant_allowed(plan: str | None = None) -> Unavailable | None:

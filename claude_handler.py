@@ -1708,22 +1708,29 @@ def _routing_call(messages: list[dict], date_block: str):
     return client.messages.create(**kwargs)
 
 
-def ask_akira(text: str) -> str:
-    """Send user text to Akira, get back a JSON string response."""
-    # inject PC context safely
-    try:
-        from executor import get_pc_context
-        ctx = get_pc_context()
-        fg = ctx.get("foreground_app") or "unknown"
-        if ctx.get("current_url") and ctx["current_url"] not in ("about:blank", "chrome://newtab/", ""):
-            context_str = (
-                f"[PC STATE] Focused app: {fg} | Page: {ctx.get('current_page_title', '')} | {ctx['current_url']} | "
-                f"Windows: {', '.join(ctx['open_windows'][:4])}\n\n"
-            )
-        else:
-            context_str = f"[PC STATE] Focused app: {fg} | Windows: {', '.join(ctx['open_windows'][:4])}\n\n"
-        full_text = context_str + text
-    except Exception:
+def ask_akira(text: str, *, skip_context: bool = False) -> str:
+    """Send user text to Akira, get back a JSON string response.
+
+    skip_context=True bypasses the Selenium-based get_pc_context() call,
+    which avoids 3-5s of chromedriver cold-start overhead in text mode.
+    """
+    # inject PC context safely (only when a browser session is likely active)
+    if not skip_context:
+        try:
+            from executor import get_pc_context
+            ctx = get_pc_context()
+            fg = ctx.get("foreground_app") or "unknown"
+            if ctx.get("current_url") and ctx["current_url"] not in ("about:blank", "chrome://newtab/", ""):
+                context_str = (
+                    f"[PC STATE] Focused app: {fg} | Page: {ctx.get('current_page_title', '')} | {ctx['current_url']} | "
+                    f"Windows: {', '.join(ctx['open_windows'][:4])}\n\n"
+                )
+            else:
+                context_str = f"[PC STATE] Focused app: {fg} | Windows: {', '.join(ctx['open_windows'][:4])}\n\n"
+            full_text = context_str + text
+        except Exception:
+            full_text = text
+    else:
         full_text = text
 
     with _history_lock:

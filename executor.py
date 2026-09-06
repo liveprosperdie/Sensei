@@ -12,6 +12,7 @@ import zipfile
 import psutil
 import winreg
 import datetime
+import threading
 import webbrowser
 import subprocess
 import urllib.parse
@@ -295,6 +296,11 @@ _VK_CODES = {
     'left': (0x25, 'ArrowLeft', ''), 'up': (0x26, 'ArrowUp', ''),
     'right': (0x27, 'ArrowRight', ''), 'down': (0x28, 'ArrowDown', ''),
 }
+
+
+
+
+
 
 
 def _ensure_target_tab(browser) -> str | None:
@@ -589,22 +595,44 @@ def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
                     break
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-        profile_dir = os.path.join(os.environ["LOCALAPPDATA"], "Sensei", "AkiraChromeProfile")
-        os.makedirs(profile_dir, exist_ok=True)
-        subprocess.Popen([
+        user_data_dir = os.environ.get("CHROME_USER_DATA_DIR")
+        if not user_data_dir:
+            chrome_user_data = os.path.join(os.environ.get("LOCALAPPDATA", r"C:\Users\swast\AppData\Local"), "Google", "Chrome", "User Data")
+            if os.path.exists(chrome_user_data):
+                user_data_dir = chrome_user_data
+            else:
+                user_data_dir = os.path.join(os.environ.get("LOCALAPPDATA", r"C:\Users\swast\AppData\Local"), "Sensei", "AkiraChromeProfile")
+        
+        profile_name = os.environ.get("CHROME_PROFILE", "Default")
+        os.makedirs(user_data_dir, exist_ok=True)
+
+        cmd = [
             binary_path,
             f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile_dir}",
+            f"--user-data-dir={user_data_dir}",
+            f"--profile-directory={profile_name}",
             "--no-first-run",
             "--disable-session-crashed-bubble",
             "--restore-last-session=false",
-        ])
-        for _ in range(40):
+            "--remote-allow-origins=*",
+        ]
+        subprocess.Popen(cmd)
+        for _ in range(20):
             if _port_ready(port):
                 break
-            time.sleep(0.5)
+            time.sleep(0.3)
         else:
-            raise RuntimeError(f"Browser at {binary_path} did not bind port {port} within 20s")
+            # Retry fallback with dedicated fallback profile directory if primary port failed
+            fb_dir = os.path.join(user_data_dir, "FallbackProfile")
+            os.makedirs(fb_dir, exist_ok=True)
+            cmd[2] = f"--user-data-dir={fb_dir}"
+            subprocess.Popen(cmd)
+            for _ in range(20):
+                if _port_ready(port):
+                    break
+                time.sleep(0.3)
+            else:
+                raise RuntimeError(f"Browser at {binary_path} did not bind port {port} within 12s")
 
     options = Options()
     options.binary_location = binary_path
@@ -749,6 +777,39 @@ def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.C
     _browsers[key] = driver
     _last_browser_name = name
     return driver
+
+
+_warmup_thread: threading.Thread | None = None
+
+def warmup_browser(name: str | None = None) -> None:
+    """Pre-warm Chrome browser asynchronously in a background daemon thread.
+    
+    Eliminates the ~1.5s cold-start latency on the first browser action so that
+    opening sites, searching, or drafting emails happens in ~15ms immediately.
+    """
+    global _warmup_thread
+    if _warmup_thread and _warmup_thread.is_alive():
+        return
+
+    def _do_warmup():
+        try:
+            t0 = time.perf_counter()
+            _ = get_browser(name)
+            dt_ms = (time.perf_counter() - t0) * 1000
+            print(f"[BROWSER] Chrome pre-warmed & attached in {dt_ms:.1f}ms (ready for instant actions)")
+        except Exception as e:
+            print(f"[BROWSER] Background browser pre-warmup warning: {e}")
+
+    _warmup_thread = threading.Thread(target=_do_warmup, daemon=True, name="AkiraBrowserWarmup")
+    _warmup_thread.start()
+
+
+# Auto-trigger asynchronous browser pre-warming on system import
+try:
+    warmup_browser()
+except Exception as _w_err:
+    print(f"[BROWSER] Auto-warmup trigger warning: {_w_err}")
+
 
 
 def _navigate(url: str) -> None:
@@ -1035,6 +1096,20 @@ def youtube_control(parameter: str) -> str:
         WebDriverWait(browser, 8).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     except Exception:
         pass
+
+    # ── Group 0: Direct Video Search & Auto-Play ───────────────────────────
+    if param.startswith("play ") and param not in ("play", "playing") or param.startswith("search "):
+        query_str = param.replace("play ", "", 1).replace("search ", "", 1).strip()
+        query = urllib.parse.quote(query_str)
+        url = f"https://www.youtube.com/results?search_query={query}"
+        browser.get(url)
+        try:
+            WebDriverWait(browser, 6).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "ytd-video-renderer a#video-title, a#video-title")))
+            first_video = browser.find_element(By.CSS_SELECTOR, "ytd-video-renderer a#video-title, a#video-title")
+            first_video.click()
+            return f"Playing '{query_str}' on YouTube."
+        except Exception:
+            return f"Opened YouTube search results for '{query_str}'."
 
     if "youtube.com" not in (browser.current_url or ""):
         return "This isn't a YouTube tab right now. Switch to YouTube first."
@@ -3085,12 +3160,16 @@ def gmail_compose(action: str, parameter: str | None = None) -> dict:
     tool requires a send-capable OAuth token (gmail.modify + mail.google.com),
     which would break the token-level read-only guarantee on sensei-gmail-ro.
     """
-    print(f"[gmail_compose] action={action!r}")
-    action = (action or "").strip().lower()
-    if action not in ("draft", "generate"):
-        return {"success": False, "message": f"Unknown gmail_compose action: {action}"}
+    print(f"[gmail_compose] action={action!r}, parameter={parameter!r}")
+    action_clean = (action or "").strip().lower()
+    if action_clean not in ("draft", "generate"):
+        full_param = f"{action}|{parameter}" if parameter else (action or "")
+        parts = full_param.split("|", 2)
+        action = "draft"
+    else:
+        action = action_clean
+        parts = (parameter or "").split("|", 2)
 
-    parts = (parameter or "").split("|", 2)
     if len(parts) < 3 or not parts[0].strip():
         return {"success": False,
                 "message": "Drafting needs a recipient, a subject, and the "
@@ -5016,6 +5095,12 @@ def minimize_window(parameter: str) -> str:
 def scroll(parameter: str) -> str:
     browser = get_browser(_last_browser_name)
     param = parameter.lower().strip()
+    if "|" in param:
+        parts = param.split("|")
+        param = parts[0].strip()
+        target_tab = parts[1].replace("tab:", "").strip()
+        if target_tab:
+            switch_tab(target_tab)
     scripts = {
         "down":   "window.scrollBy(0,500);",
         "up":     "window.scrollBy(0,-500);",
@@ -5150,6 +5235,20 @@ def fill(parameter: str) -> str:
     from element_matcher import find_element_index
     index = find_element_index(elements, instruction)
     if index is None or index >= len(elements):
+        # Fallback to first visible input/textarea on the page if exact match fails
+        inputs = browser.find_elements(By.CSS_SELECTOR, 'input:not([type="hidden"]), textarea')
+        for inp in inputs:
+            if inp.is_displayed():
+                try:
+                    inp.click()
+                    inp.clear()
+                    inp.send_keys(text)
+                    if should_submit:
+                        from selenium.webdriver.common.keys import Keys
+                        inp.send_keys(Keys.RETURN)
+                    return f"Typed '{text}' into input field." + (" Submitted." if should_submit else "")
+                except Exception:
+                    continue
         return "Couldn't find that field."
     el = browser.find_elements(By.CSS_SELECTOR, f'[data-akira-index="{index}"]')
     if not el:
@@ -5471,6 +5570,16 @@ _ACTION_MAP = {
     # action there needs no edit here. Tier 2 entries are confirmation-gated
     # by sensei's existing safety net, not by anything in this map.
     **_system_control.ACTIONS,
+    # ── LLM hallucination aliases ─────────────────────────────────────────
+    # Groq sometimes invents plausible action names that don't exist. These
+    # aliases route them to the closest real handler so they execute cleanly
+    # instead of failing with "Unknown action".
+    "write_text":    write_clipboard,   # "write text in notepad" → clipboard
+    "type_text":     write_clipboard,   # "type this text" → clipboard
+    "insert_text":   write_clipboard,   # "insert text" → clipboard
+    "fill_input":    fill,              # "fill input" → fill
+    "file_search":   search_file,       # "find a file named X" → search_file
+    "folder_search": search_file,       # "find a folder named X" → search_file
 }
 
 
