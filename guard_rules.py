@@ -193,6 +193,8 @@ ACTION_RULES: dict[str, Rule] = {
     "write_file": SUB,
     "edit_file": SUB_MULTI,
     "search_file": SUB,
+    "manage_index_scope": SUB,
+    "index_stats": IGNORED,
     "open_file": TEXT,
     "open_folder": TEXT,
     "list_folder": OPT_TEXT,

@@ -3567,45 +3567,53 @@ def edit_file(parameter: str | None = None) -> dict:
 
 
 def search_file(parameter: str | None = None) -> dict:
-    """search_file|filename|optional search_root — recursive partial-name
-    search with a time budget. Read-only, never gated."""
+    """search_file|query|optional search_root|optional content_flag —
+    fast indexed search over SQLite index. Zero live filesystem walks."""
     print(f"[search_file] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
     name = parts[0].strip() if parts and parts[0].strip() else None
     if not name:
         return {"success": False, "message": "What file should I look for?"}
+
+    root = None
     if len(parts) > 1 and parts[1].strip():
-        root, rerr = _resolve_folder(parts[1])   # accepts "pictures", "downloads", paths
-        if rerr:
-            return {"success": False, "message": rerr}
-    else:
-        root = _vsc_last_folder or os.path.expanduser("~")
-    if not os.path.isdir(root):
-        return {"success": False, "message": f"That search folder doesn't exist: {root}"}
-    name_lower = name.lower()
-    results: list = []
-    deadline = time.time() + 15  # hard time budget — never hang on huge drives
-    timed_out = False
-    SKIP_DIRS = {"node_modules", ".git", "__pycache__", "AppData", ".venv",
-                 "venv", "$RECYCLE.BIN", "System Volume Information"}
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for fn in filenames:
-            if name_lower in fn.lower():
-                results.append(os.path.join(dirpath, fn))
-                if len(results) >= 20:
-                    break
-        if len(results) >= 20 or time.time() > deadline:
-            timed_out = time.time() > deadline
-            break
-    if not results:
-        extra = " I stopped after 15 seconds — try a more specific folder." if timed_out else ""
-        return {"success": False, "message": f"No file matching '{name}' found under {root}.{extra}", "results": []}
-    shown = "; ".join(os.path.relpath(r, root) for r in results[:5])
-    extra = " (search timed out — there may be more)" if timed_out else ""
-    return {"success": True, "speak": True,
-            "message": f"Found {len(results)} match{'es' if len(results) != 1 else ''} under {root}: {shown}{extra}",
-            "results": results}
+        resolved_root, rerr = _resolve_folder(parts[1])
+        if not rerr:
+            root = resolved_root
+
+    is_content = False
+    if len(parts) > 2 and parts[2].strip().lower() in ("content", "true", "1", "inside"):
+        is_content = True
+    elif any(kw in name.lower() for kw in ("containing ", "search inside ", "with text ")):
+        is_content = True
+        name = re.sub(r"\b(containing|search inside|with text)\b", "", name, flags=re.I).strip()
+
+    try:
+        import file_index
+        return file_index.search_files(name, root=root, content=is_content)
+    except Exception as e:
+        print(f"[search_file] file_index error: {e}")
+        return {"success": False, "message": f"Could not complete file search: {e}"}
+
+
+def manage_index_scope(parameter: str | None = None) -> dict:
+    """manage_index_scope|action|folder_path — voice management of indexed scope."""
+    import file_index
+    parts = (parameter or "").split("|")
+    action = parts[0].strip() if parts and parts[0].strip() else "status"
+    folder = parts[1].strip() if len(parts) > 1 else None
+    if folder:
+        clean_folder = re.sub(r"^my\s+", "", folder, flags=re.I).strip()
+        resolved, _ = _resolve_folder(clean_folder)
+        if resolved:
+            folder = resolved
+    return file_index.manage_index_scope(action, folder)
+
+
+def index_stats(parameter: str | None = None) -> dict:
+    """index_stats — report current index database size and statistics."""
+    import file_index
+    return file_index.get_index_stats()
 
 
 # ── Bulk file operations ──────────────────────────────────────────────────────
@@ -5618,6 +5626,8 @@ _ACTION_MAP = {
     "write_file":        write_file,
     "edit_file":         edit_file,
     "search_file":       search_file,
+    "manage_index_scope": manage_index_scope,
+    "index_stats":       index_stats,
     "open_file":         open_file,
     "open_folder":       open_folder,
     "list_folder":       list_folder,

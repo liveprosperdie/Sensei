@@ -485,6 +485,19 @@ def on_probation(action: str) -> bool:
     return guard_mode().reliability_gate and not reliability.cleared(action)
 
 
+def content_search_allowed(plan: str | None = None) -> tuple[bool, str]:
+    """May the user perform document content search (PDF, DOCX, TXT)?
+
+    Free tier: filename/metadata search only.
+    Standard & Pro: full document content search allowed.
+    Returns: (is_allowed, explanatory_message)
+    """
+    plan = plan or plan_for(Layer.HEAD)
+    if plan == FREE:
+        return (False, "Content search is available on Standard and Pro — I can still search filenames though.")
+    return (True, "")
+
+
 # ── Diagnostics ──────────────────────────────────────────────────────────────
 
 def warnings() -> list[str]:

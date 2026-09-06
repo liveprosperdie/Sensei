@@ -1363,6 +1363,11 @@ if __name__ == "__main__":
         executor.warmup_browser()
     except Exception as _w_err:
         print(f"[BROWSER] Warmup warning: {_w_err}")
+    try:
+        import file_index
+        file_index.init_file_index(background=True)
+    except Exception as _idx_err:
+        print(f"[file_index] Background init warning: {_idx_err}")
     while True:
         try:
             current_time = time.time()

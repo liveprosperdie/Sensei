@@ -445,6 +445,10 @@ ACTION_ALIASES: dict[str, str] = {
     "find_file": "search_file",
     "find_folder": "search_file",
     "search_files": "search_file",
+    "index_size": "index_stats",
+    "search_index_size": "index_stats",
+    "file_index_size": "index_stats",
+    "manage_index": "manage_index_scope",
     "google_search": "web_search",
     "google": "web_search",
     "search": "web_search",
@@ -506,7 +510,7 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list,
         "- switch_window, maximize_window, minimize_window\n"
         "- screenshot, read_clipboard, write_clipboard\n"
         "- lock_pc, sleep_pc, shutdown_pc, restart_pc\n"
-        "- search_file, open_file, open_folder\n"
+        "- search_file, open_file, open_folder, index_stats, manage_index_scope\n"
         "Output tone must be one of: 'neutral', 'happy', 'calm', 'excited', 'focused'.\n"
         "For commands: {\"mode\": \"command\", \"action\": \"canonical_action_name\", \"parameter\": \"value\", \"tone\": \"focused\"}\n"
         "For chat: {\"mode\": \"conversation\", \"response\": \"reply\", \"tone\": \"neutral\", \"end_session\": false}"
@@ -673,7 +677,7 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
 
     # ── 4. Web Search (generic — default to chrome) ──────────────────────
     m = re.search(r'(?:search|google|look\s+up)\s+(?:for\s+)?(?:on\s+(?:the\s+)?(?:web|internet|google)\s+)?(.+)', text_clean)
-    if m and not re.search(r'(?:file|folder|image|on\s+(?:amazon|flipkart|github|youtube|netflix|spotify))', text_clean):
+    if m and not re.search(r'(?:file|folder|image|index|on\s+(?:amazon|flipkart|github|youtube|netflix|spotify))', text_clean):
         query = m.group(1).strip()
         if len(query) > 3 and not query.startswith(("on ", "in ")):
             return _emit("web_search", f"{query}|browser:chrome")
@@ -959,6 +963,44 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
     if m:
         content = m.group(1).strip().rstrip('".,')
         return _emit("write_clipboard", content)
+
+    # ── 39d. Index Stats & Scope Management ───────────────────────────────
+    # 'how big is my search index', 'index size'
+    m = re.search(r'(?:how\s+(?:big|large)|what\s+is\s+the\s+size\s+of)\s+(?:is\s+)?(?:my\s+|the\s+)?(?:search\s+index|file\s+index|index)', text_clean)
+    if not m:
+        m = re.search(r'\b(?:search\s+index|file\s+index)\s+(?:size|stats|status)\b', text_clean)
+    if m:
+        return _emit("index_stats", "")
+
+    # 'don't index my Downloads', 'exclude folder X from search'
+    m = re.search(r"(?:don'?t\s+index|stop\s+indexing|exclude\s+(?:folder\s+|directory\s+|path\s+)?)(.+?)(?:\s+from\s+(?:the\s+)?(?:index|search))?$", text_clean)
+    if m and any(k in text_clean for k in ("don't index", "dont index", "stop indexing", "exclude")):
+        target = m.group(1).strip().strip('"\'')
+        target = re.sub(r"\s+from\s+(?:the\s+)?(?:index|search)$", "", target, flags=re.I).strip()
+        if target:
+            return _emit("manage_index_scope", f"exclude|{target}")
+
+    # 'include folder X in index', 'start indexing Y'
+    m = re.search(r"(?:include\s+(?:folder\s+|directory\s+|path\s+)?|start\s+indexing\s+)(.+?)(?:\s+in\s+(?:the\s+)?(?:index|search))?$", text_clean)
+    if m and any(k in text_clean for k in ("include", "start indexing")):
+        target = m.group(1).strip().strip('"\'')
+        target = re.sub(r"\s+in\s+(?:the\s+)?(?:index|search)$", "", target, flags=re.I).strip()
+        if target:
+            return _emit("manage_index_scope", f"include|{target}")
+
+    if re.search(r"\b(?:what\s+folders\s+are\s+indexed|show\s+(?:indexed\s+folders|index\s+scope)|index\s+scope)\b", text_clean):
+        return _emit("manage_index_scope", "status")
+
+    # ── 39e. Content & Scoped File Search ─────────────────────────────────
+    # 'search for files containing keyword', 'find documents with text XYZ'
+    m = re.search(r'(?:search|find|look)\s+(?:for\s+)?(?:files?|documents?|notes?)\s+(?:containing|with\s+text|inside)\s+["\']?(.+?)["\']?$', text_clean)
+    if m:
+        return _emit("search_file", f"{m.group(1).strip()}||content")
+
+    # 'search for file X under/in folder Y'
+    m = re.search(r'(?:search\s+for|find|locate)\s+(?:a\s+)?(?:file|folder|document)\s+(?:named|called\s+)?(.+?)\s+(?:in|under)\s+(.+)', text_clean)
+    if m:
+        return _emit("search_file", f"{m.group(1).strip()}|{m.group(2).strip()}")
 
     # ── 39c. File/Folder search alias ────────────────────────────────────
     # 'search for a folder', 'find a file' → search_file

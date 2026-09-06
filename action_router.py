@@ -123,6 +123,7 @@ ROLLBACK: dict[str, Rollback] = {
     "read_more": Rollback.SAFE,
     "stop_reading": Rollback.SAFE,
     "search_file": Rollback.SAFE,
+    "index_stats": Rollback.SAFE,
     "summarize_file": Rollback.SAFE,
     "read_clipboard": Rollback.SAFE,
     "speak_clipboard": Rollback.SAFE,
@@ -243,6 +244,7 @@ ROLLBACK: dict[str, Rollback] = {
     "organize_files": Rollback.UNSAFE,
     "organize_folder": Rollback.UNSAFE,
     "bulk_rename_files": Rollback.UNSAFE,
+    "manage_index_scope": Rollback.UNSAFE,
     # Network/radio toggles: flipping these can drop a live connection, and
     # restoring the radio does not restore what the disconnect interrupted.
     "toggle_wifi": Rollback.UNSAFE,

@@ -198,6 +198,7 @@ FAST_PATH_ALLOWED_ACTIONS: frozenset[str] = frozenset({
     # ── Read-Only System Diagnostics & Telemetry ───────────────────────────
     "performance_stats",
     "background_status",
+    "index_stats",
     "screenshot",
 
     # ── Non-Destructive Window & Tab Navigation ────────────────────────────
