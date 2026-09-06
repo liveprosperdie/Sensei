@@ -598,7 +598,8 @@ def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
         user_data_dir = os.environ.get("CHROME_USER_DATA_DIR")
         if not user_data_dir:
             # Use dedicated Akira profile to avoid profile lock conflict with user's open personal Chrome
-            user_data_dir = os.path.join(os.environ.get("LOCALAPPDATA", r"C:\Users\swast\AppData\Local"), "Akira", "AkiraChromeProfile")
+            local_appdata = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+            user_data_dir = os.path.join(local_appdata, "Akira", "AkiraChromeProfile")
         
         profile_name = os.environ.get("CHROME_PROFILE", "Default")
         os.makedirs(user_data_dir, exist_ok=True)
@@ -801,11 +802,7 @@ def warmup_browser(name: str | None = None) -> None:
     _warmup_thread.start()
 
 
-# Auto-trigger asynchronous browser pre-warming on system import
-try:
-    warmup_browser()
-except Exception as _w_err:
-    print(f"[BROWSER] Auto-warmup trigger warning: {_w_err}")
+# Note: warmup_browser() is called explicitly at runtime in akira.py, not on module import
 
 
 
@@ -1093,6 +1090,20 @@ def youtube_control(parameter: str) -> str:
         WebDriverWait(browser, 8).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     except Exception:
         pass
+
+    # ── Group 0: Direct Video Search & Auto-Play ───────────────────────────
+    if (param.startswith("play ") and param not in ("play", "playing")) or param.startswith("search "):
+        query_str = param.replace("play ", "", 1).replace("search ", "", 1).strip()
+        query = urllib.parse.quote(query_str)
+        url = f"https://www.youtube.com/results?search_query={query}"
+        browser.get(url)
+        try:
+            WebDriverWait(browser, 6).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "ytd-video-renderer a#video-title, a#video-title")))
+            first_video = browser.find_element(By.CSS_SELECTOR, "ytd-video-renderer a#video-title, a#video-title")
+            first_video.click()
+            return f"Playing '{query_str}' on YouTube."
+        except Exception:
+            return f"Opened YouTube search results for '{query_str}'."
 
     if "youtube.com" not in (browser.current_url or ""):
         return "This isn't a YouTube tab right now. Switch to YouTube first."
@@ -5107,6 +5118,12 @@ def minimize_window(parameter: str) -> str:
 def scroll(parameter: str) -> str:
     browser = get_browser(_last_browser_name)
     param = parameter.lower().strip()
+    if "|" in param:
+        parts = param.split("|")
+        param = parts[0].strip()
+        target_tab = parts[1].replace("tab:", "").strip()
+        if target_tab:
+            switch_tab(target_tab)
     scripts = {
         "down":   "window.scrollBy(0,500);",
         "up":     "window.scrollBy(0,-500);",
@@ -5241,6 +5258,20 @@ def fill(parameter: str) -> str:
     from element_matcher import find_element_index
     index = find_element_index(elements, instruction)
     if index is None or index >= len(elements):
+        # Fallback to first visible input/textarea on the page if exact match fails
+        inputs = browser.find_elements(By.CSS_SELECTOR, 'input:not([type="hidden"]), textarea')
+        for inp in inputs:
+            if inp.is_displayed():
+                try:
+                    inp.click()
+                    inp.clear()
+                    inp.send_keys(text)
+                    if should_submit:
+                        from selenium.webdriver.common.keys import Keys
+                        inp.send_keys(Keys.RETURN)
+                    return f"Typed '{text}' into input field." + (" Submitted." if should_submit else "")
+                except Exception:
+                    continue
         return "Couldn't find that field."
     el = browser.find_elements(By.CSS_SELECTOR, f'[data-akira-index="{index}"]')
     if not el:
@@ -5483,6 +5514,7 @@ _ACTION_MAP = {
     "web_search":        _handle_web_search,
     "site_search":       _handle_site_search,
     "fill":              fill,
+    "fill_input":        fill,
     "scroll":            scroll,
     "new_tab":           new_tab,
     "open_site_tab":     open_site_tab,

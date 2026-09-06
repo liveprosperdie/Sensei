@@ -175,6 +175,60 @@ def _parse(payload) -> Verdict:
     return Verdict(decision, reasons, source="model")
 
 
+import logging
+
+logger = logging.getLogger("akira.guard")
+
+# ── EXPLICIT GUARD FAST-PATH ALLOWLIST ─────────────────────────────────────────
+# Hand-reviewed, genuinely non-destructive, non-sensitive, low-blast-radius actions.
+# An action qualifies for the fast-path (skipping the 6-16s model review) ONLY if:
+#   1. action is in FAST_PATH_ALLOWED_ACTIONS
+#   2. guard_rules.validate(action, parameter) returns ALLOW
+#   3. static.reasons is empty (zero parameter-shape or keyword concerns)
+#   4. parameter contains NO untrusted/indirect context markers
+#
+# Everything else (file modifications/deletions, communications, payments, system
+# lifecycle, interactive browser actions, and compound multi-field actions)
+# ALWAYS proceeds to full model review.
+FAST_PATH_ALLOWED_ACTIONS: frozenset[str] = frozenset({
+    # ── Display & Audio (Non-destructive Hardware) ─────────────────────────
+    "adjust_volume",
+    "adjust_brightness",
+
+    # ── Read-Only System Diagnostics & Telemetry ───────────────────────────
+    "performance_stats",
+    "background_status",
+    "screenshot",
+
+    # ── Non-Destructive Window & Tab Navigation ────────────────────────────
+    "switch_tab",
+    "list_tabs",
+    "scroll",
+    "switch_window",
+    "maximize_window",
+    "minimize_window",
+    "new_tab",
+
+    # ── Safe Media & Settings ──────────────────────────────────────────────
+    "spotify_control",
+    "open_settings",
+
+    # ── Safe Navigation & Search ───────────────────────────────────────────
+    "web_search",
+    "open_site_tab",
+    "open_url",
+    "search_image",
+
+    # ── Read-Only File Exploration ─────────────────────────────────────────
+    "list_folder",
+    "search_file",
+    "file_search",
+    "folder_search",
+    "read_more",
+    "stop_reading",
+})
+
+
 def review(action: str, parameter=None, *, timeout: float = GUARD_TIMEOUT,
            label: str = "guard") -> Verdict:
     """Validate one action step statically, then with the guard model.
@@ -182,13 +236,11 @@ def review(action: str, parameter=None, *, timeout: float = GUARD_TIMEOUT,
     Returns a Verdict; never raises. The static verdict is computed first and
     can only be tightened by the model, never loosened — see Verdict.merge.
 
-    FAST PATH: when the static validator returns a clean ALLOW (no reasons at
-    all — parameter shape is correct, no risky keywords, risk classifier says
-    safe), the model call is skipped entirely. The model's job is to catch
-    things static rules cannot express; when static has zero concerns, the
-    model adds cost (6-16s on CPU) without information. This is the single
-    biggest latency win: routine commands like 'open_application chrome' go
-    from 6s to <1ms.
+    FAST PATH: when an action is in FAST_PATH_ALLOWED_ACTIONS, static validator
+    returns a clean ALLOW (no reasons, parameter shape correct, no risky keywords),
+    and no untrusted external context markers are present, the model call is skipped.
+    All other actions (destructive, compound, communications, system controls)
+    ALWAYS proceed through full model review.
     """
     static = guard_rules.validate(action, parameter)
     if static.decision == BLOCK:
@@ -197,13 +249,15 @@ def review(action: str, parameter=None, *, timeout: float = GUARD_TIMEOUT,
         # same answer, and a model that disagreed could not be honoured anyway.
         return static
 
-    # FAST PATH: static cleared with zero concerns → skip the model entirely.
-    # This is safe because:
-    #   1. The static validator already checked parameter shape (guard_rules)
-    #   2. It checked risky keywords (executor.RISKY_KEYWORDS)
-    #   3. It checked akira._is_dangerous_step (the live gating classifier)
-    # When all three say "no objection", the model has nothing to add.
-    if static.decision == ALLOW and not static.reasons:
+    # FAST PATH: strictly allowlist-based, low-blast-radius actions only.
+    param_str = str(parameter or "")
+    has_untrusted = "<untrusted_external_context>" in param_str or "untrusted" in param_str.lower()
+    if (action in FAST_PATH_ALLOWED_ACTIONS
+            and static.decision == ALLOW
+            and not static.reasons
+            and not has_untrusted):
+        logger.info(f"[GUARD FAST-PATH] Approved low-blast-radius action: {action!r}")
+        print(f"[guard] FAST-PATH approved {action!r} (<1ms)")
         return static
 
     user = f"action: {action}\nparameter: {parameter!r}"

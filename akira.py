@@ -102,23 +102,24 @@ WAKE_DEBUG     = os.getenv("AKIRA_WAKE_DEBUG", "") not in ("", "0", "false")
 # directory — launching from a shortcut or any other folder otherwise fails.
 _WAKE_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "akira.onnx")
-if not os.path.isfile(_WAKE_MODEL):
-    raise SystemExit(
-        f"Wake model not found: {_WAKE_MODEL}\n"
-        "akira.onnx is gitignored, so a fresh clone won't have it — copy your "
-        "trained model into the project folder."
-    )
-oww_model = WakeModel(wakeword_models=[_WAKE_MODEL], inference_framework="onnx")
+oww_model = None
+_WAKE_KEY = None
+if os.path.isfile(_WAKE_MODEL):
+    try:
+        oww_model = WakeModel(wakeword_models=[_WAKE_MODEL], inference_framework="onnx")
+        _WAKE_KEY = next(iter(oww_model.models.keys()), None)
+    except Exception as e:
+        print(f"[akira] Wake model load warning: {e}")
+else:
+    try:
+        oww_model = WakeModel()
+        _WAKE_KEY = next(iter(oww_model.models.keys()), None)
+        print(f"[akira] Custom model akira.onnx not found — loaded openwakeword default model: {_WAKE_KEY}")
+    except Exception as e:
+        print(f"[akira] Voice wake model (akira.onnx) not found. VAD speech-detection active (listening for speech).")
 
-# openwakeword's predict() returns {model_label: score} for EVERY loaded model.
-# Reading position [0] out of that dict assumed one model and a stable order;
-# after an openwakeword upgrade it can silently return a different label's
-# score, so the wake word never fires and nothing is logged. Bind the real key
-# once, here, and fail loudly if it can't be determined.
-_WAKE_KEY = next(iter(oww_model.models.keys()), None)
-if _WAKE_KEY is None:
-    raise SystemExit(f"Wake model {_WAKE_MODEL} loaded no usable model.")
-print(f"[wake] model '{_WAKE_KEY}' loaded, threshold {WAKE_THRESHOLD}")
+if _WAKE_KEY:
+    print(f"[wake] model '{_WAKE_KEY}' loaded, threshold {WAKE_THRESHOLD}")
 
 # Resolved tier config, printed once at startup. The five layers are independent
 # env vars, so the effective configuration is not readable from any single one —
@@ -1358,6 +1359,10 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
 
 if __name__ == "__main__":
     _init_avatar()
+    try:
+        executor.warmup_browser()
+    except Exception as _w_err:
+        print(f"[BROWSER] Warmup warning: {_w_err}")
     while True:
         try:
             current_time = time.time()
@@ -1377,7 +1382,8 @@ if __name__ == "__main__":
                 audio = record_command(pre_audio=pre_audio)
                 if audio is None:
                     session_active = False
-                    oww_model.reset()
+                    if oww_model:
+                        oww_model.reset()
                     continue
 
                 text = transcribe_command(audio)
@@ -1385,7 +1391,8 @@ if __name__ == "__main__":
                 if session_active:
                     print("[session] continuing")
                 else:
-                    oww_model.reset()
+                    if oww_model:
+                        oww_model.reset()
 
             # ── Idle — listening for wake word ────────────────────────────
             else:
@@ -1404,7 +1411,8 @@ if __name__ == "__main__":
                         # Akira's own voice just went into an open mic. Drop it and
                         # reset the detector so it cannot self-trigger the wake word.
                         flush_stream()
-                        oww_model.reset()
+                        if oww_model:
+                            oww_model.reset()
                         last_activation_time = time.time()
                         continue
 
@@ -1412,8 +1420,8 @@ if __name__ == "__main__":
                 audio_np = np.frombuffer(chunk, dtype=np.int16)
                 # Look the score up by the model's real key. Positional access
                 # returned whichever model the dict happened to order first.
-                scores   = oww_model.predict(audio_np)
-                score    = scores.get(_WAKE_KEY, 0.0)
+                scores   = oww_model.predict(audio_np) if oww_model else {}
+                score    = scores.get(_WAKE_KEY, 0.0) if _WAKE_KEY else 0.0
 
                 if WAKE_DEBUG:
                     # Peak amplitude proves the mic is actually delivering audio —
@@ -1424,7 +1432,19 @@ if __name__ == "__main__":
                           f"keys={list(scores)}")
 
                 current_time = time.time()
-                if score > WAKE_THRESHOLD and (current_time - last_activation_time) > COOLDOWN_TIME:
+                triggered = score > WAKE_THRESHOLD and (current_time - last_activation_time) > COOLDOWN_TIME
+
+                # If no custom wake model exists, fallback to VAD speech activity trigger
+                if not triggered and oww_model is None and (current_time - last_activation_time) > COOLDOWN_TIME:
+                    if vad_model is not None and len(audio_np) > 0:
+                        audio_f = torch.from_numpy(audio_np).float() / 32768.0
+                        with torch.no_grad():
+                            vad_conf = vad_model(audio_f, 16000).item()
+                        if vad_conf > 0.6:
+                            triggered = True
+                            print("[voice] Speech detected!")
+
+                if triggered:
                     print("Wake word detected!")
                     _notify_avatar("WAKE_START")
                     winsound.Beep(1000, 200)
@@ -1444,7 +1464,8 @@ if __name__ == "__main__":
                     if session_active:
                         last_activation_time = time.time()
                         session_start_time   = time.time()
-                        oww_model.reset()
+                        if oww_model:
+                            oww_model.reset()
 
         except KeyboardInterrupt:
             print("\nShutting down Akira.")

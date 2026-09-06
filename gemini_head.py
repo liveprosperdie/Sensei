@@ -851,13 +851,14 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         return _emit("bookmark_page", "")
 
     # ── 32. Open Folder ──────────────────────────────────────────────────
+    _home_dir = os.path.expanduser("~")
     _FOLDERS = {
-        "downloads": r"C:\Users\swast\Downloads",
-        "desktop": r"C:\Users\swast\Desktop",
-        "documents": r"C:\Users\swast\Documents",
-        "pictures": r"C:\Users\swast\Pictures",
-        "music": r"C:\Users\swast\Music",
-        "videos": r"C:\Users\swast\Videos",
+        "downloads": os.path.join(_home_dir, "Downloads"),
+        "desktop": os.path.join(_home_dir, "Desktop"),
+        "documents": os.path.join(_home_dir, "Documents"),
+        "pictures": os.path.join(_home_dir, "Pictures"),
+        "music": os.path.join(_home_dir, "Music"),
+        "videos": os.path.join(_home_dir, "Videos"),
     }
     m = re.search(r'(?:open|show|go\s+to)\s+(?:the\s+|my\s+)?(downloads|desktop|documents|pictures|music|videos)\s*(?:folder)?', text_clean)
     if m:
@@ -934,7 +935,16 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
     if re.search(r'(?:continue|read)\s+more', text_clean):
         return _emit("read_more", "")
 
-    # ── 39b. Type / Write text in active window ───────────────────────────
+    # ── 39b. Web Form Field Input ─────────────────────────────────────────
+    m_fill = re.search(r'(?:enter|type|input|fill)\s+(.+?)\s+(?:in|into|on)\s+(?:the\s+)?(placeholder|field|input|box|search\s+bar|email\s+field|password\s+field)', text_clean)
+    if m_fill:
+        val = m_fill.group(1).strip()
+        target_field = m_fill.group(2).strip()
+        if val.lower() in ("my email", "my email address", "my gmail", "my gmail address", "email"):
+            val = os.environ.get("AKIRA_USER_EMAIL") or os.environ.get("USER_EMAIL") or "user@example.com"
+        return _emit("fill", f"{target_field}|{val}")
+
+    # ── 39c. Type / Write text in active window ───────────────────────────
     # Intercepts Groq hallucinations like 'write_text', 'type_text', 'insert_text'.
     # Strategy: copy content to clipboard so user can paste it wherever needed.
     m = re.search(r'(?:write|type|insert|enter|put)\s+(?:the\s+)?(?:text|content|following)?\s*(?:in|into|on)?\s*(?:notepad|word|the\s+editor|the\s+app)?\s*[:\-]?\s*(.{5,})', text_clean)

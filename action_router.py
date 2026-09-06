@@ -203,9 +203,10 @@ ROLLBACK: dict[str, Rollback] = {
     # undoable: closing the tab reverses the only visible effect.
     # The latency cost of serial guard (6-16s CPU) on every single navigation
     # made the assistant unusable. Parallel lets the page load while Guard
-    "open_url": Rollback.UNSAFE,
-    "open_site_tab": Rollback.UNSAFE,
-    "web_search": Rollback.UNSAFE,
+    # checks in the background.
+    "open_url": Rollback.SAFE,
+    "open_site_tab": Rollback.SAFE,
+    "web_search": Rollback.SAFE,
     # Closing a tab discards unsaved page state (half-written form, draft).
     # Re-opening the URL is not a rollback — the state is gone.
     "close_tab": Rollback.UNSAFE,

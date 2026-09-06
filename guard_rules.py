@@ -186,7 +186,7 @@ ACTION_RULES: dict[str, Rule] = {
     # ── Obsidian ──────────────────────────────────────────────────────────
     "obsidian_control": SUB_MULTI,
     # ── files ─────────────────────────────────────────────────────────────
-    "create_file": TEXT,
+    "create_file": SUB_MULTI,
     "read_file": TEXT,
     "read_more": SUB,
     "stop_reading": IGNORED,
@@ -252,6 +252,7 @@ ACTION_RULES: dict[str, Rule] = {
     "write_text": TEXT,       # → write_clipboard (intercepted in pre-router)
     "type_text": TEXT,        # → write_clipboard
     "insert_text": TEXT,      # → write_clipboard
+    "fill_input": SUB_MULTI,  # → fill
     "file_search": TEXT,      # → search_file
     "folder_search": TEXT,    # → search_file
 }
