@@ -30,6 +30,7 @@ import socket
 import subprocess
 import sys
 import soundfile as sf
+import executor
 from executor import execute, get_all_tabs, get_pc_context
 from openwakeword import Model as WakeModel
 
@@ -191,6 +192,8 @@ akira_speaking  = False
 user_speaking   = threading.Event()
 vad_buffer_lock = threading.Lock()
 vad_audio_buffer: list[np.ndarray] = []
+vad_rem_buffer = np.array([], dtype=np.int16)
+_vad_error_warned = False
 
 # Dangerous actions — safety net catches these if Claude forgets to gate them
 DANGEROUS_ACTIONS = frozenset({
@@ -1442,14 +1445,28 @@ if __name__ == "__main__":
                 # If no custom wake model exists, fallback to VAD speech activity trigger
                 if not triggered and oww_model is None and (current_time - last_activation_time) > COOLDOWN_TIME:
                     if vad_model is not None and len(audio_np) > 0:
-                        audio_f = torch.from_numpy(audio_np).float() / 32768.0
-                        with torch.no_grad():
-                            vad_conf = vad_model(audio_f, 16000).item()
-                        if vad_conf > 0.6:
-                            triggered = True
-                            print("[voice] Speech detected!")
+                        vad_combined = np.concatenate([vad_rem_buffer, audio_np]) if len(vad_rem_buffer) > 0 else audio_np
+                        # Silero VAD strictly requires exactly 512 samples at 16kHz
+                        while len(vad_combined) >= 512:
+                            sub_chunk = vad_combined[:512]
+                            vad_combined = vad_combined[512:]
+                            try:
+                                audio_f = torch.from_numpy(sub_chunk).float() / 32768.0
+                                with torch.no_grad():
+                                    vad_conf = vad_model(audio_f, 16000).item()
+                                if vad_conf > 0.6:
+                                    triggered = True
+                                    print("[voice] Speech detected!")
+                                    break
+                            except Exception as _vad_err:
+                                if not _vad_error_warned:
+                                    print(f"[vad] Inference warning (skipping frame): {_vad_err}")
+                                    _vad_error_warned = True
+                                break
+                        vad_rem_buffer = vad_combined if not triggered else np.array([], dtype=np.int16)
 
                 if triggered:
+                    vad_rem_buffer = np.array([], dtype=np.int16)
                     print("Wake word detected!")
                     _notify_avatar("WAKE_START")
                     winsound.Beep(1000, 200)
