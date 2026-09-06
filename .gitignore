@@ -46,3 +46,12 @@ test.py
 .v0/
 scratch/
 *.mp3
+
+cat >> .gitignore << 'EOF'
+
+# Diagnostic/debug artifacts — not meant for version control
+akira_system_prompts_dump.md
+live_all_local_functions_report.json
+live_function_test_results.json
+live_verified_report.json
+EOF
