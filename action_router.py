@@ -80,6 +80,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 import guard
+import guard_rules
 from guard_rules import BLOCK, FLAG, Verdict
 
 
@@ -279,7 +280,8 @@ ROLLBACK: dict[str, Rollback] = {
     "shutdown_pc": Rollback.UNSAFE,
     "restart": Rollback.UNSAFE,         # legacy alias -> restart_pc
     "restart_pc": Rollback.UNSAFE,
-    # ── action aliases (normalized by pre-router / executor) ──────────────
+    "click_element": Rollback.UNSAFE,
+    "fill_input": Rollback.UNSAFE,
     "write_text": Rollback.SAFE,
     "type_text": Rollback.SAFE,
     "insert_text": Rollback.SAFE,
@@ -467,17 +469,27 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None,
     step_tier = tier(step)
     kwargs = {"timeout": timeout} if timeout is not None else {}
 
+    # ── Universal structural / parameter gate (synchronous pre-flight) ───
+    # Basic correctness (action validity, required parameter count, field arity)
+    # is NOT a safety judgement call: there is no reason to run execution in
+    # parallel or race with a malformed step. Parameter/structural validation
+    # must ALWAYS complete and pass BEFORE an action is dispatched for execution.
+    static_verdict = guard_rules.validate(action, parameter)
+    if static_verdict.decision == guard_rules.BLOCK:
+        print(f"[router] {action} tier={step_tier.value} block(static): "
+              f"{'; '.join(static_verdict.reasons)}")
+        return Outcome(step_tier, static_verdict, executed=False)
+
     # ── Gated, NOT yet approved: review only, never execute ──────────────
     if step_tier is Tier.GATED and not confirmed:
         verdict = guard.review(action, parameter, label="guard:gated", **kwargs)
         print(f"[router] {action} tier=gated {verdict}")
         return Outcome(step_tier, verdict, executed=False)
 
-    # ── Not rollback-safe (or gated and approved): serial ────────────────
-    # Gated+confirmed lands here deliberately: same blocking-guard-then-execute
-    # shape, and parallel_ok() already excludes every gated action, so no extra
-    # condition is needed to keep an approved delete off the racing path.
-    if not parallel_ok(step):
+    # ── Not rollback-safe (or flagged statically, or gated and approved): serial ──
+    # If the static check produced a FLAG (e.g. risky keyword), it cannot race
+    # execution even if the action type is normally rollback-safe.
+    if static_verdict.decision == guard_rules.FLAG or not parallel_ok(step):
         why = rollback(action).value
         verdict = guard.review(action, parameter, label="guard:serial", **kwargs)
         print(f"[router] {action} tier={step_tier.value} serial "

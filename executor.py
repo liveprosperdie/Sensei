@@ -1162,6 +1162,17 @@ def youtube_control(parameter: str) -> str:
     browser = get_browser(_last_browser_name)
     param = parameter.lower().strip()
 
+    # If the current tab is not youtube.com, check if an existing open tab is on youtube.com:
+    if "youtube.com" not in (browser.current_url or ""):
+        for handle in browser.window_handles:
+            try:
+                browser.switch_to.window(handle)
+                if "youtube.com" in (browser.current_url or ""):
+                    browser._akira_tab = handle
+                    break
+            except Exception:
+                pass
+
     try:
         browser.switch_to.window(browser._akira_tab)
         WebDriverWait(browser, 8).until(EC.presence_of_element_located((By.TAG_NAME, "body")))

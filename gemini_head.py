@@ -117,6 +117,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -642,9 +643,13 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
                 last_user_msg = "".join(b.get("text", "") for b in content if isinstance(b, dict))
             break
 
-    import re
-    # Strip PC state prefix if present so regex targets the user's actual command
-    text_clean = re.sub(r"^\[pc state\].*?\n\n", "", (last_user_msg or "").strip(), flags=re.I | re.DOTALL).strip().lower()
+    # Strip external context wrappers (session context, PC state, untrusted tags)
+    # so regex targets the user's actual spoken command rather than injected metadata
+    raw = (last_user_msg or "").strip()
+    raw = re.sub(r"^\[session start\].*?</untrusted_external_context>\s*", "", raw, flags=re.I | re.DOTALL)
+    raw = re.sub(r"<untrusted_external_context>.*?</untrusted_external_context>\s*", "", raw, flags=re.I | re.DOTALL)
+    raw = re.sub(r"^\[pc state\].*?\n\n", "", raw, flags=re.I | re.DOTALL)
+    text_clean = raw.strip().lower()
     if not text_clean:
         return None
 
@@ -684,7 +689,7 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
 
     # ── 5. Open Site Tab ─────────────────────────────────────────────────
     m = re.search(r'open\s+(youtube|netflix|spotify|github|reddit|amazon|flipkart|twitter|x\.com|instagram|linkedin|whatsapp\s*web|facebook|google\s*maps|google\s*drive|google\s*docs|stackoverflow)(?:\s+in\s+\w+)?', text_clean)
-    if m:
+    if m and not re.search(r'\band\s+(?:play|search|listen)\b', text_clean):
         return _emit("open_site_tab", m.group(1).strip())
 
     # ── 6. Open URL ──────────────────────────────────────────────────────
@@ -798,7 +803,41 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         tool = m.group(1).strip().replace(" ", "")
         return _emit("open_system_tool", tool)
 
-    # ── 23. YouTube Control ──────────────────────────────────────────────
+    # ── 23. YouTube Search & Play / Control ──────────────────────────────
+    # A. Search & Auto-Play on YouTube
+    m = re.search(r'(?:open|go\s+to)\s+youtube\s+(?:and\s+)?(?:play|search\s+(?:for\s+)?)\s+(.+)', text_clean)
+    if m:
+        query = m.group(1).strip().rstrip("?.!")
+        return _emit("youtube_control", f"play {query}")
+
+    m = re.search(r'(?:can\s+you\s+)?(?:please\s+)?play\s+(.+?)\s+on\s+youtube\s+by\s+(.+)', text_clean)
+    if m:
+        song = m.group(1).strip().rstrip("?.!")
+        artist = m.group(2).strip().rstrip("?.!")
+        return _emit("youtube_control", f"play {song} {artist}")
+
+    m = re.search(r'(?:can\s+you\s+)?(?:please\s+)?play\s+(.+?)\s+by\s+(.+?)\s+on\s+youtube', text_clean)
+    if m:
+        song = m.group(1).strip().rstrip("?.!")
+        artist = m.group(2).strip().rstrip("?.!")
+        return _emit("youtube_control", f"play {song} {artist}")
+
+    m = re.search(r'(?:can\s+you\s+)?(?:please\s+)?play\s+(.+?)\s+on\s+youtube', text_clean)
+    if m:
+        song = m.group(1).strip().rstrip("?.!")
+        return _emit("youtube_control", f"play {song}")
+
+    m = re.search(r'on\s+youtube\s+(?:play|search\s+(?:for\s+)?)\s+(.+)', text_clean)
+    if m:
+        query = m.group(1).strip().rstrip("?.!")
+        return _emit("youtube_control", f"play {query}")
+
+    m = re.search(r'search\s+(?:for\s+)?(.+?)\s+on\s+youtube', text_clean)
+    if m:
+        query = m.group(1).strip().rstrip("?.!")
+        return _emit("youtube_control", f"play {query}")
+
+    # B. Interactive Controls & Actions
     if re.search(r'(?:skip|next)\s+(?:this\s+)?(?:out|video|song|track)?', text_clean):
         return _emit("youtube_control", "next")
     if re.search(r'(?:like|dislike|thumbs\s+up|thumbs\s+down)\s+(?:this\s+)?(?:video|song|track)?', text_clean):
@@ -842,8 +881,11 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         return _emit("browser_control", "refresh")
 
     # ── 27. New Tab ──────────────────────────────────────────────────────
-    if re.search(r'(?:open|new)\s+(?:a\s+)?(?:new\s+)?tab', text_clean):
-        return _emit("new_tab", "")
+    if re.search(r'\b(?:open|new)\s+(?:a\s+)?(?:new\s+)?tab\b', text_clean):
+        if not re.search(r'\b(?:youtube|spotify|netflix|play|video|song)\b', text_clean):
+            m_search = re.search(r'\b(?:open|new)\s+(?:a\s+)?(?:new\s+)?tab\s+(?:and\s+)?(?:search\s+(?:for\s+)?|with\s+)?(.+)', text_clean)
+            param = m_search.group(1).strip().rstrip("?.!") if m_search else ""
+            return _emit("new_tab", param)
 
     # ── 28. Close Tab ────────────────────────────────────────────────────
     if re.search(r'close\s+(?:the\s+|this\s+|current\s+)?tab', text_clean):
