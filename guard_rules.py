@@ -126,16 +126,20 @@ class Rule:
 
     min_fields: int
     max_fields: int
-    screen: bool = True  # run the risky-keyword screen over the parameter text
+    screen: bool = True      # run the risky-keyword screen over the parameter text
+    split_pipe: bool = True  # split on '|' into sub-fields; False treats parameter as opaque
 
 
 # Shared rule instances rather than a literal per action: 80 actions collapse to
-# five shapes, and referencing the same object makes the table scannable enough
+# named shapes, and referencing the same object makes the table scannable enough
 # that a wrong shape is visible on sight.
-IGNORED = Rule(0, 0, screen=False)   # handler takes no parameter (lambda _:)
-OPT_TEXT = Rule(0, 1)                # one optional free-text field
-TEXT = Rule(1, 1)                    # one required free-text field
-SUB = Rule(1, 2)                     # "sub" or "sub|arg"
+IGNORED = Rule(0, 0, screen=False, split_pipe=False)   # handler takes no parameter (lambda _:)
+OPT_TEXT = Rule(0, 1)                # one optional free-text field (screened)
+TEXT = Rule(1, 1)                    # one required free-text field (screened)
+OPAQUE_TEXT = Rule(1, 1, screen=False, split_pipe=False)       # 1 opaque text field (unscreened, no '|' split)
+OPT_OPAQUE_TEXT = Rule(0, 1, screen=False, split_pipe=False)   # optional opaque text field
+SUB = Rule(1, 2)                     # "sub" or "sub|arg" (screened)
+SUB_UNSCREENED = Rule(1, 2, screen=False, split_pipe=True)     # "sub" or "sub|arg" (unscreened: media, search)
 SUB_ARGS = Rule(1, 3)                # "app|sub|args"
 SUB_MULTI = Rule(1, 6)               # multi-field commands (e.g. gmail_compose generate|to|subject|body)
 FILL = Rule(1, 3)                    # "field|text" or "field|text|submit" (Mech Servant fill+enter)
@@ -146,34 +150,34 @@ FILL = Rule(1, 3)                    # "field|text" or "field|text|submit" (Mech
 # dispatching unvalidated. That failure is the feature.
 ACTION_RULES: dict[str, Rule] = {
     # ── applications & windows ────────────────────────────────────────────
-    "open_application": TEXT,
-    "close_application": TEXT,
-    "switch_window": TEXT,
-    "maximize_window": OPT_TEXT,
-    "minimize_window": OPT_TEXT,
+    "open_application": OPAQUE_TEXT,
+    "close_application": OPAQUE_TEXT,
+    "switch_window": OPAQUE_TEXT,
+    "maximize_window": OPT_OPAQUE_TEXT,
+    "minimize_window": OPT_OPAQUE_TEXT,
     # ── browser & web ─────────────────────────────────────────────────────
-    "open_url": TEXT,
-    "web_search": SUB,
-    "site_search": SUB,
+    "open_url": OPAQUE_TEXT,
+    "web_search": SUB_UNSCREENED,
+    "site_search": SUB_UNSCREENED,
     "fill": FILL,
     "scroll": OPT_TEXT,
     "new_tab": SUB,
-    "open_site_tab": TEXT,
+    "open_site_tab": OPAQUE_TEXT,
     "list_tabs": IGNORED,
-    "switch_tab": TEXT,
-    "close_tab": OPT_TEXT,
+    "switch_tab": OPAQUE_TEXT,
+    "close_tab": OPT_OPAQUE_TEXT,
     "click": TEXT,
     "browser_control": SUB,
     "bookmark_page": IGNORED,
     # ── site-specific controllers ─────────────────────────────────────────
-    "youtube_control": SUB,
-    "netflix_control": SUB,
+    "youtube_control": SUB_UNSCREENED,
+    "netflix_control": SUB_UNSCREENED,
     "meet_control": SUB,
     "amazon_control": SUB,
     "flipkart_control": SUB,
     "github_control": SUB,
     "vscode_control": SUB,
-    "spotify_control": SUB,
+    "spotify_control": SUB_UNSCREENED,
     # ── Google Workspace (MCP) ────────────────────────────────────────────
     "calendar_control": SUB_MULTI,
     "docs_control": SUB_MULTI,
@@ -187,17 +191,17 @@ ACTION_RULES: dict[str, Rule] = {
     "obsidian_control": SUB_MULTI,
     # ── files ─────────────────────────────────────────────────────────────
     "create_file": SUB_MULTI,
-    "read_file": TEXT,
+    "read_file": OPAQUE_TEXT,
     "read_more": SUB,
     "stop_reading": IGNORED,
     "write_file": SUB,
     "edit_file": SUB_MULTI,
-    "search_file": SUB,
+    "search_file": OPAQUE_TEXT,
     "manage_index_scope": SUB,
     "index_stats": IGNORED,
-    "open_file": TEXT,
-    "open_folder": TEXT,
-    "list_folder": OPT_TEXT,
+    "open_file": OPAQUE_TEXT,
+    "open_folder": OPAQUE_TEXT,
+    "list_folder": OPT_OPAQUE_TEXT,
     "copy_files": SUB,
     "move_files": SUB,
     "organize_files": OPT_TEXT,
@@ -206,17 +210,18 @@ ACTION_RULES: dict[str, Rule] = {
     "bulk_rename_files": SUB,
     "compress_files": SUB,
     "extract_files": SUB,
-    "summarize_file": TEXT,
+    "summarize_file": OPAQUE_TEXT,
     "file_to_doc": SUB,
     # ── media & clipboard ─────────────────────────────────────────────────
-    "search_image": SUB,
+    "search_image": SUB_UNSCREENED,
     "download_image": TEXT,
     "set_wallpaper": TEXT,
     "read_clipboard": IGNORED,
-    "write_clipboard": TEXT,
+    "write_clipboard": OPAQUE_TEXT,
+    "generate_to_clipboard": OPAQUE_TEXT,  # compose content → clipboard (Bug A fix)
     "adjust_volume": TEXT,
     "adjust_brightness": TEXT,
-    "screenshot": OPT_TEXT,
+    "screenshot": OPT_OPAQUE_TEXT,
     "background_status": IGNORED,
     # ── power & session (legacy aliases onto system_control) ──────────────
     "lock_screen": IGNORED,
@@ -245,23 +250,26 @@ ACTION_RULES: dict[str, Rule] = {
     "restart_pc": IGNORED,
     "preview_temp_cleanup": IGNORED,
     # ── clipboard output ───────────────────────────────────────────────────
-    "write_clipboard": TEXT,
+    "write_clipboard": OPAQUE_TEXT,
     "speak_clipboard": IGNORED,
     # ── LLM hallucination aliases: map to real actions via pre-router ─────
     # These entries prevent a BLOCK when Groq invents a plausible-sounding
     # action name. The pre-router maps them BEFORE execution, but guard_rules
     # must also accept them so static validation doesn't short-circuit first.
-    "write_text": TEXT,       # → write_clipboard (intercepted in pre-router)
-    "type_text": TEXT,        # → write_clipboard
-    "insert_text": TEXT,      # → write_clipboard
-    "fill_input": SUB_MULTI,  # → fill
-    "click_element": TEXT,    # → click
-    "file_search": TEXT,      # → search_file
-    "folder_search": TEXT,    # → search_file
+    "write_text": OPAQUE_TEXT,       # → write_clipboard (intercepted in pre-router)
+    "type_text": OPAQUE_TEXT,        # → write_clipboard
+    "insert_text": OPAQUE_TEXT,      # → write_clipboard
+    "fill_input": SUB_MULTI,         # → fill
+    "click_element": TEXT,           # → click
+    "file_search": OPAQUE_TEXT,      # → search_file
+    "folder_search": OPAQUE_TEXT,    # → search_file
 }
 
 
 # ── reuse hooks into the existing safety logic ────────────────────────────────
+
+_cached_risky_pattern: re.Pattern | None = None
+_checked_risky_pattern: bool = False
 
 def _risky_pattern() -> re.Pattern | None:
     """executor's compiled RISKY_KEYWORDS pattern, or None if unreachable.
@@ -277,20 +285,33 @@ def _risky_pattern() -> re.Pattern | None:
     RISKY_KEYWORDS list keeps the taxonomy single-sourced (the list is the
     taxonomy; the pattern is just its compiled form) while surviving the rename.
     """
+    global _cached_risky_pattern, _checked_risky_pattern
+    if _checked_risky_pattern:
+        return _cached_risky_pattern
+
     try:
         import executor
     except Exception:
+        _checked_risky_pattern = True
+        _cached_risky_pattern = None
         return None
 
     pattern = getattr(executor, "_risky_pattern", None)
     if pattern is not None:
+        _checked_risky_pattern = True
+        _cached_risky_pattern = pattern
         return pattern
 
     keywords = getattr(executor, "RISKY_KEYWORDS", None)
     if not keywords:
+        _checked_risky_pattern = True
+        _cached_risky_pattern = None
         return None
-    return re.compile(r"\b(" + "|".join(re.escape(k) for k in keywords) + r")\b",
-                      re.IGNORECASE)
+    _cached_risky_pattern = re.compile(
+        r"\b(" + "|".join(re.escape(k) for k in keywords) + r")\b",
+        re.IGNORECASE)
+    _checked_risky_pattern = True
+    return _cached_risky_pattern
 
 
 def _akira_classifier():
@@ -313,9 +334,11 @@ def _akira_classifier():
 
 # ── the static gate itself ───────────────────────────────────────────────────
 
-def _fields(parameter) -> list[str]:
+def _fields(parameter, split_pipe: bool = True) -> list[str]:
     raw = "" if parameter is None else str(parameter)
-    return [] if not raw.strip() else raw.split("|")
+    if not raw.strip():
+        return []
+    return raw.split("|") if split_pipe else [raw.strip()]
 
 
 def validate(action: str, parameter=None) -> Verdict:
@@ -335,7 +358,7 @@ def validate(action: str, parameter=None) -> Verdict:
         # rule. The coverage gate exists so the second never reaches runtime.
         return Verdict(BLOCK, (f"no guard rule for action {name!r}",))
 
-    fields = _fields(parameter)
+    fields = _fields(parameter, split_pipe=rule.split_pipe)
     if len(fields) < rule.min_fields:
         reasons.append(
             f"{name} needs {rule.min_fields} parameter field(s), got "

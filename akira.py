@@ -11,6 +11,7 @@ import pyaudio
 import tempfile
 import winsound
 import threading
+import collections
 import numpy as np
 import openwakeword
 import claude_handler
@@ -34,10 +35,60 @@ import executor
 from executor import execute, get_all_tabs, get_pc_context
 from openwakeword import Model as WakeModel
 
+# ── Session Action History & Pinned Session Tracking ──────────────────────────
+_session_action_history: collections.deque = collections.deque(maxlen=8)
+_active_session_id: str | None = None
+
+def _record_session_action(action: str, parameter: str, result: object) -> None:
+    """Append a concise summary of a completed action + outcome to session history."""
+    if not action:
+        return
+    res_str = ""
+    if isinstance(result, dict):
+        res_str = result.get("detail") or result.get("message") or ("ok" if result.get("success") else "failed")
+    elif isinstance(result, str):
+        res_str = result.strip()
+    elif result is not None:
+        res_str = str(result)
+    if len(res_str) > 120:
+        res_str = res_str[:117] + "..."
+
+    entry = {
+        "action": action,
+        "parameter": parameter[:80] if parameter else "",
+        "result": res_str,
+        "timestamp": time.time(),
+    }
+    _session_action_history.append(entry)
+
+def _reset_session_action_history() -> None:
+    """Clear session action history."""
+    _session_action_history.clear()
+
+def _end_session() -> None:
+    """Clean up state at the end of a session."""
+    global _active_session_id, _pending_blocked_action
+    _reset_session_action_history()
+    _pending_blocked_action = None
+    if _active_session_id:
+        try:
+            import model_pool
+            model_pool.get_pool().reset_session_pin(_active_session_id)
+        except Exception:
+            pass
+        _active_session_id = None
+
+
 # ── Init ──────────────────────────────────────────────────────────────────────
 
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 openwakeword.utils.download_models()
+
+# ── Multi-Action Chain Throttling & Pacing ───────────────────────────────────
+AKIRA_CHAIN_STAGGER_MS = int(os.environ.get("AKIRA_CHAIN_STAGGER_MS", "300"))
+AKIRA_CHAIN_MAX_SAFE_LENGTH = int(os.environ.get("AKIRA_CHAIN_MAX_SAFE_LENGTH", "8"))
+AKIRA_CHAIN_PACING_INTERVAL = int(os.environ.get("AKIRA_CHAIN_PACING_INTERVAL", "5"))
+AKIRA_CHAIN_PACING_PAUSE_S = float(os.environ.get("AKIRA_CHAIN_PACING_PAUSE_S", "1.0"))
 
 # ── Avatar Process & IPC ───────────────────────────────────────────────────────
 
@@ -186,6 +237,12 @@ pending_execute   = None   # callable for click confirmation
 # a rule. Kept as a separate slot rather than overloading pending_action,
 # because the confirmation branch dispatches on that exact string.
 pending_origin    = None
+_pending_blocked_action: dict | None = None
+
+CONFIRMATION_PHRASES = frozenset({
+    "do it", "yes", "confirm", "go ahead", "yeah do that", "proceed",
+    "do that", "yeah", "yep", "sure", "ok do it", "please do it"
+})
 
 # VAD barge-in state
 akira_speaking  = False
@@ -727,7 +784,17 @@ def run_actions(response: dict, step_results: dict | None = None,
         if isinstance(raw_param, str):
             consumed.update(re.findall(r"\{\{(\w+)\.result\}\}", raw_param))
 
-    for step in steps:
+    import model_pool
+    for idx, step in enumerate(steps):
+        # Mandatory stagger and pacing between consecutive sub-actions
+        model_pool.throttle_chain_step(
+            idx, len(steps),
+            stagger_ms=AKIRA_CHAIN_STAGGER_MS,
+            max_safe_length=AKIRA_CHAIN_MAX_SAFE_LENGTH,
+            pacing_interval=AKIRA_CHAIN_PACING_INTERVAL,
+            pacing_pause_s=AKIRA_CHAIN_PACING_PAUSE_S,
+        )
+
         step_id    = step.get("id")
         depends_on = step.get("depends_on")
 
@@ -803,6 +870,7 @@ def run_actions(response: dict, step_results: dict | None = None,
             # Serial path refused before running. Nothing happened, so this is a
             # clean failure: report it and let depends_on skip the rest.
             result = _guard_refusal_text(step["action"], outcome)
+            _pending_blocked_action = {"action": step["action"], "parameter": parameter}
             if step_id:
                 step_results[step_id] = None
                 failed_ids.add(step_id)
@@ -857,6 +925,7 @@ def run_actions(response: dict, step_results: dict | None = None,
         # consumed this value is unaffected by the halt.
         if not outcome.verdict.allowed:
             msg = _guard_flag_pending(step["action"], outcome)
+            _pending_blocked_action = {"action": step["action"], "parameter": parameter}
             results.append(msg)
             break
 
@@ -904,6 +973,13 @@ def run_actions(response: dict, step_results: dict | None = None,
                 print(f"[reliability] failed to record {step['action']}: {e!r}")
 
         results.append(result)
+
+        # Record action in ongoing session action tracker
+        try:
+            _record_session_action(step.get("action", ""), str(parameter or ""), result)
+        except Exception as _act_err:
+            print(f"[run_actions] failed to record session action: {_act_err}")
+
 
     return results
 
@@ -1112,17 +1188,52 @@ def handle_response(response: dict, user_text: str = "") -> bool:
     return True
 
 
-# ── LLM query ────────────────────────────────────────────────�����────────────────
+# ── LLM query ─────────────────────────────────────────────────────────────────
 
-def get_akira_response(text: str) -> dict | None:
+def get_akira_response(text: str, session_id: str | None = None) -> dict | None:
     """
     Get Akira's response for user text.
     Handles pending confirmation state before calling the LLM.
     Returns parsed dict or None (when confirmation was handled inline).
     """
-    global pending_action, pending_parameter, pending_execute, pending_origin
+    global pending_action, pending_parameter, pending_execute, pending_origin, _pending_blocked_action
 
-    # handle pending confirmation
+    cleaned_input = re.sub(r"[^\w\s]", "", text.lower()).strip()
+    is_short_confirmation = cleaned_input in CONFIRMATION_PHRASES or any(
+        cleaned_input == phrase or cleaned_input.startswith(f"{phrase} ")
+        for phrase in ("do it", "confirm", "proceed", "go ahead", "do that")
+    )
+
+    # 1. Handle confirmation of a previously blocked action (Bug 2)
+    if _pending_blocked_action is not None and is_short_confirmation:
+        blocked = dict(_pending_blocked_action)
+        _pending_blocked_action = None
+        print(f"[confirmation] Retrying previously blocked action: {blocked}")
+        confirm_results = run_actions({"actions": [blocked]}, confirmed=True)
+        speak_text = "Done."
+        for r in reversed(confirm_results):
+            if isinstance(r, str) and r.startswith(FAILURE_PREFIXES):
+                speak_text = r
+                break
+            if isinstance(r, dict) and r.get("success") is False:
+                speak_text = r.get("message", "That didn't work.")
+                break
+            if isinstance(r, dict) and r.get("success") is True and r.get("message"):
+                speak_text = r["message"]
+                break
+            if isinstance(r, str):
+                speak_text = r
+                break
+        speak_and_wait(speak_text)
+        try:
+            claude_handler.record_action_results(confirm_results)
+        except Exception as e:
+            print(f"[v0] record_action_results failed: {e}")
+        return None
+    elif _pending_blocked_action is not None and not is_short_confirmation:
+        _pending_blocked_action = None
+
+    # 2. handle existing pending confirmation
     if pending_action is not None:
         if pending_action == "click_confirmed":
             pending_desc = f"clicking '{pending_parameter}'"
@@ -1132,32 +1243,10 @@ def get_akira_response(text: str) -> dict | None:
                 for a in pending_action)
         else:
             pending_desc = f"{pending_action} {pending_parameter or ''}".strip()
+
         confirmed = claude_handler.ask_confirmation(text, pending_desc)
         if confirmed:
             if pending_action == "click_confirmed" and pending_execute is not None:
-                # The closure — not the original step — is what finally touches
-                # the world, and it carries the targets the executor RESOLVED
-                # (which files matched, which element was picked). The guard has
-                # only ever seen the unresolved request, so this is the last and
-                # only point where it can judge what will actually happen. Going
-                # through the router (rather than calling the closure directly)
-                # also keeps this path under the same serial-guard policy as the
-                # steps branch below; a bare call here was a hole through which
-                # every self-gating file op reached the disk unreviewed.
-                #
-                # pending_parameter is deliberately what gets screened: for a
-                # click it is the retry parameter, and for a file op it is the
-                # executor's RESOLVED enumeration. Screening the original request
-                # instead would show the guard nothing it had not already seen.
-                # guard_rules is arity-only, so prose passes; a '|' inside it
-                # would read as a second field and refuse. That is fail-closed,
-                # and '|' is illegal in Windows filenames, so the enumeration
-                # cannot grow one from a path.
-                #
-                # A missing origin also fails closed: "click_confirmed" is not a
-                # real action, so it has no rule and BLOCKs. verify_guard_wiring
-                # asserts the origin is always recorded, so that is a backstop
-                # rather than a path anyone should reach.
                 origin = pending_origin or "click_confirmed"
                 try:
                     outcome = action_router.run_guarded(
@@ -1168,50 +1257,13 @@ def get_akira_response(text: str) -> dict | None:
                         exec_result = speak_text
                     else:
                         exec_result = outcome.result
-                        # gated file-op closures return {"success", "message"} —
-                        # speak the real outcome instead of a generic "Done."
                         if isinstance(exec_result, dict) and exec_result.get("message"):
                             speak_text = exec_result["message"]
                         else:
                             speak_text = "Done."
-                        # Ran, then the guard objected. Say so instead of
-                        # reporting a clean success — there is no undo here, so
-                        # an accurate report is the only remedy available.
                         if not outcome.verdict.allowed:
                             speak_text = _guard_flag_pending(origin, outcome)
 
-                    # RELIABILITY LEDGER — closure/self-gating path.
-                    #
-                    # run_actions records at the bottom of its loop, but the
-                    # self-gating file actions (delete_files, move_files,
-                    # organize_files, organize_folder, bulk_rename_files) never
-                    # reach that line: they return a needs_confirmation PLAN and
-                    # `break` out of the loop ABOVE it, then finally execute
-                    # HERE, through the stored closure. Without this call those
-                    # action types accumulate zero history for as long as they
-                    # exist — and once they are classified Gated (and therefore
-                    # checked against tiers.gated_available) a permanently empty
-                    # ledger means a permanent lockout with no way to unlock.
-                    #
-                    # Recorded under `origin`, not the literal "click_confirmed"
-                    # pending_action, because the ledger is per action TYPE and
-                    # "click_confirmed" is not a real action. This is the same
-                    # name the guard screened above, so the ledger and the gate
-                    # agree on what ran.
-                    #
-                    # Semantics deliberately mirror run_actions:
-                    #   * only counted when it ACTUALLY ran (outcome.executed) —
-                    #     a guard refusal is not reliability evidence, and
-                    #     recording one would let a strict guard suppress an
-                    #     action that never misbehaved.
-                    #   * failure detected with the same two shapes run_actions
-                    #     uses: a FAILURE_PREFIXES string or {"success": False}.
-                    #   * confirmed=True by construction on this path (the human
-                    #     just approved), matching run_actions' `confirmed` scope.
-                    #
-                    # Guarded for the same reason: the action already happened,
-                    # and a ledger write must never take down a completed action.
-                    # A dropped record only makes the action MORE gated.
                     if outcome.executed and origin:
                         _failed = (
                             (isinstance(exec_result, str)
@@ -1228,6 +1280,11 @@ def get_akira_response(text: str) -> dict | None:
                         claude_handler.record_action_results([exec_result if isinstance(exec_result, dict) else speak_text])
                     except Exception as e:
                         print(f"[v0] record_action_results failed: {e}")
+                    if "_record_session_action" in globals():
+                        try:
+                            _record_session_action(str(origin), str(pending_parameter or ""), exec_result)
+                        except Exception:
+                            pass
                 except Exception as e:
                     speak_text = f"Couldn't do that: {e}"
             else:
@@ -1235,9 +1292,6 @@ def get_akira_response(text: str) -> dict | None:
                     pending_action if isinstance(pending_action, list)
                     else [{"action": pending_action, "parameter": pending_parameter}]
                 )
-                # confirmed=True: the human just approved these gated steps, so
-                # the router must EXECUTE them rather than review them again.
-                # Without this the approval is silently discarded.
                 confirm_results = run_actions({"actions": actions},
                                               confirmed=True)
                 speak_text = "Done."
@@ -1251,9 +1305,6 @@ def get_akira_response(text: str) -> dict | None:
                     if isinstance(r, dict) and r.get("success") is True and r.get("message"):
                         speak_text = r["message"]
                         break
-                # record confirmed-action outcomes in history too — this path
-                # previously skipped it, so after "delete my meeting" + "yes"
-                # the next turn had no idea the delete ever happened
                 if confirm_results:
                     try:
                         claude_handler.record_action_results(confirm_results)
@@ -1269,7 +1320,7 @@ def get_akira_response(text: str) -> dict | None:
             # fall through to normal LLM call (user said something else)
 
     try:
-        raw = claude_handler.ask_akira(text)
+        raw = claude_handler.ask_akira(text, session_id=session_id)
         if not (raw or "").strip():
             return {"mode": "conversation",
                     "response": "Having trouble connecting right now.", "end_session": False}
@@ -1301,31 +1352,52 @@ def get_akira_response(text: str) -> dict | None:
 
 
 def _build_session_context() -> str:
-    """Build a one-time context string injected at session start."""
+    """Build a concise context string injected into every turn of an active session."""
     try:
         tabs = get_all_tabs()
         ctx  = get_pc_context()
-        tabs_str    = ", ".join(f"{t['title']}" for t in tabs[:6]) or "none"
-        windows_str = ", ".join(ctx["open_windows"][:5]) or "none"
+        tabs_str    = ", ".join(f"{t['title']}" for t in tabs[:8] if t.get("title")) or "none"
+        windows_str = ", ".join(ctx.get("open_windows", [])[:5]) or "none"
         url_str     = ctx.get("current_url") or "none"
-        note_str = obsidian_context.session_line()
+        note_str = obsidian_context.session_line() if "obsidian_context" in globals() else ""
+
+        # Concise action history of recent actions this session
+        action_lines = []
+        hist = globals().get("_session_action_history")
+        if hist:
+            for i, act in enumerate(hist, 1):
+                param_part = f" | {act['parameter']}" if act.get('parameter') else ""
+                res_part = f" -> {act['result']}" if act.get('result') else ""
+                action_lines.append(f"{i}. {act.get('action', '')}{param_part}{res_part}")
+
+        actions_block = ""
+        if action_lines:
+            actions_block = "[RECENT ACTIONS THIS SESSION]\n" + "\n".join(action_lines) + "\n\n"
+
+        tabs_block = f"[CURRENT BROWSER TABS]\n{tabs_str}\n\n"
+
         raw_ctx = (
-            f"Open tabs: {tabs_str} | "
+            f"Focused app: {ctx.get('foreground_app', 'unknown')} | "
             f"Current page: {url_str} | "
             f"Windows: {windows_str}"
             + (f" | {note_str}" if note_str else "")
         )
+
         return (
             "[SESSION START]\n"
+            f"{actions_block}"
             "<untrusted_external_context>\n"
+            f"{tabs_block}"
+            "[PC STATE]\n"
             f"{raw_ctx}\n"
             "</untrusted_external_context>\n\n"
         )
-    except Exception:
+    except Exception as e:
+        print(f"[v0] session context error: {e}")
         return ""
 
 
-# ── Main loop ──────────���──────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────────
 
 def _process_command(text: str, inject_context: bool = False) -> bool:
     """
@@ -1333,31 +1405,36 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
     Returns True to keep session alive, False to end it.
     inject_context: True on the first command of a new session.
     """
+    global _active_session_id
     if not text:
         print("[v0] empty transcription, staying alive")
         return True
 
-    if inject_context:
-        # A brand-new session starts with no note state. Clearing HERE rather
-        # than only on end_session also covers a session that simply timed out,
-        # which never runs the end_session path — otherwise the next session
-        # would inherit a stale focus note and quietly write to the wrong file.
+    if inject_context or not _active_session_id:
+        _end_session()
+        _active_session_id = f"session_{int(time.time())}"
         obsidian_context.reset()
-        print("[v0] building session context (browser)...")
-        text = _build_session_context() + text
-        print("[v0] session context done")
+
+    print("[v0] building session context (browser)...")
+    context_prefix = _build_session_context()
+    if context_prefix:
+        text = context_prefix + text
+    print("[v0] session context done")
 
     print("[v0] calling LLM...")
     import memory_observer
     memory_observer.observe_turn_async(text)
-    
-    response = get_akira_response(text)
+
+    response = get_akira_response(text, session_id=_active_session_id)
     print("[v0] LLM returned")
     if response is None:
         return True  # confirmation was handled inline, stay alive
 
     print(response)
-    return handle_response(response, user_text=text)
+    alive = handle_response(response, user_text=text)
+    if not alive:
+        _end_session()
+    return alive
 
 
 if __name__ == "__main__":
@@ -1390,6 +1467,7 @@ if __name__ == "__main__":
                 audio = record_command(pre_audio=pre_audio)
                 if audio is None:
                     session_active = False
+                    _end_session()
                     if oww_model:
                         oww_model.reset()
                     continue
@@ -1399,11 +1477,14 @@ if __name__ == "__main__":
                 if session_active:
                     print("[session] continuing")
                 else:
+                    _end_session()
                     if oww_model:
                         oww_model.reset()
 
             # ── Idle — listening for wake word ────────────────────────────
             else:
+                if session_active:
+                    _end_session()
                 session_active = False
 
                 # Interrupt-on-completion. This branch polls every ~80ms, so a task

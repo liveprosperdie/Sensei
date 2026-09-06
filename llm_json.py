@@ -193,13 +193,32 @@ def parse(raw: str) -> tuple[dict | None, dict]:
     except json.JSONDecodeError:
         pass
 
+    # Pre-clean known delimiter-quote corruption patterns (e.g. ]"} or }"})
+    cleaned_text = re.sub(r'([}\]])\s*"\s*([}\]])', r'\1\2', text)
+    cleaned_text = re.sub(r'([}\]])\s*"\s*$', r'\1', cleaned_text)
+    if cleaned_text != text:
+        try:
+            obj = json.loads(cleaned_text)
+            if isinstance(obj, dict):
+                info["repaired"] = True
+                print(f"[llm_json] repaired delimiter-quote corruption: keys={list(obj)}")
+                return obj, info
+        except json.JSONDecodeError:
+            text = cleaned_text
+
     repaired, truncated = _repair(text)
     info["truncated"] = truncated
     for candidate in _candidates(repaired):
         try:
             obj = json.loads(candidate)
         except json.JSONDecodeError:
-            continue
+            # Try delimiter repair on candidate as well
+            cand_clean = re.sub(r'([}\]])\s*"\s*([}\]])', r'\1\2', candidate)
+            cand_clean = re.sub(r'([}\]])\s*"\s*$', r'\1', cand_clean)
+            try:
+                obj = json.loads(cand_clean)
+            except json.JSONDecodeError:
+                continue
         if isinstance(obj, dict):
             info["repaired"] = True
             print(f"[llm_json] repaired (truncated={truncated}) "

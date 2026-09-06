@@ -87,6 +87,18 @@ MANUAL_MAP = {
     "zoom":     os.path.join(_home, "AppData", "Roaming", "Zoom", "bin", "Zoom.exe"),
     "filmora":  os.path.join(_home, "AppData", "Local", "Wondershare", "Wondershare Filmora", "Filmora.exe"),
     "spotify":  os.path.join(_home, "AppData", "Roaming", "Spotify", "Spotify.exe"),
+    "vscode":   next((p for p in [
+        os.path.join(_home, "AppData", "Local", "Programs", "Microsoft VS Code", "Code.exe"),
+        r"C:\Program Files\Microsoft VS Code\Code.exe",
+        r"C:\Program Files (x86)\Microsoft VS Code\Code.exe",
+    ] if os.path.exists(p)), shutil.which("code") or r"C:\Program Files\Microsoft VS Code\Code.exe"),
+    "code":     next((p for p in [
+        os.path.join(_home, "AppData", "Local", "Programs", "Microsoft VS Code", "Code.exe"),
+        r"C:\Program Files\Microsoft VS Code\Code.exe",
+        r"C:\Program Files (x86)\Microsoft VS Code\Code.exe",
+    ] if os.path.exists(p)), shutil.which("code") or r"C:\Program Files\Microsoft VS Code\Code.exe"),
+    "calc":     r"C:\Windows\System32\calc.exe" if os.path.exists(r"C:\Windows\System32\calc.exe") else "calc.exe",
+    "notepad":  r"C:\Windows\System32\notepad.exe" if os.path.exists(r"C:\Windows\System32\notepad.exe") else "notepad.exe",
 }
 
 WEB_MAP = {
@@ -184,6 +196,8 @@ APP_ALIASES = {
     "adobe acrobat": "acrobat", "adobe reader": "acrobat", "git bash": "gitbash",
     "file explorer": "explorer", "windows explorer": "explorer",
     "my computer": "explorer", "this pc": "explorer", "file manager": "explorer",
+    "vs code": "vscode", "visual studio code": "vscode", "code": "vscode",
+    "calculator": "calc", "calc": "calc", "notepad": "notepad",
 }
 
 # RISKY_KEYWORDS — word-boundary matched, not substring
@@ -4415,6 +4429,88 @@ def write_clipboard(parameter: str | None = None) -> dict:
         return {"success": True, "message": f"Copied to clipboard ({len(parameter)} chars), but I couldn't verify it: {e}"}
 
 
+def generate_to_clipboard(parameter: str | None = None) -> dict:
+    """generate_to_clipboard|brief — generates content from a brief/prompt using
+    model_pool (with automatic failover across Groq/Cerebras/etc.), then writes
+    the produced text to the clipboard.
+
+    BUG FIX (2026-09): the Fast Pre-Router previously treated "write an essay on
+    llms in notepad" as literal dictation and copied the instruction text itself
+    to the clipboard. This action is the fix — it invokes actual AI content
+    generation and writes the RESULT, not the instruction.
+
+    Routed through model_pool.call_model() so generation doesn't go dark when
+    one provider's free quota runs out — the pool automatically fails over to
+    the next available endpoint.
+    """
+    print(f"[generate_to_clipboard] called with brief={parameter!r}")
+    if not parameter:
+        return {"success": False, "message": "Tell me what to write — for example, 'write an essay on LLMs'."}
+
+    _CONTENT_SYSTEM = (
+        "You are a professional content writer. Produce high-quality, clean, "
+        "well-formatted prose matching the requested length and format. "
+        "Do not include conversational preambles or meta commentary."
+    )
+    prompt = (
+        f"Write the following content in roughly 400 words or fewer. "
+        f"Write clean, well-structured prose with appropriate paragraphs.\n\n"
+        f"{parameter}"
+    )
+
+    try:
+        import model_pool
+        pool = model_pool.get_pool()
+        result = pool.call_model(
+            messages=[{"role": "user", "content": prompt}],
+            system=_CONTENT_SYSTEM,
+            json_mode=False,       # prose output, not JSON
+            timeout=60.0,          # long-form generation can take a while
+            max_tokens=4096,
+        )
+        text = (result.text or "").strip()
+        provider_info = f"{result.provider}/{result.model}"
+    except Exception as e:
+        print(f"[generate_to_clipboard] model_pool call failed: {e!r}")
+        # Fallback: try gemini_content.generate() directly (single-provider)
+        try:
+            import gemini_content
+            gen = gemini_content.generate(
+                brief=parameter,
+                format_instructions="Write clean, well-structured prose with appropriate paragraphs.",
+                length="short",
+            )
+            if not gen.get("success"):
+                return {"success": False, "message": f"I couldn't generate that content: {gen.get('message', 'all providers exhausted')}"}
+            text = gen["text"]
+            provider_info = "gemini_content (fallback)"
+        except Exception as e2:
+            return {"success": False, "message": f"Content generation failed — all providers exhausted: {e}; fallback: {e2}"}
+
+    # SAFETY: never write empty or suspiciously short content to the clipboard
+    # and report success — that violates the "never report false success" rule.
+    if not text or len(text) < 20:
+        print(f"[generate_to_clipboard] generation returned empty/trivial text ({len(text) if text else 0} chars)")
+        return {
+            "success": False,
+            "message": "Content generation returned empty or trivially short text. Please try again.",
+        }
+
+    print(f"[generate_to_clipboard] generated {len(text)} chars via {provider_info}, writing to clipboard")
+
+    # Reuse write_clipboard to actually set the clipboard and verify
+    cb_result = write_clipboard(text)
+    if cb_result.get("success"):
+        return {
+            "success": True,
+            "message": f"Generated and copied to clipboard ({len(text)} chars). You can paste it now.",
+        }
+    return {
+        "success": False,
+        "message": f"I wrote the content but clipboard copy failed: {cb_result.get('message', 'unknown error')}",
+    }
+
+
 # ── Spotify ────────────────���───────────────────────────────────��──────────────
 # HYBRID control, priority order (never ask the user which):
 #   1. Desktop app installed -> Web API against it (launch + poll if not running)
@@ -5065,20 +5161,26 @@ def _open_single_app(name: str) -> str:
 
     exe = _find_exe(param)
     if exe:
-        subprocess.Popen(exe)
-        return f"Opening {name}."
+        try:
+            subprocess.Popen(exe)
+            return f"Opening {name}."
+        except Exception as e:
+            return f"Couldn't open {name}: {e}"
 
-    # last resort
+    # Try Windows App Paths or direct shell association
+    try:
+        os.startfile(param)
+        return f"Opening {name}."
+    except Exception:
+        pass
+
     try:
         os.startfile(name)
         return f"Opening {name}."
     except Exception:
         pass
-    try:
-        subprocess.Popen(["cmd", "/c", "start", "", name], shell=False)
-        return f"Trying to open {name}."
-    except Exception:
-        return f"Couldn't find {name}."
+
+    return f"Couldn't find {name}."
 
 
 def safe_open_app(name: str, is_indirect: bool = False) -> str:
@@ -5097,9 +5199,19 @@ def safe_open_app(name: str, is_indirect: bool = False) -> str:
 
 
 def open_application(parameter: str, is_indirect: bool = False) -> str:
-    for app in [p.strip() for p in parameter.split(",")]:
-        safe_open_app(app, is_indirect=is_indirect)
-    return "Done."
+    apps = [p.strip() for p in parameter.split(",") if p.strip()]
+    if not apps:
+        return "No application specified."
+    results = []
+    for app in apps:
+        res = safe_open_app(app, is_indirect=is_indirect)
+        results.append(res)
+    failures = [r for r in results if r.startswith(("Couldn't", "Invalid", "Unknown"))]
+    if failures:
+        return " ".join(results)
+    if len(results) == 1:
+        return results[0]
+    return f"Opening {', '.join(apps)}."
 
 
 def _close_single_app(name: str) -> str:
@@ -5131,9 +5243,11 @@ def close_application(parameter: str) -> str:
             except Exception:
                 pass
         return "Closed everything."
-    for app in [p.strip() for p in parameter.split(",")]:
-        _close_single_app(app)
-    return "Done."
+    apps = [p.strip() for p in parameter.split(",") if p.strip()]
+    if not apps:
+        return "No application specified."
+    results = [_close_single_app(app) for app in apps]
+    return " ".join(results)
 
 
 def adjust_volume(parameter: str) -> str:
@@ -5702,6 +5816,7 @@ _ACTION_MAP = {
     "read_clipboard":    read_clipboard,
     "speak_clipboard":   read_clipboard,
     "write_clipboard":   write_clipboard,
+    "generate_to_clipboard": generate_to_clipboard,
     "adjust_volume":     adjust_volume,
     "adjust_brightness": adjust_brightness,
     "screenshot":        lambda _: screenshot(),

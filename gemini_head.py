@@ -493,11 +493,12 @@ def _normalize_payload(obj: dict) -> dict:
 
 
 def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list,
-                    schema: dict | None = None) -> HeadReply | None:
-    """Route intent using Groq Cloud Ultra-Fast API (groq/compound-mini).
+                    schema: dict | None = None,
+                    session_id: str | None = None) -> HeadReply | None:
+    """Route intent using Groq multi-model rotation pool with 5-task session pinning.
 
-    Typically completes in 200-500ms, providing sub-second latency for any query
-    not matched by the local fast pre-router pattern matcher.
+    Rotates across verified >=27B and compound class models on Groq with quality tiering,
+    automatic 429 failover, sliding-window RPM smoothing, and 5-task session pinning.
     """
     groq_sys = (
         "You are Akira AI system assistant. Analyze user intent and respond strictly with a single JSON object.\n"
@@ -507,62 +508,76 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list,
         "- web_search (param: 'query|browser:chrome')\n"
         "- open_url (param: 'https://...')\n"
         "- open_site_tab (param: 'youtube', 'netflix', 'spotify')\n"
+        "- switch_tab (param: 'tab_title_or_site')\n"
+        "- close_tab (param: '')\n"
+        "- new_tab (param: 'optional search query')\n"
+        "- list_tabs (param: '')\n"
+        "- youtube_control (param: 'play [song]', 'pause', 'resume', 'next', 'like', etc.)\n"
+        "- spotify_control (param: 'play [song]', 'pause', 'resume', 'next', 'previous')\n"
+        "- browser_control (param: 'back', 'forward', 'refresh')\n"
         "- open_application / close_application (param: 'app_name')\n"
         "- switch_window, maximize_window, minimize_window\n"
         "- screenshot, read_clipboard, write_clipboard\n"
         "- lock_pc, sleep_pc, shutdown_pc, restart_pc\n"
         "- search_file, open_file, open_folder, index_stats, manage_index_scope\n"
+        "\nContextual Tab and Prior Action Resolution Rules:\n"
+        "1. Check [RECENT ACTIONS THIS SESSION] and [CURRENT BROWSER TABS] before choosing actions.\n"
+        "2. When resolving ambiguous tab references (e.g. 'the tab that was opened before', 'the tab opened before', 'that tab', 'the other one', 'switch back', 'no I meant the previous one'):\n"
+        "   - Prioritize the tab most recently opened or acted upon in [RECENT ACTIONS THIS SESSION] over any other open tab.\n"
+        "   - Emit 'switch_tab' with the specific tab title or site name from recent actions.\n"
+        "   - Do NOT guess an unrelated open tab. If confidence is genuinely low and the target cannot be determined from recent history or tabs, ask a brief clarifying question in conversation mode (e.g. 'Did you mean the YouTube tab or another tab?').\n"
+        "   - Do NOT emit 'new_tab', 'open_site_tab', or 'web_search' when referring to an already-open or recently-acted tab.\n"
+        "\nOutput format:\n"
         "Output tone must be one of: 'neutral', 'happy', 'calm', 'excited', 'focused'.\n"
         "For commands: {\"mode\": \"command\", \"action\": \"canonical_action_name\", \"parameter\": \"value\", \"tone\": \"focused\"}\n"
         "For chat: {\"mode\": \"conversation\", \"response\": \"reply\", \"tone\": \"neutral\", \"end_session\": false}"
     )
-    groq_messages = [{"role": "system", "content": groq_sys}]
-    for m in messages:
-        groq_messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
-    
-    model_name = os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
-    payload = {
-        "model": model_name,
-        "messages": groq_messages,
-        "response_format": {"type": "json_object"}
-    }
-    
-    try:
-        start_t = time.time()
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {groq_key}",
-                "Content-Type": "application/json"
-            },
-            json=payload,
-            timeout=10.0
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            raw_text = (data["choices"][0]["message"]["content"] or "").strip()
-            
-            import re, llm_json
-            clean_text = re.sub(r"^(User Safety:\s*\w+|\[Safety\]:\s*\w+)\s*", "", raw_text, flags=re.I).strip()
-            clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
-            
-            obj, _ = llm_json.parse(clean_text or raw_text)
-            if obj and isinstance(obj, dict) and "mode" in obj:
-                obj = _normalize_payload(obj)
-                raw_text = json.dumps(obj)
-            elif clean_text:
-                raw_text = json.dumps({"mode": "conversation", "response": clean_text, "tone": "neutral", "end_session": False})
-            else:
-                raw_text = json.dumps({"mode": "conversation", "response": "How can I help with that?", "tone": "neutral", "end_session": False})
 
-            elapsed = (time.time() - start_t) * 1000
-            print(f"[gemini_head] routed via Groq ({model_name}) in {elapsed:.1f}ms")
-            return HeadReply([_TextBlock(raw_text)], "end_turn", provider="groq")
+    import model_pool
+    pool = model_pool.get_pool()
+
+    try:
+        route_messages = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages]
+        try:
+            import prompt_dump
+            prompt_dump.capture_payload("Groq Head Routing (gemini_head._route_via_groq)", groq_sys, route_messages, {"provider": "groq", "json_mode": True})
+        except Exception:
+            pass
+        result = pool.call_model(
+            messages=route_messages,
+            system=groq_sys,
+            json_mode=True,
+            timeout=10.0,
+            session_id=session_id,
+        )
+
+        raw_text = result.text
+        import llm_json
+        obj = result.parsed
+        if not obj:
+            obj, _ = llm_json.parse(raw_text)
+
+        if obj and isinstance(obj, dict) and "mode" in obj:
+            obj = _normalize_payload(obj)
+            raw_text = json.dumps(obj)
+        elif raw_text:
+            raw_text = json.dumps({"mode": "conversation", "response": raw_text, "tone": "neutral", "end_session": False})
         else:
-            print(f"[gemini_head] Groq HTTP {resp.status_code}: {resp.text[:200]}")
+            raw_text = json.dumps({"mode": "conversation", "response": "How can I help with that?", "tone": "neutral", "end_session": False})
+
+        print(f"[gemini_head] routed via {result.provider} ({result.model}) in {result.elapsed_ms:.1f}ms (retries={result.retries_made})")
+        return HeadReply([_TextBlock(raw_text)], "end_turn", provider="groq")
+
+
+    except model_pool.PoolExhaustedError as e:
+        print(f"[gemini_head] Model pool exhausted: {e}")
+        return _refuse(
+            f"All free routing models are temporarily rate-limited. "
+            f"Please wait {int(e.retry_after)} seconds."
+        )
     except Exception as e:
-        print(f"[gemini_head] Groq failed: {e!r}")
-    return None
+        print(f"[gemini_head] Multi-model route failed: {e!r}")
+        return None
 
 
 def _route_via_openrouter(openrouter_key: str, messages: list[dict], system_blocks: list, schema: dict | None = None) -> HeadReply | None:
@@ -649,14 +664,36 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
     raw = re.sub(r"^\[session start\].*?</untrusted_external_context>\s*", "", raw, flags=re.I | re.DOTALL)
     raw = re.sub(r"<untrusted_external_context>.*?</untrusted_external_context>\s*", "", raw, flags=re.I | re.DOTALL)
     raw = re.sub(r"^\[pc state\].*?\n\n", "", raw, flags=re.I | re.DOTALL)
+    raw = re.sub(r"\[recent actions this session\].*?\n\n", "", raw, flags=re.I | re.DOTALL)
+    raw = re.sub(r"\[current browser tabs\].*?\n\n", "", raw, flags=re.I | re.DOTALL)
+    raw = re.sub(r"\[session context\].*?\[/session context\]\s*", "", raw, flags=re.I | re.DOTALL)
     text_clean = raw.strip().lower()
     if not text_clean:
+        return None
+
+    # Conversational correction & context-referencing cues:
+    # When user says "no I meant...", "where it was opened before", "already open", "switch back", etc.,
+    # they are correcting or referencing prior actions/tabs. The fast pre-router must NOT hijack
+    # this (e.g. treating "open the tab where it was opened before" as new_tab or web_search).
+    # Return None so the full LLM with session action history & tab context resolves it cleanly.
+    _CORRECTION_PATTERNS = (
+        r'\b(?:no|wait|actually|sorry)\b.*?\b(?:i\s+meant|not\s+that|wanted|mean)\b',
+        r'\b(?:where\s+it\s+was\s+(?:opened|open)\s+before)\b',
+        r'\b(?:opened|open)\s+before\b',
+        r'\balready\s+open(?:ed)?\b',
+        r'\bthe\s+(?:other|previous|prior)\s+tab\b',
+        r'\bswitch\s+back\b',
+        r'\bbut\s+i\s+(?:wanted|meant)\b',
+        r'\binstead\s+of\b',
+    )
+    if any(re.search(p, text_clean) for p in _CORRECTION_PATTERNS):
         return None
 
     def _emit(action: str, parameter: str = "") -> HeadReply:
         envelope = json.dumps({"mode": "command", "action": action, "parameter": parameter, "tone": "focused"})
         print(f"[gemini_head] routed via Fast Pre-Router in 0.1ms -> {action}")
         return HeadReply([_TextBlock(envelope)], "end_turn", provider="fast_pattern")
+
 
     # ── 1. Volume ─────────────────────────────────────────────────────────
     m = re.search(r'(?:increase|decrease|set|change|turn|put|make|adjust)\s+(?:the\s+)?(?:system\s+|pc\s+|speaker\s+|audio\s+)?volume\s+(?:to\s+)?(\d+)', text_clean)
@@ -1001,9 +1038,47 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
     # ── 39c. Type / Write text in active window ───────────────────────────
     # Intercepts Groq hallucinations like 'write_text', 'type_text', 'insert_text'.
     # Strategy: copy content to clipboard so user can paste it wherever needed.
+    #
+    # BUG FIX (2026-09): distinguish COMPOSE requests ("write an essay on
+    # llms in notepad") from LITERAL DICTATION ("type this: hello world").
+    # Compose requests are routed to generate_to_clipboard which invokes
+    # gemini_content.generate() to produce actual content, then writes the
+    # result to the clipboard. Literal dictation keeps the fast path.
     m = re.search(r'(?:write|type|insert|enter|put)\s+(?:the\s+)?(?:text|content|following)?\s*(?:in|into|on)?\s*(?:notepad|word|the\s+editor|the\s+app)?\s*[:\-]?\s*(.{5,})', text_clean)
     if m:
         content = m.group(1).strip().rstrip('".,')
+
+        # Literal-dictation markers: "type this:", "write exactly:", etc.
+        # These mean the user IS dictating verbatim text — keep the fast path.
+        _is_literal = bool(re.search(
+            r'(?:this|exactly|the\s+following|verbatim|these\s+words)\s*[:\-]',
+            content, re.I))
+
+        # Compose-type trigger words: the captured text describes WHAT to
+        # generate, not the literal characters to type.
+        _COMPOSE_KEYWORDS = re.compile(
+            r'\b(?:essay|story|poem|email|letter|report|summary|paragraph[s]?|'
+            r'article|blog\s*post|speech|code|script|note|notes|document|paper|'
+            r'review|description|explanation|tutorial|guide|outline|draft|memo|'
+            r'proposal|message|list|plan|response|reply|haiku|sonnet)\b', re.I)
+        _COMPOSE_PHRASES = re.compile(
+            r'\b(?:about|on\s+the\s+topic\s+of|regarding|on\s+(?:the\s+)?'
+            r'(?:subject|theme)\s+of)\b', re.I)
+
+        is_compose = (not _is_literal
+                      and (_COMPOSE_KEYWORDS.search(content)
+                           or _COMPOSE_PHRASES.search(content)))
+
+        if is_compose:
+            # Strip target-app suffixes so the brief is clean:
+            # "an essay on llms in notepad" → "an essay on llms"
+            brief = re.sub(
+                r'\s+(?:in|into|on|to)\s+(?:notepad|word|the\s+editor|the\s+app)\s*$',
+                '', content, flags=re.I).strip()
+            if not brief:
+                brief = content
+            return _emit("generate_to_clipboard", brief)
+
         return _emit("write_clipboard", content)
 
     # ── 39d. Index Stats & Scope Management ───────────────────────────────
@@ -1210,14 +1285,19 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
 
 
 def route(messages: list[dict], system_blocks: list[dict],
-          schema: dict | None = None) -> HeadReply:
+          schema: dict | None = None, session_id: str | None = None) -> HeadReply:
     fast_reply = _try_fast_pattern_route(messages)
     if fast_reply is not None:
+        try:
+            import prompt_dump
+            prompt_dump.capture_payload("Fast Pre-Router Match", "(Deterministic Regex Pattern Matcher — No LLM Prompt)", messages, {"result": fast_reply.text if hasattr(fast_reply, "text") else str(fast_reply)})
+        except Exception:
+            pass
         return fast_reply
 
     groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
     if groq_key:
-        groq_reply = _route_via_groq(groq_key, messages, system_blocks, schema)
+        groq_reply = _route_via_groq(groq_key, messages, system_blocks, schema, session_id=session_id)
         if groq_reply is not None:
             return groq_reply
 

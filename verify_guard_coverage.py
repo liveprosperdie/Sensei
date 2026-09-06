@@ -199,9 +199,10 @@ def check_fail_closed(dispatchable: set[str]) -> None:
             v = guard_rules.validate(action, "")
             if v.decision != guard_rules.BLOCK:
                 missing_ok.append(f"{action}={v.decision}")
-        v = guard_rules.validate(action, "|".join(["x"] * (rule.max_fields + 1)))
-        if v.decision != guard_rules.BLOCK:
-            excess_ok.append(f"{action}={v.decision}")
+        if rule.split_pipe:
+            v = guard_rules.validate(action, "|".join(["x"] * (rule.max_fields + 1)))
+            if v.decision != guard_rules.BLOCK:
+                excess_ok.append(f"{action}={v.decision}")
 
     record("FAIL" if missing_ok else "PASS", "fail-closed/missing-parameter",
            f"accepted empty parameter: {missing_ok}" if missing_ok

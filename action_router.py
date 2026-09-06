@@ -206,9 +206,9 @@ ROLLBACK: dict[str, Rollback] = {
     # The latency cost of serial guard (6-16s CPU) on every single navigation
     # made the assistant unusable. Parallel lets the page load while Guard
     # checks in the background.
-    "open_url": Rollback.SAFE,
-    "open_site_tab": Rollback.SAFE,
-    "web_search": Rollback.SAFE,
+    "open_url": Rollback.UNSAFE,
+    "open_site_tab": Rollback.UNSAFE,
+    "web_search": Rollback.UNSAFE,
     # Closing a tab discards unsaved page state (half-written form, draft).
     # Re-opening the URL is not a rollback — the state is gone.
     "close_tab": Rollback.UNSAFE,
@@ -486,10 +486,11 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None,
         print(f"[router] {action} tier=gated {verdict}")
         return Outcome(step_tier, verdict, executed=False)
 
-    # ── Not rollback-safe (or flagged statically, or gated and approved): serial ──
-    # If the static check produced a FLAG (e.g. risky keyword), it cannot race
-    # execution even if the action type is normally rollback-safe.
-    if static_verdict.decision == guard_rules.FLAG or not parallel_ok(step):
+    # ── Not rollback-safe (or flagged statically with risky keywords, or gated and approved): serial ──
+    # If the static check flagged risky keywords, it cannot race execution even
+    # if the action type is normally rollback-safe.
+    has_risky_keyword = any("risky keyword" in r for r in static_verdict.reasons)
+    if has_risky_keyword or not parallel_ok(step):
         why = rollback(action).value
         verdict = guard.review(action, parameter, label="guard:serial", **kwargs)
         print(f"[router] {action} tier={step_tier.value} serial "

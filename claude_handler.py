@@ -894,6 +894,11 @@ def plan_organization(raw_content: str, vault_context: str = "", *,
         # ORGANIZE_TIMEOUT, not the client's 30s fast-path default: this reply
         # contains entire note bodies and legitimately takes longer to generate.
         # Single attempt so a timeout can't double into 4 minutes of silence.
+        try:
+            import prompt_dump
+            prompt_dump.capture_payload(f"Claude Brain ({BRAIN_MODEL} - plan_organization)", organize_system, user_block, {"model": BRAIN_MODEL, "max_tokens": 8000})
+        except Exception:
+            pass
         message = client.with_options(
             timeout=ORGANIZE_TIMEOUT,
             max_retries=REASONING_MAX_RETRIES,
@@ -1401,6 +1406,11 @@ def deliberate(request: str, context: str = "", *,
         # class of problem as plan_organization: a reasoning reply is far larger
         # than a routing envelope and needs proportionally longer to generate.
         # Single attempt, for the same dead-air reason as organize.
+        try:
+            import prompt_dump
+            prompt_dump.capture_payload(f"Claude Brain ({BRAIN_MODEL} - deliberate)", [AKIRA_PROMPT, DELIBERATE_PROMPT], user_block, {"model": BRAIN_MODEL, "max_tokens": 4000})
+        except Exception:
+            pass
         message = client.with_options(
             timeout=DELIBERATE_TIMEOUT,
             max_retries=REASONING_MAX_RETRIES,
@@ -1703,7 +1713,7 @@ def _head_dispatch() -> tuple[str, object]:
                           f"Check that GROQ_API_KEY is set in your .env file.")
 
 
-def _routing_call(messages: list[dict], date_block: str):
+def _routing_call(messages: list[dict], date_block: str, session_id: str | None = None):
     """The routing model call, schema-constrained where the API allows it."""
     global _structured_output_ok
 
@@ -1720,7 +1730,9 @@ def _routing_call(messages: list[dict], date_block: str):
                     return fast
                 groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
                 if groq_key:
-                    groq_res = gemini_head._route_via_groq(groq_key, messages, system_blocks(date_block), _routing_schema())
+                    groq_res = gemini_head._route_via_groq(
+                        groq_key, messages, system_blocks(date_block), _routing_schema(), session_id=session_id
+                    )
                     if groq_res is not None:
                         return groq_res
             except Exception as e:
@@ -1729,6 +1741,7 @@ def _routing_call(messages: list[dict], date_block: str):
         except Exception as e:
             print(f"[routing_call] Groq Head error: {e}")
             return _refusal_reply(f"Groq routing error: {e}")
+
     if provider == "gemini":
         return _refusal_reply("Gemini free API has been decommissioned. Free Head routes via Groq.")
 
@@ -1762,6 +1775,19 @@ def _routing_call(messages: list[dict], date_block: str):
         extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
     )
 
+    try:
+        import prompt_dump
+        prompt_dump.capture_payload(
+            f"Claude Routing ({ROUTING_MODEL})",
+            kwargs["system"],
+            kwargs["messages"],
+            {"model": ROUTING_MODEL, "max_tokens": kwargs["max_tokens"],
+             "actions_count": len(_action_enum() or []),
+             "output_config": _routing_output_config() if _structured_output_ok else None}
+        )
+    except Exception:
+        pass
+
     if _structured_output_ok:
         try:
             return client.messages.create(
@@ -1780,7 +1806,7 @@ def _routing_call(messages: list[dict], date_block: str):
     return client.messages.create(**kwargs)
 
 
-def ask_akira(text: str, skip_context: bool = False) -> str:
+def ask_akira(text: str, skip_context: bool = False, session_id: str | None = None) -> str:
     """Send user text to Akira, get back a JSON string response."""
     if skip_context:
         full_text = text
@@ -1845,7 +1871,8 @@ def ask_akira(text: str, skip_context: bool = False) -> str:
     # pattern started beating the system prompt. Keeping every assistant turn
     # JSON-shaped removes that pressure, and matters doubly whenever layer 1 has
     # degraded to the prompt-only fallback.
-    message = _routing_call(messages_snapshot, date_block)
+    message = _routing_call(messages_snapshot, date_block, session_id=session_id)
+
 
     # by type, not position: a ThinkingBlock can precede the text block.
     # Grammar scope is the model's direct output only, so thinking stays free.
