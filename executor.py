@@ -668,8 +668,13 @@ def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
     options = Options()
     options.binary_location = binary_path
     options.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
-    driver = webdriver.Chrome(service=service, options=options)
-    return driver
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+        return driver
+    except Exception:
+        global _chromedriver_path
+        _chromedriver_path = None
+        raise
 
 
 def _attach_cdp_edge(port: int) -> webdriver.Edge:
@@ -734,19 +739,58 @@ def _chromedriver() -> str:
     can be called on every action.
     """
     global _chromedriver_path
-    if _chromedriver_path:
+    if _chromedriver_path and os.path.exists(_chromedriver_path):
         return _chromedriver_path
+
+    # 1. Clean up any stale webdriver-manager lock files left by aborted processes
+    try:
+        wdm_dir = os.path.expanduser(r"~/.wdm")
+        if os.path.isdir(wdm_dir):
+            for fname in os.listdir(wdm_dir):
+                if fname.startswith(".wdm-lock"):
+                    fpath = os.path.join(wdm_dir, fname)
+                    if (time.time() - os.path.getmtime(fpath)) > 10.0:
+                        try:
+                            os.remove(fpath)
+                        except OSError:
+                            pass
+    except Exception:
+        pass
+
+    # 2. Try online resolution via ChromeDriverManager
     try:
         _chromedriver_path = ChromeDriverManager().install()
         print(f"[BROWSER] chromedriver resolved: {_chromedriver_path}")
+        return _chromedriver_path
     except Exception as e:
-        local = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
-        if not os.path.exists(local):
-            raise
-        print(f"[BROWSER] webdriver-manager failed ({e}); falling back to "
-              f"the bundled driver, which may not match your browser version")
+        print(f"[BROWSER] webdriver-manager failed ({e}); checking local cache...")
+
+    # 3. If online resolution fails, check ~/.wdm cache for latest downloaded chromedriver
+    try:
+        wdm_drivers = os.path.expanduser(r"~/.wdm/drivers/chromedriver/win64")
+        if os.path.isdir(wdm_drivers):
+            def _vkey(s):
+                return [int(x) if x.isdigit() else 0 for x in s.split(".")]
+            versions = [v for v in os.listdir(wdm_drivers) if os.path.isdir(os.path.join(wdm_drivers, v))]
+            if versions:
+                versions.sort(key=_vkey, reverse=True)
+                for ver in versions:
+                    cand = os.path.join(wdm_drivers, ver, "chromedriver-win64", "chromedriver.exe")
+                    if os.path.exists(cand):
+                        _chromedriver_path = cand
+                        print(f"[BROWSER] Reused cached chromedriver: {_chromedriver_path}")
+                        return _chromedriver_path
+    except Exception:
+        pass
+
+    # 4. Fallback to bundled chromedriver.exe next to this file
+    local = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
+    if os.path.exists(local):
+        print("[BROWSER] Falling back to bundled chromedriver.exe")
         _chromedriver_path = local
-    return _chromedriver_path
+        return _chromedriver_path
+
+    raise RuntimeError("No usable chromedriver executable found.")
 
 
 def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.Chrome:

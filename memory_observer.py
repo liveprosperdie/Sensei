@@ -38,9 +38,9 @@ def _observe_turn_blocking(user_text: str):
         result = servant_clients.call_openai_compatible(
             tier=servant_clients.GUARD,
             system=_OBSERVER_PROMPT,
-            prompt=user_text,
-            temperature=0.0,  # Zero for extraction
-            max_tokens=150
+            user=user_text,
+            max_tokens=150,
+            label="memory_observer"
         )
         
         text = result.strip()

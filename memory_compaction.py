@@ -61,14 +61,14 @@ def run_compaction():
                     content = f.read()
                 
                 # Ask servant model to extract big events
-                payload, _ = servant_clients.call_openai_compatible(
+                payload = servant_clients.call_openai_compatible(
                     servant_clients.SERVANT_MECH,
                     system=COMPACTION_SYSTEM,
                     user=content,
                     max_tokens=300,
                     timeout=30.0,
                     label="compaction"
-                )
+                ).strip()
                 
                 _append_to_core(payload)
                 os.remove(file_path)
