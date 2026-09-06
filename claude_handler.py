@@ -1735,18 +1735,21 @@ def _routing_call(messages: list[dict], date_block: str):
     if provider == "gemini":
         return _refusal_reply("Gemini free API has been decommissioned. Free Head routes via Groq.")
 
-    import gateway_client
-    if not gateway_client.is_dev_direct_keys():
-        gw_reply = gateway_client.call_route(
-            messages=messages,
-            system=system_blocks(date_block),
-            model=ROUTING_MODEL,
-            max_tokens=1600,
-            output_config=_routing_output_config() if _structured_output_ok else None
-        )
-        if gw_reply is not None:
-            return gw_reply
-        return _refusal_reply("The Akira gateway service is currently unavailable. Please check your connection.")
+    try:
+        import gateway_client
+        if not gateway_client.is_dev_direct_keys():
+            gw_reply = gateway_client.call_route(
+                messages=messages,
+                system=system_blocks(date_block),
+                model=ROUTING_MODEL,
+                max_tokens=1600,
+                output_config=_routing_output_config() if _structured_output_ok else None
+            )
+            if gw_reply is not None:
+                return gw_reply
+            return _refusal_reply("The Akira gateway service is currently unavailable. Please check your connection.")
+    except ImportError:
+        pass
 
     kwargs = dict(
         # BRAIN tier, but NOT BRAIN_MODEL — see the tier table. This runs on
