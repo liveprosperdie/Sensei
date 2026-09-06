@@ -1,4 +1,4 @@
-# Sensei/Akira — Obsidian Focus Mode v1 Implementation Plan
+# Akira — Obsidian Focus Mode v1 Implementation Plan
 
 **Document Version:** 1.1  
 **Status:** PHASE 1 IMPLEMENTED  
@@ -36,7 +36,7 @@ Two consequences v1.0 missed entirely:
 
 1. **HTTPS-first, with a self-signed certificate.** A stock `requests` call to
    `https://127.0.0.1:27124` raises `SSLError` until the cert is trusted. The cert is
-   downloadable from `https://127.0.0.1:27124/obsidian-local-rest-api.crt`. Sensei pins
+   downloadable from `https://127.0.0.1:27124/obsidian-local-rest-api.crt`. Akira pins
    that cert as its CA when present and only falls back to unverified localhost TLS
    otherwise.
 2. **Authentication is mandatory.** Every endpoint except `GET /` is gated behind
@@ -73,7 +73,7 @@ stable-channel Obsidian, and it carries the Markdown Patch 2.0 engine, the built
 MCP server, and the `anyOf` heading-target fix. **"Install latest" is explicitly
 wrong advice for this plugin** and the SETUP guide says so in a warning box.
 
-Sensei enforces this at runtime rather than trusting the docs: `obsidian_api.py`
+Akira enforces this at runtime rather than trusting the docs: `obsidian_api.py`
 reads the reported plugin version from `GET /` and warns on a version outside the
 known-good range instead of failing an opaque call later.
 
@@ -111,7 +111,7 @@ Consequences:
 
 | Option | Verdict |
 |---|---|
-| Python installer script that fetches release assets from the GitHub API | **Rejected.** Solves a problem that no longer exists, and would leave Sensei silently downgrading users away from the stale-read fix. Also a standing maintenance liability: it writes into `.obsidian/plugins/` and fights Obsidian's own updater. |
+| Python installer script that fetches release assets from the GitHub API | **Rejected.** Solves a problem that no longer exists, and would leave Akira silently downgrading users away from the stale-read fix. Also a standing maintenance liability: it writes into `.obsidian/plugins/` and fights Obsidian's own updater. |
 | Document BRAT for pinning an exact tag | **Rejected.** BRAT is the right tool for pinning, but pinning is the thing that's obsolete. Recommending a second plugin to work around a resolved incompatibility is strictly worse than "update Obsidian, install latest". |
 | Combination of both | **Rejected** for the same reason — combining two solutions to a non-problem. |
 
@@ -128,28 +128,28 @@ and trained users to ignore the warning. No Phase 1 request/PATCH/auth code was 
 
 This was the real open question, and the answer is **REST**, decisively. The plugin's
 built-in MCP server is genuinely good and the maintainer is right that it obsoletes
-third-party Obsidian MCP servers — but it does not fit *Sensei's* shape, for four
+third-party Obsidian MCP servers — but it does not fit *Akira's* shape, for four
 reasons found by reading the existing code rather than by preference:
 
 1. **Transport mismatch.** `mcp_client.MCPServer` speaks JSON-RPC over **stdio to a
    child process** (`subprocess.Popen`, `stdin.write`/`stdout.readline`). The plugin's
-   MCP server is **Streamable HTTP** inside an already-running Obsidian. Sensei has no
+   MCP server is **Streamable HTTP** inside an already-running Obsidian. Akira has no
    HTTP MCP transport, so MCP means either writing one, or shelling out to the
    `mcp-remote` Node bridge — a third moving part, plus `npx`, plus the same
    self-signed-cert problem, to reach a server that also exposes plain REST.
-2. **Sensei is not a tool-loop agent.** `claude_handler.AKIRA_PROMPT` mandates
+2. **Akira is not a tool-loop agent.** `claude_handler.AKIRA_PROMPT` mandates
    *"Your entire output is exactly ONE JSON object"*, and `executor._ACTION_MAP`
    dispatches `action|parameter` strings deterministically. MCP's value is handing a
-   tool catalogue to a model that loops over tool calls. Sensei has no such loop;
+   tool catalogue to a model that loops over tool calls. Akira has no such loop;
    adding one to support notes would be a rewrite of the core control flow, not an
    integration.
 3. **Safety model would regress.** Every gate in this codebase is *code-level at the
-   dispatch layer* — `google_mcp.DENYLIST`, `sensei.DANGEROUS_ACTIONS`, the
+   dispatch layer* — `google_mcp.DENYLIST`, `akira.DANGEROUS_ACTIONS`, the
    `RISKY_*_PARAMS` sets — precisely because of the documented lesson that
    prompt-level-only gates fail. The plugin's MCP surface includes `command_execute`
    (arbitrary command-palette execution), `vault_delete`, and `vault_write` (whole-file
    overwrite). Exposing that catalogue to the model would put destructive vault
-   operations behind prompt instructions alone. REST lets Sensei expose exactly five
+   operations behind prompt instructions alone. REST lets Akira expose exactly five
    verbs and never wire the dangerous ones.
 4. **Zero new dependencies.** REST needs `requests`, already in `requirements.txt`.
    No `requirements.txt` change is needed for Phase 1 at all.
@@ -161,7 +161,7 @@ is both fragile and a lost-update race. The plugin exposes a purpose-built
 `PATCH /vault/{path}` instruction engine (Markdown Patch 2.0) that appends under a
 named heading server-side, creates the heading if missing
 (`Create-Target-If-Missing`), owns whitespace canonicalisation, and supports
-`If-Match` optimistic concurrency. **Sensei uses that instead of parsing Markdown
+`If-Match` optimistic concurrency. **Akira uses that instead of parsing Markdown
 itself.** So the corrected approach is "REST, but using the plugin's real capabilities
 rather than the naive endpoints v1.0 imagined" — which is where most of the MCP
 robustness argument actually lived.
@@ -195,7 +195,7 @@ at right now" directly, which v1.0's §1.1 could only guess at by asking the use
 
 ## Executive Summary
 
-This plan extends Sensei/Akira with voice-driven productivity features in Focus Mode, anchored on Obsidian integration. The system will allow users to naturally update notes, track progress, create linked structures, and improve note quality—all mid-session via voice, without breaking focus.
+This plan extends Akira with voice-driven productivity features in Focus Mode, anchored on Obsidian integration. The system will allow users to naturally update notes, track progress, create linked structures, and improve note quality—all mid-session via voice, without breaking focus.
 
 **Key Design Principle:** Obsidian is the permanent knowledge store; Akira brokers context-aware updates into it. The focus session is the interaction context; Obsidian's vault is the durability layer.
 
@@ -224,10 +224,10 @@ Currently, users can open Obsidian and manually type updates. **Goal:** Users sa
 
 ### Current Architecture Analysis
 
-**Existing Session Context in Sensei:**
+**Existing Session Context in Akira:**
 - `conversation_history` (list[dict]) in `claude_handler.py` — stores recent exchanges, max 20 entries (10 full exchanges)
-- `session_start_time` and `SESSION_TIMEOUT` (45 seconds) in `sensei.py` — tracks active session duration
-- `_build_session_context()` in `sensei.py` — injects PC context (open tabs, active window) at session start
+- `session_start_time` and `SESSION_TIMEOUT` (45 seconds) in `akira.py` — tracks active session duration
+- `_build_session_context()` in `akira.py` — injects PC context (open tabs, active window) at session start
 
 **Existing Note Integration:**
 - `docs_control.py` provides Google Docs read/create/append via `google_mcp`
@@ -338,7 +338,7 @@ Create-Target-If-Missing: true
   - Add prompt injection for session summarization
   - New action type: `obsidian_control|update|<note>|<section>`
 
-- [ ] **Wire into `sensei.py`**
+- [ ] **Wire into `akira.py`**
   - Capture focus note at session start (via clarifying question or detection)
   - Store in session state
   - Pass to Claude context
@@ -482,7 +482,7 @@ If user has the Excalidraw plugin installed, Akira can suggest creating a visual
   - New action: `obsidian_control|create_moc|<title>|<note1>|<note2>...`
   - New action: `obsidian_control|add_diagram|<note>|<type>`
 
-- [ ] **Add graph-intent detection in `sensei.py`**
+- [ ] **Add graph-intent detection in `akira.py`**
   - Listen for keywords: "map", "structure", "organize", "diagram", "timeline"
   - Trigger MOC/diagram generation on request
 
@@ -606,7 +606,7 @@ def should_ask_clarification(context: dict) -> tuple[bool, str]:
 }
 ```
 
-**Sensei response handling:**
+**Akira response handling:**
 - Display question via TTS
 - Wait for user clarification input
 - Inject answer into action parameter
@@ -617,13 +617,13 @@ def should_ask_clarification(context: dict) -> tuple[bool, str]:
 - [ ] **Create `obsidian_clarify.py`**
   - `should_ask_clarification(context: dict) -> tuple[bool, str]`
   - `generate_question(question_type: str, context: dict) -> str`
-  - Session flow rate tracking in `sensei.py`
+  - Session flow rate tracking in `akira.py`
 
 - [ ] **Extend `claude_handler.py`**
   - Add `clarifying_question` field to action JSON
   - Condition: only emit question if `should_ask_clarification() == True`
 
-- [ ] **Update `sensei.py`**
+- [ ] **Update `akira.py`**
   - Handle clarifying questions in the action confirmation loop
   - Re-inject user's answer into action parameter
   - Track message frequency for flow-rate heuristic
@@ -773,7 +773,7 @@ Over time:
    - Add new action types: `obsidian_control|update|...`, `obsidian_control|create_moc|...`
    - Add clarifying question handling
 
-2. **`sensei.py`**
+2. **`akira.py`**
    - Extend session state with `focus_note`, `session_topic`, `mentioned_notes`
    - Integrate clarifying question prompts
    - Track session flow rate (for interruption heuristics)
@@ -791,7 +791,7 @@ Over time:
 ```
 User (voice) 
   ↓
-sensei.py (VAD, transcription, session state)
+akira.py (VAD, transcription, session state)
   ↓
 claude_handler.py (LLM decision + action routing)
   ↓
@@ -816,7 +816,7 @@ User sees result (next note refresh)
 - **Local REST API with MCP** (`coddingtonbear/obsidian-local-rest-api`) — **latest, >= 5.0.2** (§0.6)
   - Endpoint: `https://127.0.0.1:27124` (HTTPS default); `http://127.0.0.1:27123` opt-in
   - Auth: `Authorization: Bearer <api-key>` from the plugin's settings pane, read by
-    Sensei from `OBSIDIAN_API_KEY`
+    Akira from `OBSIDIAN_API_KEY`
   - Installation: Obsidian Settings → Community Plugins → Search "Local REST API" → Install & Enable
   - Fallback needed: If plugin not running, fail gracefully (suggest enabling)
   - See `SETUP_OBSIDIAN_FOCUS_MODE.md` for the version-pinning warning
@@ -829,7 +829,7 @@ User sees result (next note refresh)
 Create a **SETUP_OBSIDIAN_FOCUS_MODE.md** guide covering:
 - How to install Local REST API plugin
 - How to configure API security (port, optional token)
-- How to enable Focus Mode in Sensei/Akira
+- How to enable Focus Mode in Akira
 - Troubleshooting (e.g., REST API not responding)
 
 ---
@@ -868,7 +868,7 @@ Create a **SETUP_OBSIDIAN_FOCUS_MODE.md** guide covering:
 
 ### Phase 2 (Refinement — Week 2–3)
 1. Create `obsidian_clarify.py` — clarifying question logic
-2. Integrate with action confirmation loop in `sensei.py`
+2. Integrate with action confirmation loop in `akira.py`
 3. Add MOC generation to `obsidian_control.py`
 4. **Test:** Clarifying questions in ambiguous scenarios; MOC generation
 

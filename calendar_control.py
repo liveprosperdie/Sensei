@@ -1,6 +1,6 @@
 """Google Calendar dispatcher. Full read/write, routed through google_mcp.
 
-Action format (pipe-separated, matching sensei's existing convention):
+Action format (pipe-separated, matching akira's existing convention):
   list|[days ahead, default 7]
   create|Title|2026-07-17 15:00|2026-07-17 16:00|[description]
   get|<eventId>
@@ -30,7 +30,7 @@ def calendar_control(action: str, parameter: str | None = None) -> dict:
             days = int(parts[0]) if parts and parts[0].isdigit() else 7
             now = datetime.now().astimezone()
             # speak_summary: list results are raw event dumps — synthesized
-            # into a spoken schedule in the same turn (see sensei.handle_response)
+            # into a spoken schedule in the same turn (see akira.handle_response)
             return google_mcp.call("workspace", "list_events", {
                 "timeMin": now.isoformat(),
                 "timeMax": (now + timedelta(days=days)).isoformat(),

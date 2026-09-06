@@ -30,7 +30,7 @@ understands. 'speak' marks a message whose content must be read aloud verbatim
 
 Destructive sub-actions (close without saving, save-as over an existing file)
 are NOT gated here. They are declared in RISKY_OFFICE_PARAMS and gated by
-sensei's existing confirmation_required safety net, so the codebase keeps
+akira's existing confirmation_required safety net, so the codebase keeps
 exactly ONE confirmation mechanism.
 """
 
@@ -903,6 +903,15 @@ def _word_generate(app, doc, parameter: str | None) -> dict:
     if not title or not brief:
         return _err("Generating needs a title and a short brief of what to write.")
 
+    # Pro-only: AI-authored document generation with auto-images is a premium
+    # capability. Interactive Word operations (new/open/read/insert/format)
+    # remain on Standard.
+    import tiers
+    if tiers.plan_for(tiers.Layer.SERVANT) != tiers.PRO:
+        return {"success": False, "speak": True,
+                "message": "AI-generated Word document drafting is a Pro tier feature. "
+                           "You can still create documents and dictate text using 'new' and 'insert'."}
+
     try:
         import gemini_content
     except Exception as e:                                # pragma: no cover
@@ -1733,7 +1742,7 @@ _APP_ALIASES = {
     "ms teams": "teams", "microsoft teams": "teams",
 }
 
-# Sub-actions that can lose work. Gated by sensei's existing
+# Sub-actions that can lose work. Gated by akira's existing
 # confirmation_required safety net — this module holds NO confirmation logic,
 # exactly like system_control's Tier 2.
 # Deliberately NOT gated: formatting, lists, formulas, charts, image inserts
@@ -1758,7 +1767,7 @@ def _canonical_sub(parameter: str | None) -> str:
 
 def is_risky_parameter(parameter: str | None) -> bool:
     """Does this office_control parameter need confirmation? Single source of
-    truth, consumed by sensei's confirmation_required gate."""
+    truth, consumed by akira's confirmation_required gate."""
     return _canonical_sub(parameter) in RISKY_OFFICE_PARAMS
 
 

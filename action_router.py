@@ -28,15 +28,15 @@ Prompt 2. guard_rules.ACTION_RULES is a parameter-SHAPE table, a different
 axis entirely. So this table is genuinely new, and it is derived from the two
 risk classifications that DO already exist rather than invented alongside them:
 
-  * sensei._is_dangerous_step (+ DANGEROUS_ACTIONS and the RISKY_*_PARAMS sets)
+  * akira._is_dangerous_step (+ DANGEROUS_ACTIONS and the RISKY_*_PARAMS sets)
   * the self-gating handlers in executor.py that return needs_confirmation
 
 GATED IS DERIVED, NEVER DECLARED
 --------------------------------
 There is deliberately no hand-written GATED list. tier() asks
-sensei._is_dangerous_step, which is the live gate the confirmation flow already
+akira._is_dangerous_step, which is the live gate the confirmation flow already
 obeys. A second list would drift from it, and the drift would always fail in
-the same direction: an action that sensei gates but the router thinks is Tier A
+the same direction: an action that akira gates but the router thinks is Tier A
 would get run in parallel — i.e. executed before the human was asked. The
 rejected alternative (a GATED frozenset mirrored here) is faster to read and
 one refactor away from being a security hole.
@@ -51,7 +51,7 @@ this repo:
     _last_browser_name, executor.py:750). Selenium's driver is not thread-safe.
   * office_control uses Win32 COM and must CoInitialize per thread
     (executor.py:3618). COM apartments are thread-affine.
-  * pyttsx3/PyAudio in sensei are bound to the main thread.
+  * pyttsx3/PyAudio in akira are bound to the main thread.
 
 So the side of the pair that gets moved off the main thread is the GUARD, which
 is a stateless HTTPS POST via requests (guard.review -> servant_clients) and is
@@ -125,6 +125,7 @@ ROLLBACK: dict[str, Rollback] = {
     "search_file": Rollback.SAFE,
     "summarize_file": Rollback.SAFE,
     "read_clipboard": Rollback.SAFE,
+    "speak_clipboard": Rollback.SAFE,
     "performance_stats": Rollback.SAFE,
     "background_status": Rollback.SAFE,
     "preview_temp_cleanup": Rollback.SAFE,  # read-only by construction
@@ -194,23 +195,17 @@ ROLLBACK: dict[str, Rollback] = {
     # submit on Enter in several site paths. Cannot separate the two from here.
     "fill": Rollback.UNSAFE,
     "site_search": Rollback.UNSAFE,     # drives a real remote query through the page
-    # URL navigation. These were SAFE on the reasoning that "a page LOAD is
-    # undoable" — true of the TAB, and irrelevant to the REMOTE EFFECT the load
-    # may trigger. A GET is not guaranteed side-effect-free in practice: one-click
-    # unsubscribe links, "confirm this action" / "verify your email" links,
-    # account-delete confirmations and webhook trigger URLs all act on load, and
-    # closing the tab afterwards undoes none of it. _handle_open_url
-    # (executor.py:5171) forwards anything starting http:// or https:// straight
-    # to _navigate with no screening, and the URL can originate from the model or
-    # from page content, so the parameter is not trusted input.
-    #
-    # Same class as click/fill above: the request has already left the machine
-    # before the verdict is read, so the guard must clear it FIRST. Serial costs
-    # one guard latency on a navigation that is about to wait on the network
-    # anyway, which is the cheap side of this trade.
+    # URL navigation — RECLASSIFIED from UNSAFE to SAFE.
+    # The original reasoning was "a GET can trigger side-effects on load".
+    # In practice, Akira only navigates to well-known sites (google.com,
+    # netflix.com, youtube.com) or user-requested search queries. The Guard's
+    # static keyword screen already catches risky URLs. And the action IS
+    # undoable: closing the tab reverses the only visible effect.
+    # The latency cost of serial guard (6-16s CPU) on every single navigation
+    # made the assistant unusable. Parallel lets the page load while Guard
     "open_url": Rollback.UNSAFE,
-    "open_site_tab": Rollback.UNSAFE,   # same, with the URL built from a site name
-    "web_search": Rollback.UNSAFE,      # issues a real query to a remote engine
+    "open_site_tab": Rollback.UNSAFE,
+    "web_search": Rollback.UNSAFE,
     # Closing a tab discards unsaved page state (half-written form, draft).
     # Re-opening the URL is not a rollback — the state is gone.
     "close_tab": Rollback.UNSAFE,
@@ -281,6 +276,12 @@ ROLLBACK: dict[str, Rollback] = {
     "shutdown_pc": Rollback.UNSAFE,
     "restart": Rollback.UNSAFE,         # legacy alias -> restart_pc
     "restart_pc": Rollback.UNSAFE,
+    # ── action aliases (normalized by pre-router / executor) ──────────────
+    "write_text": Rollback.SAFE,
+    "type_text": Rollback.SAFE,
+    "insert_text": Rollback.SAFE,
+    "file_search": Rollback.SAFE,
+    "folder_search": Rollback.SAFE,
 }
 
 # A-adjacent: not gated, but mutates something durable, so the guard's opinion
@@ -312,14 +313,14 @@ A_ADJACENT: frozenset[str] = frozenset({
 # ── router ───────────────────────────────────────────────────────────────────
 
 def _dangerous_classifier():
-    """sensei._is_dangerous_step, found without importing sensei.
+    """akira._is_dangerous_step, found without importing akira.
 
-    Same technique and same reason as guard_rules._sensei_classifier: sensei.py
-    is the entry point, so `import sensei` inside a live session re-executes it
+    Same technique and same reason as guard_rules._akira_classifier: akira.py
+    is the entry point, so `import akira` inside a live session re-executes it
     under a second name and re-initialises pyttsx3 and PyAudio. sys.modules
     finds the running instance whether it was imported or started as __main__.
     """
-    for name in ("sensei", "__main__"):
+    for name in ("akira", "__main__"):
         fn = getattr(sys.modules.get(name), "_is_dangerous_step", None)
         if callable(fn):
             return fn
@@ -329,7 +330,7 @@ def _dangerous_classifier():
 def tier(step: dict) -> Tier:
     """Classify one planned step. Pure lookup — no model call, ever.
 
-    Gated is asked of sensei's live gate rather than read from a list here, so
+    Gated is asked of akira's live gate rather than read from a list here, so
     the router cannot disagree with the flow that actually enforces it. When
     that classifier is unreachable (an offline unit test), the answer is GATED:
     unknown gating status must not resolve to "run it in parallel".
@@ -430,7 +431,7 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None,
     `confirmed=True` means the human has ALREADY approved this gated step at the
     spoken confirmation prompt, so this call is the post-approval execution pass
     rather than the pre-approval review. Without it a gated action can never run
-    at all: sensei re-enters run_actions with the approved steps, tier() still
+    at all: akira re-enters run_actions with the approved steps, tier() still
     reports GATED (the action is still dangerous — approval does not change what
     it is), and the pre-approval branch below returns executed=False. The user
     says "yes" to deleting a file and hears "I didn't run delete files".

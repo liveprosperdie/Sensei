@@ -3,7 +3,7 @@ background_tasks.py — the one place a slow action goes to stop blocking the vo
 session.
 
 WHY THIS EXISTS
-Sensei is a voice interface, so wall-clock latency is not a performance detail —
+Akira is a voice interface, so wall-clock latency is not a performance detail —
 it is dead air, and dead air is indistinguishable from a hang. Several real
 actions legitimately take 30-300s (a repo-to-notes pass, a git clone, an
 organize plan). Running those inline means the user says something and then
@@ -23,7 +23,7 @@ DESIGN NOTES
 - Multi-task registry, not a single slot. Barely more code than one global (a
   dict instead of a variable) and it means a second request while the first is
   still running cannot silently vanish. No pool, no queue, no concurrency caps —
-  Sensei's usage pattern is one human talking, so contention is not a concern.
+  Akira's usage pattern is one human talking, so contention is not a concern.
 - Threads, not asyncio. The whole codebase is synchronous and the slow calls are
   blocking network I/O (Anthropic SDK, requests, subprocess), so a daemon thread
   per task is the honest fit. There is nothing to gain from an event loop here.
@@ -55,7 +55,7 @@ _MAX_FINISHED = 12
 # ── What to background ───────────────────────────────────────────────────────
 # action name -> None (always background) or the set of sub-actions to background
 # (matched against field 0 of the pipe-delimited parameter, the same way
-# sensei._is_dangerous_step reads it).
+# akira._is_dangerous_step reads it).
 #
 # Add a slow action HERE rather than writing threading code in the action: that
 # is the entire point of this module. Quick mechanical actions (click, open tab,
@@ -89,7 +89,7 @@ _LABELS: dict[str, str] = {
 
 
 def _sub_action(parameter) -> str:
-    """Field 0 of a pipe parameter, normalised like sensei's gate reads it."""
+    """Field 0 of a pipe parameter, normalised like akira's gate reads it."""
     if not isinstance(parameter, str):
         return ""
     return parameter.split("|")[0].strip().lower().replace("_", " ")
@@ -194,7 +194,7 @@ def _finish(tid: int, ok: bool, message: str) -> None:
         _ANNOUNCE.append(line)
 
 
-# ── Completion announcements (drained by sensei's main loop) ─────────────────
+# ── Completion announcements (drained by akira's main loop) ─────────────────
 
 def has_announcements() -> bool:
     with _LOCK:

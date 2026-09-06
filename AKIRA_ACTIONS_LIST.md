@@ -1,6 +1,6 @@
-# Sensei Action & Function Directory
+# Akira Action & Function Directory
 
-Sensei has over 80+ unique actions built-in, many of which are multi-layered tools for specific platforms. Below is the complete catalog of everything Sensei can currently execute.
+Akira has over 80+ unique actions built-in, many of which are multi-layered tools for specific platforms. Below is the complete catalog of everything Akira can currently execute.
 
 > [!NOTE]
 > Actions marked with **[C]** are **Gated**. They require explicit user confirmation before executing, and on the Pro tier, they are subject to the reliability gate.
@@ -54,7 +54,7 @@ Sensei has over 80+ unique actions built-in, many of which are multi-layered too
 
 # Platform-Specific Controllers
 
-Sensei has dedicated controller tools that interact with complex web applications and desktop software using native APIs or highly specialized DOM routines, rather than generic clicks.
+Akira has dedicated controller tools that interact with complex web applications and desktop software using native APIs or highly specialized DOM routines, rather than generic clicks.
 
 ## Obsidian (`obsidian_control`)
 *   `organize`: Hands raw content to a reasoning pass to structure into the vault.

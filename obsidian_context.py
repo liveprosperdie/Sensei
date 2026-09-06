@@ -2,7 +2,7 @@
 
 Two jobs:
 
-1. SESSION CONTEXT — one line appended to sensei._build_session_context() at
+1. SESSION CONTEXT — one line appended to akira._build_session_context() at
    session start telling Akira which note is open in Obsidian. The original
    plan had no way to know this and proposed asking the user for their focus
    note up front; GET /active/ just answers it, so the question is unnecessary
@@ -10,7 +10,7 @@ Two jobs:
 
 2. NOTE RESOLUTION — turning "add this to my notes" into a concrete vault path
    via the plan's decision tree (explicit -> implicit -> ambiguous), and
-   reporting AMBIGUOUS rather than guessing, so sensei can ask.
+   reporting AMBIGUOUS rather than guessing, so akira can ask.
 
 Deliberately cheap: /active/ is one localhost request and it is only made at
 session start, never per-turn, so it cannot add latency to a rapid exchange.

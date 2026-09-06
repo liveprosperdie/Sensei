@@ -51,6 +51,13 @@ def sheets_control(action: str, parameter: str | None = None) -> dict:
                                 "valueInputOption": "USER_ENTERED"})
 
     if action == "generate":
+        # Pro-only: AI-generated dataset creation is a premium capability.
+        # Interactive create/read/write stay on Standard.
+        import tiers
+        if tiers.plan_for(tiers.Layer.SERVANT) != tiers.PRO:
+            return {"success": False, "speak": True,
+                    "message": "AI-generated spreadsheet data is a Pro tier feature. "
+                               "You can still create spreadsheets with your own data using 'create'."}
         # Name|brief — data rows from Gemini in a separate call, returned in
         # the exact a,b;c,d format _grid() parses. Sheet data is inherently
         # short, so no length hint is exposed here.

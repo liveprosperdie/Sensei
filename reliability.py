@@ -61,12 +61,12 @@ MODE = (os.environ.get("RELIABILITY_MODE", "consecutive") or "").strip().lower()
 # Only consulted in cumulative mode. 0.95 of 20 runs allows a single failure.
 MIN_RATE = float(os.environ.get("RELIABILITY_MIN_RATE", "0.95"))
 
-# Same LOCALAPPDATA\Sensei convention as gemini_content._QUOTA_FILE, so all
+# Same LOCALAPPDATA\Akira convention as akira_quota._QUOTA_FILE, so all
 # persistent assistant state lands in one directory the user can inspect or
 # delete, rather than a second scheme invented here.
 LEDGER_FILE = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-    "Sensei", "action_reliability.json")
+    "Akira", "action_reliability.json")
 
 # run_actions executes on the calling thread, but background_tasks runs its own
 # threads and both can record. The lock covers the read-modify-write; the atomic

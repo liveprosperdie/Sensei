@@ -48,4 +48,4 @@ def gmail_control(action: str, parameter: str | None = None) -> dict:
         return google_mcp.call("gmail", "list_labels", {}, speak_summary=True)
 
     return {"success": False,
-            "message": f"Unknown or disabled gmail action: {action}. Gmail is read-only in Sensei."}
+            "message": f"Unknown or disabled gmail action: {action}. Gmail is read-only in Akira."}

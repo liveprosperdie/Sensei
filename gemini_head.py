@@ -91,11 +91,11 @@ producing any visible error. Do not reorder it.
 COST / LATENCY PROFILE OF FREE-TIER HEAD, PLAINLY
 =================================================
 Routing spends ONE Gemini request PER UTTERANCE, drawn from the same daily
-allowance as document generation (see gemini_quota — one shared counter, for
+allowance as document generation (see akira_quota — one shared counter, for
 exactly this reason). At the conservative 250/day default with the 90%
 safety stop, that is ~225 voice turns per day TOTAL, shared with every
 "write me a doc". Prompt caching cannot extend it. An operator who needs more
-than that does not need a cache; they need SENSEI_HEAD_TIER=standard.
+than that does not need a cache; they need AKIRA_HEAD_TIER=standard.
 
 DAILY CAP: NO SILENT ESCALATION
 ===============================
@@ -107,9 +107,9 @@ can have, and this codebase has resolved the same question the same way for
 JSON parse failures, guard failures and servant fallthrough.
 
 Escalation exists, but only as an EXPLICIT OPT-IN:
-SENSEI_HEAD_ESCALATE_ON_CAP=1. Off by default, and loud when it fires.
+AKIRA_HEAD_ESCALATE_ON_CAP=1. Off by default, and loud when it fires.
 
-No Windows/TTS imports: exercised headlessly by verify_gemini_head.py.
+No Windows/TTS imports: exercised headlessly by verify_akira_head.py.
 """
 
 from __future__ import annotations
@@ -117,12 +117,13 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
 from dataclasses import dataclass, field
 
 import requests
 from dotenv import load_dotenv
 
-import gemini_quota
+import akira_quota
 
 load_dotenv()
 
@@ -162,7 +163,7 @@ TEMPERATURE = float(os.environ.get("GEMINI_HEAD_TEMPERATURE", "0"))
 # turns out to need it — it is a knob, not a constant.
 THINKING_BUDGET = int(os.environ.get("GEMINI_HEAD_THINKING_BUDGET", "0"))
 
-KEY_ENV = "GEMINI_API_KEY"
+KEY_ENV = "GROQ_API_KEY"
 _PURPOSE = "head_routing"
 
 # Capability flags, flipped off the first time the API rejects the field, so an
@@ -220,18 +221,18 @@ def _refuse(spoken: str) -> HeadReply:
     rules out.
 
     An exception would also be fail-closed, but strictly worse HERE: the sole
-    caller (sensei.get_akira_response) wraps ask_akira in a bare
+    caller (akira.get_akira_response) wraps ask_akira in a bare
     `except Exception` that speaks "Something went wrong. Try again." So raising
     would convert every specific, actionable reason — cap reached, key missing,
     Gemini 500 — into the same generic sentence, discarding the diagnosis at the
     last step. Returning a spoken envelope routes the REAL reason to the user's
     ears and the log, through a path that already works, with no change to
-    sensei.py.
+    akira.py.
     """
     print(f"[gemini_head] refusing: {spoken}")
     return _reply({"mode": "conversation", "response": spoken,
                    "end_session": False},
-                  quota=gemini_quota.snapshot())
+                  quota=akira_quota.snapshot())
 
 
 # ── Readiness (consumed by tiers.head) ───────────────────────────────────────
@@ -242,16 +243,12 @@ def readiness() -> tuple[bool, str]:
     Checks CONFIGURATION only, never the network: tiers.head() is called from a
     startup banner and a status command, and a layer-resolution function that
     makes an HTTP request would turn config display into a network dependency.
-    Quota exhaustion is deliberately NOT checked here either — it is a
-    mid-session runtime condition, and reporting the Head layer as structurally
-    unavailable because today's allowance ran out would conflate "you are not
-    set up" with "you are set up and used it up".
     """
     if not (os.environ.get(KEY_ENV) or "").strip():
         return False, (
-            f"the Free Head is Gemini, but {KEY_ENV} is not set. Get a free key "
-            f"at aistudio.google.com/apikey and add it to .env, or set "
-            f"SENSEI_HEAD_TIER=standard to use paid Claude. Not falling back to "
+            f"the Free Head is Groq, but {KEY_ENV} is not set in .env. Get a key "
+            f"at console.groq.com/keys and add it to .env, or set "
+            f"AKIRA_HEAD_TIER=standard to use paid Claude. Not falling back to "
             f"paid Claude automatically, because that would spend money you did "
             f"not agree to.")
     return True, ""
@@ -259,7 +256,7 @@ def readiness() -> tuple[bool, str]:
 
 def escalation_opted_in() -> bool:
     """True only if the user EXPLICITLY allowed paid escalation on cap."""
-    raw = (os.environ.get("SENSEI_HEAD_ESCALATE_ON_CAP") or "").strip().lower()
+    raw = (os.environ.get("AKIRA_HEAD_ESCALATE_ON_CAP") or "").strip().lower()
     return raw in ("1", "true", "yes", "on")
 
 
@@ -418,96 +415,720 @@ def _degrade(detail: str) -> bool:
     return False
 
 
+ACTION_ALIASES: dict[str, str] = {
+    # Brightness
+    "set_system_brightness": "adjust_brightness",
+    "set_brightness": "adjust_brightness",
+    "change_brightness": "adjust_brightness",
+    "change_system_brightness": "adjust_brightness",
+    "screen_brightness": "adjust_brightness",
+    "system_brightness": "adjust_brightness",
+
+    # Volume
+    "set_system_volume": "adjust_volume",
+    "set_volume": "adjust_volume",
+    "change_volume": "adjust_volume",
+    "change_system_volume": "adjust_volume",
+    "adjust_sound": "adjust_volume",
+    "system_volume": "adjust_volume",
+
+    # Text & Clipboard
+    "write_text": "write_clipboard",
+    "type_text": "write_clipboard",
+    "insert_text": "write_clipboard",
+    "enter_text": "write_clipboard",
+    "paste_text": "write_clipboard",
+
+    # Files & Search
+    "file_search": "search_file",
+    "folder_search": "search_file",
+    "find_file": "search_file",
+    "find_folder": "search_file",
+    "search_files": "search_file",
+    "google_search": "web_search",
+    "google": "web_search",
+    "search": "web_search",
+    "search_web": "web_search",
+
+    # Screenshot
+    "take_screenshot": "screenshot",
+    "capture_screenshot": "screenshot",
+    "grab_screenshot": "screenshot",
+
+    # Applications
+    "launch_app": "open_application",
+    "launch_application": "open_application",
+    "start_app": "open_application",
+    "start_application": "open_application",
+    "kill_app": "close_application",
+    "kill_application": "close_application",
+    "exit_app": "close_application",
+    "quit_app": "close_application",
+}
+
+
+def _normalize_payload(obj: dict) -> dict:
+    """Normalize LLM-hallucinated action names and ensure valid tone."""
+    if not isinstance(obj, dict):
+        return obj
+    if "action" in obj and isinstance(obj["action"], str):
+        obj["action"] = ACTION_ALIASES.get(obj["action"], obj["action"])
+    if "actions" in obj and isinstance(obj["actions"], list):
+        for a in obj["actions"]:
+            if isinstance(a, dict) and "action" in a:
+                a["action"] = ACTION_ALIASES.get(a["action"], a["action"])
+
+    valid_tones = {"neutral", "happy", "calm", "excited", "focused"}
+    tone = obj.get("tone")
+    if not isinstance(tone, str) or tone.lower() not in valid_tones:
+        obj["tone"] = "focused" if obj.get("mode") == "command" else "neutral"
+    else:
+        obj["tone"] = tone.lower()
+    return obj
+
+
+def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list,
+                    schema: dict | None = None) -> HeadReply | None:
+    """Route intent using Groq Cloud Ultra-Fast API (groq/compound-mini).
+
+    Typically completes in 200-500ms, providing sub-second latency for any query
+    not matched by the local fast pre-router pattern matcher.
+    """
+    groq_sys = (
+        "You are Akira AI system assistant. Analyze user intent and respond strictly with a single JSON object.\n"
+        "Canonical action names:\n"
+        "- adjust_volume (param: '0'..'100')\n"
+        "- adjust_brightness (param: '0'..'100')\n"
+        "- web_search (param: 'query|browser:chrome')\n"
+        "- open_url (param: 'https://...')\n"
+        "- open_site_tab (param: 'youtube', 'netflix', 'spotify')\n"
+        "- open_application / close_application (param: 'app_name')\n"
+        "- switch_window, maximize_window, minimize_window\n"
+        "- screenshot, read_clipboard, write_clipboard\n"
+        "- lock_pc, sleep_pc, shutdown_pc, restart_pc\n"
+        "- search_file, open_file, open_folder\n"
+        "Output tone must be one of: 'neutral', 'happy', 'calm', 'excited', 'focused'.\n"
+        "For commands: {\"mode\": \"command\", \"action\": \"canonical_action_name\", \"parameter\": \"value\", \"tone\": \"focused\"}\n"
+        "For chat: {\"mode\": \"conversation\", \"response\": \"reply\", \"tone\": \"neutral\", \"end_session\": false}"
+    )
+    groq_messages = [{"role": "system", "content": groq_sys}]
+    for m in messages:
+        groq_messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
+    
+    model_name = os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
+    payload = {
+        "model": model_name,
+        "messages": groq_messages,
+        "response_format": {"type": "json_object"}
+    }
+    
+    try:
+        start_t = time.time()
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {groq_key}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=10.0
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            raw_text = (data["choices"][0]["message"]["content"] or "").strip()
+            
+            import re, llm_json
+            clean_text = re.sub(r"^(User Safety:\s*\w+|\[Safety\]:\s*\w+)\s*", "", raw_text, flags=re.I).strip()
+            clean_text = re.sub(r"<think>.*?</think>", "", clean_text, flags=re.DOTALL).strip()
+            
+            obj, _ = llm_json.parse(clean_text or raw_text)
+            if obj and isinstance(obj, dict) and "mode" in obj:
+                obj = _normalize_payload(obj)
+                raw_text = json.dumps(obj)
+            elif clean_text:
+                raw_text = json.dumps({"mode": "conversation", "response": clean_text, "tone": "neutral", "end_session": False})
+            else:
+                raw_text = json.dumps({"mode": "conversation", "response": "How can I help with that?", "tone": "neutral", "end_session": False})
+
+            elapsed = (time.time() - start_t) * 1000
+            print(f"[gemini_head] routed via Groq ({model_name}) in {elapsed:.1f}ms")
+            return HeadReply([_TextBlock(raw_text)], "end_turn", provider="groq")
+        else:
+            print(f"[gemini_head] Groq HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[gemini_head] Groq failed: {e!r}")
+    return None
+
+
+def _route_via_openrouter(openrouter_key: str, messages: list[dict], system_blocks: list, schema: dict | None = None) -> HeadReply | None:
+    system_text = ""
+    for block in system_blocks:
+        if isinstance(block, dict):
+            system_text += block.get("text", "") + "\n\n"
+        elif isinstance(block, str):
+            system_text += block + "\n\n"
+    
+    or_messages = [{"role": "system", "content": system_text.strip()}]
+    for m in messages:
+        or_messages.append({"role": m.get("role", "user"), "content": m.get("content", "")})
+    
+    model_name = os.environ.get("OPENROUTER_MODEL", "openrouter/auto")
+    payload = {
+        "model": model_name,
+        "messages": or_messages,
+        "response_format": {"type": "json_object"}
+    }
+    
+    try:
+        start_t = time.time()
+        resp = requests.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {openrouter_key}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=30.0
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            raw_text = (data["choices"][0]["message"]["content"] or "").strip()
+            
+            # Strip model safety preambles (e.g. "User Safety: safe")
+            import re, llm_json
+            clean_text = re.sub(r"^(User Safety:\s*\w+|\[Safety\]:\s*\w+)\s*", "", raw_text, flags=re.I).strip()
+            
+            # Attempt to extract JSON envelope from response
+            obj, _ = llm_json.parse(clean_text or raw_text)
+            if obj and isinstance(obj, dict) and "mode" in obj:
+                obj = _normalize_payload(obj)
+                raw_text = json.dumps(obj)
+            elif clean_text:
+                raw_text = json.dumps({"mode": "conversation", "response": clean_text, "tone": "neutral", "end_session": False})
+            else:
+                raw_text = json.dumps({"mode": "conversation", "response": "How can I help with that?", "tone": "neutral", "end_session": False})
+
+            elapsed = (time.time() - start_t) * 1000
+            print(f"[gemini_head] routed via OpenRouter ({model_name}) in {elapsed:.1f}ms")
+            return HeadReply([_TextBlock(raw_text)], "end_turn", provider="openrouter")
+        else:
+            print(f"[gemini_head] OpenRouter HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+        print(f"[gemini_head] OpenRouter failed: {e!r}")
+    return None
+
+
+def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
+    """Instant regex-based intent matcher for deterministic Tier-A commands.
+
+    Matches ~35 high-frequency intent categories in <0.1ms, bypassing the
+    23-69s OpenRouter free-tier queue entirely.  Only unambiguous, single-action
+    intents are matched here — anything complex or conversational falls through
+    to the LLM.
+    """
+    if not messages:
+        return None
+    last_user_msg = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                last_user_msg = content
+            elif isinstance(content, list):
+                last_user_msg = "".join(b.get("text", "") for b in content if isinstance(b, dict))
+            break
+
+    import re
+    # Strip PC state prefix if present so regex targets the user's actual command
+    text_clean = re.sub(r"^\[pc state\].*?\n\n", "", (last_user_msg or "").strip(), flags=re.I | re.DOTALL).strip().lower()
+    if not text_clean:
+        return None
+
+    def _emit(action: str, parameter: str = "") -> HeadReply:
+        envelope = json.dumps({"mode": "command", "action": action, "parameter": parameter, "tone": "focused"})
+        print(f"[gemini_head] routed via Fast Pre-Router in 0.1ms -> {action}")
+        return HeadReply([_TextBlock(envelope)], "end_turn", provider="fast_pattern")
+
+    # ── 1. Volume ─────────────────────────────────────────────────────────
+    m = re.search(r'(?:increase|decrease|set|change|turn|put|make|adjust)\s+(?:the\s+)?(?:system\s+|pc\s+|speaker\s+|audio\s+)?volume\s+(?:to\s+)?(\d+)', text_clean)
+    if m:
+        return _emit("adjust_volume", m.group(1))
+    if re.search(r'(?:mute|unmute)\s+(?:the\s+)?(?:system\s+|pc\s+|speaker\s+|audio\s+)?(?:volume|sound|audio)', text_clean):
+        return _emit("adjust_volume", "0" if "unmute" not in text_clean else "50")
+    if re.search(r'(?:max|full|maximum)\s+(?:the\s+)?(?:system\s+|pc\s+|speaker\s+|audio\s+)?volume', text_clean):
+        return _emit("adjust_volume", "100")
+
+    # ── 2. Brightness ────────────────────────────────────────────────────
+    m = re.search(r'(?:increase|decrease|set|change|turn|put|adjust)\s+(?:the\s+)?(?:screen\s+|system\s+|display\s+|monitor\s+)?brightness\s+(?:to\s+)?(\d+)', text_clean)
+    if m:
+        return _emit("adjust_brightness", m.group(1))
+    if re.search(r'(?:max|full|maximum|high|low|min|minimum|half)\s+(?:the\s+)?(?:screen\s+|system\s+|display\s+|monitor\s+)?brightness', text_clean):
+        val = "100" if re.search(r'max|full|high', text_clean) else ("50" if "half" in text_clean else "20")
+        return _emit("adjust_brightness", val)
+
+    # ── 3. Web Search (browser-specific) ─────────────────────────────────
+    m = re.search(r'(?:search|google|look\s+up|find)\s+(.+?)\s+(?:on|in|using)\s+(chrome|brave|edge|firefox)', text_clean)
+    if m:
+        return _emit("web_search", f"{m.group(1).strip()}|browser:{m.group(2).strip()}")
+
+    # ── 4. Web Search (generic — default to chrome) ──────────────────────
+    m = re.search(r'(?:search|google|look\s+up)\s+(?:for\s+)?(?:on\s+(?:the\s+)?(?:web|internet|google)\s+)?(.+)', text_clean)
+    if m and not re.search(r'(?:file|folder|image|on\s+(?:amazon|flipkart|github|youtube|netflix|spotify))', text_clean):
+        query = m.group(1).strip()
+        if len(query) > 3 and not query.startswith(("on ", "in ")):
+            return _emit("web_search", f"{query}|browser:chrome")
+
+    # ── 5. Open Site Tab ─────────────────────────────────────────────────
+    m = re.search(r'open\s+(youtube|netflix|spotify|github|reddit|amazon|flipkart|twitter|x\.com|instagram|linkedin|whatsapp\s*web|facebook|google\s*maps|google\s*drive|google\s*docs|stackoverflow)(?:\s+in\s+\w+)?', text_clean)
+    if m:
+        return _emit("open_site_tab", m.group(1).strip())
+
+    # ── 6. Open URL ──────────────────────────────────────────────────────
+    m = re.search(r'(?:open|go\s+to|navigate\s+to|visit)\s+(https?://\S+)', text_clean)
+    if m:
+        return _emit("open_url", m.group(1).strip())
+    m = re.search(r'(?:open|go\s+to|navigate\s+to|visit)\s+(\S+\.(?:com|org|net|io|dev|in|co|ai|edu|gov)(?:/\S*)?)', text_clean)
+    if m:
+        url = m.group(1).strip()
+        if not url.startswith("http"):
+            url = "https://" + url
+        return _emit("open_url", url)
+
+    # ── 7. Open Desktop App ──────────────────────────────────────────────
+    _APPS = (
+        "chrome|brave|firefox|edge|notepad|calculator|calc|vscode|code|"
+        "spotify|vlc|cmd|powershell|terminal|explorer|files|discord|"
+        "steam|whatsapp|teams|obsidian|notion|paint|camera|clock|"
+        "excel|word|powerpoint|outlook|onenote|winrar|gitbash|capcut|"
+        "adobe|acrobat|protonvpn|vpn|copilot|chatgpt|store|xbox|settings"
+    )
+    m = re.search(rf'(?:open|launch|start|run)\s+({_APPS})', text_clean)
+    if m:
+        app = m.group(1).strip()
+        if app == "code":
+            app = "vscode"
+        if app in ("settings",):
+            return _emit("open_settings", "")
+        return _emit("open_application", app)
+
+    # ── 8. Close Application ─────────────────────────────────────────────
+    m = re.search(r'(?:close|quit|exit|kill|stop)\s+(\w+(?:\s+\w+)?)', text_clean)
+    if m:
+        target = m.group(1).strip()
+        if target not in ("tab", "window", "all tabs", "this tab", "the tab", "browser"):
+            return _emit("close_application", target)
+
+    # ── 9. Switch Window ─────────────────────────────────────────────────
+    m = re.search(r'(?:switch|go|change|alt.?tab)\s+(?:to\s+|window\s+(?:to\s+)?)?(\w+(?:\s+\w+)?)', text_clean)
+    if m and re.search(r'switch|alt.?tab', text_clean):
+        return _emit("switch_window", m.group(1).strip())
+
+    # ── 10. Maximize / Minimize Window ───────────────────────────────────
+    if re.search(r'maximize\s+(?:the\s+)?(?:current\s+)?window', text_clean):
+        return _emit("maximize_window", "")
+    if re.search(r'minimize\s+(?:the\s+)?(?:current\s+)?window', text_clean):
+        return _emit("minimize_window", "")
+
+    # ── 11. Scroll ───────────────────────────────────────────────────────
+    m = re.search(r'scroll\s+(up|down|left|right|top|bottom)', text_clean)
+    if m:
+        return _emit("scroll", m.group(1).strip())
+
+    # ── 12. Screenshot ───────────────────────────────────────────────────
+    if re.search(r'(?:take|capture|grab)\s+(?:a\s+)?screenshot', text_clean):
+        return _emit("screenshot", "")
+
+    # ── 13. Clipboard ────────────────────────────────────────────────────
+    if re.search(r'(?:read|get|check|show|what\'?s?\s+(?:in|on))\s+(?:the\s+|my\s+)?clipboard', text_clean):
+        return _emit("read_clipboard", "")
+    m = re.search(r'(?:copy|write)\s+(?:to\s+)?clipboard\s*[:\-]?\s*(.+)', text_clean)
+    if m:
+        return _emit("write_clipboard", m.group(1).strip())
+
+    # ── 14. Performance Stats ────────────────────────────────────────────
+    if re.search(r'(?:show|check|view|get|what\'?s?)\s+(?:the\s+)?(?:cpu|ram|performance|memory|system\s+stats|specs|usage)', text_clean):
+        return _emit("performance_stats", "")
+
+    # ── 15. Lock PC ──────────────────────────────────────────────────────
+    if re.search(r'lock\s+(?:the\s+)?(?:pc|computer|screen|my\s+pc|workstation)', text_clean):
+        return _emit("lock_pc", "")
+
+    # ── 16. Sleep PC ─────────────────────────────────────────────────────
+    if re.search(r'(?:put\s+(?:the\s+)?(?:pc|computer)\s+to\s+sleep|sleep\s+(?:the\s+)?(?:pc|computer|mode))', text_clean):
+        return _emit("sleep_pc", "")
+
+    # ── 17. Shutdown ─────────────────────────────────────────────────────
+    if re.search(r'(?:shut\s*down|power\s+off|turn\s+off)\s+(?:the\s+)?(?:pc|computer)?', text_clean):
+        return _emit("shutdown_pc", "")
+
+    # ── 18. Restart ──────────────────────────────────────────────────────
+    if re.search(r'restart\s+(?:the\s+)?(?:pc|computer)?', text_clean):
+        return _emit("restart_pc", "")
+
+    # ── 19. Toggle WiFi ──────────────────────────────────────────────────
+    m = re.search(r'(?:turn|switch|toggle)\s+(on|off)\s+(?:the\s+)?wi-?fi', text_clean)
+    if m:
+        return _emit("toggle_wifi", m.group(1))
+    m = re.search(r'(?:enable|disable)\s+(?:the\s+)?wi-?fi', text_clean)
+    if m:
+        return _emit("toggle_wifi", "on" if "enable" in text_clean else "off")
+
+    # ── 20. Toggle Bluetooth ─────────────────────────────────────────────
+    m = re.search(r'(?:turn|switch|toggle)\s+(on|off)\s+(?:the\s+)?bluetooth', text_clean)
+    if m:
+        return _emit("toggle_bluetooth", m.group(1))
+    m = re.search(r'(?:enable|disable)\s+(?:the\s+)?bluetooth', text_clean)
+    if m:
+        return _emit("toggle_bluetooth", "on" if "enable" in text_clean else "off")
+
+    # ── 21. Open Settings ────────────────────────────────────────────────
+    m = re.search(r'open\s+(\w+)\s+settings', text_clean)
+    if m:
+        return _emit("open_settings", m.group(1).strip())
+    if re.search(r'open\s+settings', text_clean):
+        return _emit("open_settings", "")
+
+    # ── 22. Open System Tool ─────────────────────────────────────────────
+    m = re.search(r'open\s+(task\s*manager|device\s*manager|control\s*panel|disk\s*management|event\s*viewer|registry|regedit)', text_clean)
+    if m:
+        tool = m.group(1).strip().replace(" ", "")
+        return _emit("open_system_tool", tool)
+
+    # ── 23. YouTube Control ──────────────────────────────────────────────
+    m = re.search(r'(?:on\s+)?youtube\s+(?:video\s+)?(pause|play|resume|stop|next|skip|previous|mute|unmute|fullscreen|full\s*screen)', text_clean)
+    if m:
+        return _emit("youtube_control", m.group(1).strip().replace(" ", ""))
+    m = re.search(r'(pause|play|resume|stop|skip|next|previous)\s+(?:the\s+)?(?:youtube|video)', text_clean)
+    if m:
+        return _emit("youtube_control", m.group(1).strip())
+
+    # ── 24. Spotify Control ──────────────────────────────────────────────
+    m = re.search(r'(?:on\s+)?spotify\s+(pause|play|resume|next|skip|previous|shuffle|repeat|mute)', text_clean)
+    if m:
+        return _emit("spotify_control", m.group(1).strip())
+    m = re.search(r'(pause|play|resume|next\s+(?:song|track)|previous\s+(?:song|track)|skip\s+(?:song|track))\s+(?:on\s+)?spotify', text_clean)
+    if m:
+        action = m.group(1).strip()
+        if "next" in action or "skip" in action:
+            return _emit("spotify_control", "next")
+        elif "previous" in action:
+            return _emit("spotify_control", "previous")
+        else:
+            return _emit("spotify_control", action.split()[0])
+
+    # ── 25. Netflix Control ──────────────────────────────────────────────
+    m = re.search(r'(?:on\s+)?netflix\s+(pause|play|resume|next\s*episode|skip|fullscreen|subtitles)', text_clean)
+    if m:
+        return _emit("netflix_control", m.group(1).strip().replace(" ", "_"))
+
+    # ── 26. Browser Control (back/forward/refresh) ───────────────────────
+    if re.search(r'(?:go\s+)?back\s+(?:in\s+)?(?:the\s+)?browser', text_clean):
+        return _emit("browser_control", "back")
+    if re.search(r'(?:go\s+)?forward\s+(?:in\s+)?(?:the\s+)?browser', text_clean):
+        return _emit("browser_control", "forward")
+    if re.search(r'(?:refresh|reload)\s+(?:the\s+)?(?:page|browser|tab)', text_clean):
+        return _emit("browser_control", "refresh")
+
+    # ── 27. New Tab ──────────────────────────────────────────────────────
+    if re.search(r'(?:open|new)\s+(?:a\s+)?(?:new\s+)?tab', text_clean):
+        return _emit("new_tab", "")
+
+    # ── 28. Close Tab ────────────────────────────────────────────────────
+    if re.search(r'close\s+(?:the\s+|this\s+|current\s+)?tab', text_clean):
+        return _emit("close_tab", "")
+
+    # ── 29. Switch Tab ───────────────────────────────────────────────────
+    m = re.search(r'switch\s+(?:to\s+)?tab\s+(.+)', text_clean)
+    if m:
+        return _emit("switch_tab", m.group(1).strip())
+
+    # ── 30. List Tabs ────────────────────────────────────────────────────
+    if re.search(r'(?:list|show|get)\s+(?:all\s+)?(?:open\s+)?tabs', text_clean):
+        return _emit("list_tabs", "")
+
+    # ── 31. Bookmark Page ────────────────────────────────────────────────
+    if re.search(r'bookmark\s+(?:this\s+)?(?:page|tab|site)', text_clean):
+        return _emit("bookmark_page", "")
+
+    # ── 32. Open Folder ──────────────────────────────────────────────────
+    _FOLDERS = {
+        "downloads": r"C:\Users\swast\Downloads",
+        "desktop": r"C:\Users\swast\Desktop",
+        "documents": r"C:\Users\swast\Documents",
+        "pictures": r"C:\Users\swast\Pictures",
+        "music": r"C:\Users\swast\Music",
+        "videos": r"C:\Users\swast\Videos",
+    }
+    m = re.search(r'(?:open|show|go\s+to)\s+(?:the\s+|my\s+)?(downloads|desktop|documents|pictures|music|videos)\s*(?:folder)?', text_clean)
+    if m:
+        folder_key = m.group(1).strip()
+        return _emit("open_folder", _FOLDERS.get(folder_key, folder_key))
+
+    # ── 33. List Folder ──────────────────────────────────────────────────
+    m = re.search(r'(?:list|show)\s+(?:all\s+)?(?:files|contents)\s+(?:in|of)\s+(?:the\s+|my\s+)?(downloads|desktop|documents|pictures)', text_clean)
+    if m:
+        folder_key = m.group(1).strip()
+        return _emit("list_folder", _FOLDERS.get(folder_key, folder_key))
+
+    # ── 34. Open File ────────────────────────────────────────────────────
+    m = re.search(r'open\s+(?:the\s+)?(?:file\s+)?([a-zA-Z]:\\[^\s]+|~[\\/][^\s]+)', text_clean)
+    if m:
+        return _emit("open_file", m.group(1).strip())
+
+    # ── 35. Email Compose ────────────────────────────────────────────────
+    m = re.search(r'(?:write|draft|send|compose)\s+(?:an?\s+)?email\s+to\s+([a-zA-Z0-9\s]+?)\s+(?:telling|asking|about|regarding|saying)\s+(.+)', text_clean)
+    if m:
+        to_person = m.group(1).strip()
+        brief = m.group(2).strip()
+        subject = brief[:35].strip().capitalize()
+        return _emit("gmail_compose", f"draft|{to_person}|{subject}|{brief}")
+
+    # ── 36. Background Status ────────────────────────────────────────────
+    if re.search(r'(?:check|show|get|what\'?s?)\s+(?:the\s+)?(?:background|pending)\s+(?:tasks?|status|jobs?)', text_clean):
+        return _emit("background_status", "")
+
+    # ── 36b. Reminders / Notes (map to calendar_control or create_file) ──
+    # "take notes / note down / create a note" → create_file
+    m = re.search(r'(?:take\s+(?:a\s+)?note|note\s+(?:down|this)|write\s+(?:a\s+)?note|make\s+a\s+note)\s*(?:about|that|:|-)?\s*(.*)', text_clean)
+    if m:
+        content = m.group(1).strip()
+        return _emit("create_file", f"akira_notes.txt|{content}")
+
+    # "remind me / set a reminder / create a reminder" → calendar_control
+    m = re.search(r'(?:remind\s+me|set\s+(?:a\s+)?reminder|create\s+(?:a\s+)?reminder|add\s+(?:a\s+)?reminder)\s*(?:about|to|for|that)?\s*(.*)', text_clean)
+    if m:
+        content = m.group(1).strip()
+        return _emit("calendar_control", f"remind|{content}")
+
+    # "schedule / add to calendar" → calendar_control
+    m = re.search(r'(?:schedule|add\s+to\s+(?:my\s+)?calendar|add\s+(?:an?\s+)?event)\s*(.*)', text_clean)
+    if m:
+        content = m.group(1).strip()
+        return _emit("calendar_control", f"add|{content}")
+
+    # ── 37. Power Management (sleep / hibernate / shutdown / restart) ───
+    if re.search(r'(?:put\s+(?:the\s+)?(?:pc|computer)\s+to\s+)?sleep(?:\s+(?:mode|the\s+pc|the\s+computer))?', text_clean):
+        return _emit("sleep_pc", "")
+    if re.search(r'hibernate(?:\s+(?:the\s+)?(?:pc|computer))?', text_clean):
+        return _emit("hibernate", "")
+    if re.search(r'(?:shutdown|turn\s+off)\s+(?:the\s+)?(?:pc|computer|system)', text_clean):
+        return _emit("shutdown", "")
+    if re.search(r'(?:restart|reboot)\s+(?:the\s+)?(?:pc|computer|system)', text_clean):
+        return _emit("restart", "")
+
+    # ── 38. System Cleanup & Maintenance ────────────────────────────────
+    if re.search(r'empty\s+(?:the\s+)?recycle\s+bin', text_clean):
+        return _emit("empty_recycle_bin", "")
+    if re.search(r'(?:clear|clean)\s+(?:temp|temporary)\s+files', text_clean):
+        return _emit("clear_temp_files", "")
+    if re.search(r'run\s+disk\s+cleanup', text_clean):
+        return _emit("run_disk_cleanup", "")
+    if re.search(r'(?:clear|clean)\s+browser\s+(?:cache|history|data)', text_clean):
+        return _emit("clear_browser_cache", "")
+
+    # ── 39. Speech & Clipboard Audio ────────────────────────────────────
+    if re.search(r'(?:speak|read)\s+(?:the\s+)?clipboard\s*(?:aloud)?', text_clean):
+        return _emit("speak_clipboard", "")
+    if re.search(r'stop\s+(?:reading|speaking|talking)', text_clean):
+        return _emit("stop_reading", "")
+    if re.search(r'(?:continue|read)\s+more', text_clean):
+        return _emit("read_more", "")
+
+    # ── 39b. Type / Write text in active window ───────────────────────────
+    # Intercepts Groq hallucinations like 'write_text', 'type_text', 'insert_text'.
+    # Strategy: copy content to clipboard so user can paste it wherever needed.
+    m = re.search(r'(?:write|type|insert|enter|put)\s+(?:the\s+)?(?:text|content|following)?\s*(?:in|into|on)?\s*(?:notepad|word|the\s+editor|the\s+app)?\s*[:\-]?\s*(.{5,})', text_clean)
+    if m:
+        content = m.group(1).strip().rstrip('".,')
+        return _emit("write_clipboard", content)
+
+    # ── 39c. File/Folder search alias ────────────────────────────────────
+    # 'search for a folder', 'find a file' → search_file
+    m = re.search(r'(?:search\s+for|find|locate)\s+(?:a\s+)?(?:file|folder|directory)\s+(?:named|called)?\s*(.+)', text_clean)
+    if m:
+        return _emit("search_file", m.group(1).strip())
+
+    # ── 40. File Management (Search, Create, Read, Write, Edit, Delete) ───
+    m = re.search(r'(?:search|find|look\s+for)\s+(?:file|document|folder)?\s*([a-zA-Z0-9_\-\.\s]+?\.[a-zA-Z0-9]+)', text_clean)
+    if m:
+        return _emit("search_file", m.group(1).strip())
+    
+    m = re.search(r'(?:create|make|new)\s+file\s+([a-zA-Z0-9_\-\.\s]+)', text_clean)
+    if m:
+        return _emit("create_file", m.group(1).strip())
+
+    m = re.search(r'(?:read|view|show\s+content\s+of)\s+file\s+([a-zA-Z0-9_\-\.\s]+)', text_clean)
+    if m:
+        return _emit("read_file", m.group(1).strip())
+
+    m = re.search(r'write\s+to\s+file\s+([a-zA-Z0-9_\-\.\s]+?)\s+(?:content|text|saying)?\s*(.+)', text_clean)
+    if m:
+        return _emit("write_file", f"{m.group(1).strip()}|{m.group(2).strip()}")
+
+    m = re.search(r'edit\s+file\s+([a-zA-Z0-9_\-\.\s]+)', text_clean)
+    if m:
+        return _emit("edit_file", m.group(1).strip())
+
+    m = re.search(r'(?:delete|remove)\s+(?:file|folder)\s+([a-zA-Z0-9_\-\.\s]+)', text_clean)
+    if m:
+        return _emit("delete_files", m.group(1).strip())
+
+    # ── 41. File Operations (Copy, Move, Compress, Extract, Organize, Rename) ──
+    m = re.search(r'copy\s+file\s+([^\s]+)\s+to\s+(.+)', text_clean)
+    if m:
+        return _emit("copy_files", f"{m.group(1).strip()}|{m.group(2).strip()}")
+
+    m = re.search(r'move\s+file\s+([^\s]+)\s+to\s+(.+)', text_clean)
+    if m:
+        return _emit("move_files", f"{m.group(1).strip()}|{m.group(2).strip()}")
+
+    m = re.search(r'(?:zip|compress)\s+(?:folder|file|directory)\s+(.+)', text_clean)
+    if m:
+        return _emit("compress_files", m.group(1).strip())
+
+    m = re.search(r'(?:unzip|extract)\s+(?:folder|file|archive)\s+(.+)', text_clean)
+    if m:
+        return _emit("extract_files", m.group(1).strip())
+
+    m = re.search(r'organize\s+(?:files\s+in\s+)?(downloads|desktop|documents)', text_clean)
+    if m:
+        return _emit("organize_files", m.group(1).strip())
+
+    m = re.search(r'summarize\s+file\s+(.+)', text_clean)
+    if m:
+        return _emit("summarize_file", m.group(1).strip())
+
+    # ── 42. Images & Personalization ────────────────────────────────────
+    m = re.search(r'set\s+wallpaper\s+(?:to\s+)?(.+)', text_clean)
+    if m:
+        return _emit("set_wallpaper", m.group(1).strip())
+
+    m = re.search(r'download\s+image\s+(?:of\s+)?(.+)', text_clean)
+    if m:
+        return _emit("download_image", m.group(1).strip())
+
+    m = re.search(r'search\s+image\s+(?:of\s+)?(.+)', text_clean)
+    if m:
+        return _emit("search_image", m.group(1).strip())
+
+    # ── 43. Google Workspace & Cloud Apps ────────────────────────────────
+    m = re.search(r'(?:check|open)\s+(?:my\s+)?gmail\s*(?:inbox)?', text_clean)
+    if m:
+        return _emit("gmail_control", "inbox")
+
+    m = re.search(r'(?:check|show|open)\s+(?:my\s+)?calendar', text_clean)
+    if m:
+        return _emit("calendar_control", "view")
+
+    m = re.search(r'(?:open|create)\s+google\s+doc(?:s)?', text_clean)
+    if m:
+        return _emit("docs_control", "create")
+
+    m = re.search(r'(?:open|create)\s+google\s+sheet(?:s)?', text_clean)
+    if m:
+        return _emit("sheets_control", "create")
+
+    m = re.search(r'(?:open|create)\s+google\s+slide(?:s)?', text_clean)
+    if m:
+        return _emit("slides_control", "create")
+
+    # ── 44. Specialized App Controls ─────────────────────────────────────
+    m = re.search(r'github\s+(search|repo|star|issues)\s*(.*)', text_clean)
+    if m:
+        cmd = m.group(1).strip()
+        arg = m.group(2).strip()
+        return _emit("github_control", f"{cmd}|{arg}")
+
+    m = re.search(r'vscode\s+(open|toggle|terminal|run)\s*(.*)', text_clean)
+    if m:
+        cmd = m.group(1).strip()
+        arg = m.group(2).strip()
+        return _emit("vscode_control", f"{cmd}|{arg}")
+
+    m = re.search(r'obsidian\s+(open|note|create)\s*(.*)', text_clean)
+    if m:
+        cmd = m.group(1).strip()
+        arg = m.group(2).strip()
+        return _emit("obsidian_control", f"{cmd}|{arg}")
+
+    m = re.search(r'amazon\s+(search|buy)\s+(.+)', text_clean)
+    if m:
+        cmd = m.group(1).strip()
+        arg = m.group(2).strip()
+        return _emit("amazon_control", f"{cmd}|{arg}")
+
+    m = re.search(r'flipkart\s+(search|buy)\s+(.+)', text_clean)
+    if m:
+        cmd = m.group(1).strip()
+        arg = m.group(2).strip()
+        return _emit("flipkart_control", f"{cmd}|{arg}")
+
+    m = re.search(r'(?:google\s+)?meet\s+(mute|unmute|camera|leave)', text_clean)
+    if m:
+        return _emit("meet_control", m.group(1).strip())
+
+    # ── 45. Office & Additional Specialized Controls ─────────────────────
+    m = re.search(r'(?:open|create)\s+(?:microsoft\s+|ms\s+)?(word|excel|powerpoint)\s*(?:doc|document|sheet|presentation)?', text_clean)
+    if m:
+        return _emit("office_control", m.group(1).strip())
+
+    m = re.search(r'site\s+search\s+([a-zA-Z0-9_\-\.]+)\s+(?:for\s+)?(.+)', text_clean)
+    if m:
+        return _emit("site_search", f"{m.group(2).strip()}|site:{m.group(1).strip()}")
+
+    m = re.search(r'(?:batch|bulk)\s+rename\s+(?:files\s+in\s+)?(.+)', text_clean)
+    if m:
+        return _emit("bulk_rename_files", m.group(1).strip())
+
+    m = re.search(r'(?:convert|file\s+to\s+doc)\s+(?:file\s+)?(.+)\s+to\s+doc', text_clean)
+    if m:
+        return _emit("file_to_doc", m.group(1).strip())
+
+    m = re.search(r'organize\s+folder\s+(.+)', text_clean)
+    if m:
+        return _emit("organize_folder", m.group(1).strip())
+
+    m = re.search(r'click\s+(?:on\s+)?(.+)', text_clean)
+    if m:
+        return _emit("click", m.group(1).strip())
+
+    m = re.search(r'fill\s+(?:form\s+)?(.+)', text_clean)
+    if m:
+        return _emit("fill", m.group(1).strip())
+
+    m = re.search(r'send\s+message\s+(.+)', text_clean)
+    if m:
+        return _emit("message", m.group(1).strip())
+
+    # No pattern matched — fall through to LLM
+    return None
+
+
 def route(messages: list[dict], system_blocks: list[dict],
           schema: dict | None = None) -> HeadReply:
-    """One routing turn on Gemini. Returns a Claude-shaped reply, always.
+    fast_reply = _try_fast_pattern_route(messages)
+    if fast_reply is not None:
+        return fast_reply
 
-    Never raises for a provider-side problem: every failure becomes a spoken
-    conversation-mode refusal (see _refuse) so the user hears the real reason
-    and no action can execute. `schema` is ROUTING_SCHEMA, passed in by the
-    caller rather than imported, so this module never imports claude_handler
-    (which pulls in pyttsx3/anthropic and would make routing untestable
-    headlessly, and would create an import cycle).
-    """
-    api_key = (os.environ.get(KEY_ENV) or "").strip()
-    if not api_key:
+    groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if groq_key:
+        groq_reply = _route_via_groq(groq_key, messages, system_blocks, schema)
+        if groq_reply is not None:
+            return groq_reply
+
+    openrouter_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    if openrouter_key:
+        or_reply = _route_via_openrouter(openrouter_key, messages, system_blocks, schema)
+        if or_reply is not None:
+            return or_reply
+
+    if not groq_key:
         return _refuse(readiness()[1])
 
-    # PRE-FLIGHT CAP CHECK. Deliberately before the request: refusing with a
-    # clear message costs nothing, whereas discovering the cap through Google's
-    # 429 has already spent the request and delayed the turn.
-    if gemini_quota.exhausted():
-        snap = gemini_quota.snapshot()
-        if escalation_opted_in():
-            # Opt-in only, and loud. Returning None hands control back to
-            # _routing_call, which proceeds to paid Claude.
-            print(f"[gemini_head] DAILY CAP REACHED "
-                  f"({snap['used']}/{snap['stop_at']}) and "
-                  f"SENSEI_HEAD_ESCALATE_ON_CAP is on — escalating to PAID "
-                  f"Claude. This will cost money.")
-            raise CapReachedEscalate(snap)
-        return _refuse(
-            "I've used up today's free Gemini allowance, so I can't work out "
-            "what to do right now. It resets tomorrow. If you want me to keep "
-            "going today, switch to the paid tier — I won't do that on my own "
-            "because it costs money.")
+    return _refuse(
+        "Groq routing service is temporarily busy or rate-limited. "
+        "Please try again in a moment.")
 
-    body = {"contents": _contents(messages),
-            "systemInstruction": _system_instruction(system_blocks),
-            "generationConfig": _generation_config(schema)}
-
-    # At most two attempts: one degrade step, then done. Not a loop over every
-    # capability — an endless "try with less" would turn a broken request into
-    # a multi-second stall on the voice path.
-    for attempt in (1, 2):
-        try:
-            resp = requests.post(
-                _URL.format(model=MODEL),
-                # Header, not ?key=: query-string keys land in server logs and
-                # proxy traces. gemini_content still uses params for historical
-                # reasons; new code should not.
-                headers={"x-goog-api-key": api_key,
-                         "Content-Type": "application/json"},
-                json=body, timeout=TIMEOUT)
-        except requests.Timeout:
-            return _refuse("Gemini took too long to answer, so I didn't run "
-                           "anything. Say that again.")
-        except requests.RequestException as e:
-            # Never reached Google -> no quota consumed, so nothing is recorded.
-            print(f"[gemini_head] transport error: {e!r}")
-            return _refuse("I couldn't reach Gemini just now, so I didn't run "
-                           "anything. Check the connection and try again.")
-
-        used = gemini_quota.record(_PURPOSE)
-
-        if resp.status_code == 400 and attempt == 1:
-            detail = resp.text[:500]
-            if _degrade(detail):
-                body["generationConfig"] = _generation_config(schema)
-                continue
-            print(f"[gemini_head] 400 not attributable to an optional field: "
-                  f"{detail}")
-            return _refuse("Gemini rejected the request, so I didn't run "
-                           "anything.")
-        break
-
-    if resp.status_code == 429:
-        # Google's cap is the authoritative one; the local counter was only ever
-        # advisory. Sync it up so the next turn refuses pre-flight instead of
-        # spending another request to learn the same thing.
-        print(f"[gemini_head] Google returned 429 at local count {used} — "
-              f"the real cap is lower than GEMINI_DAILY_LIMIT suggests")
-        return _refuse(
-            "Gemini says I've hit the free daily limit, so I can't work out "
-            "what to do right now. It resets tomorrow, or you can switch to "
-            "the paid tier — I won't do that on my own because it costs money.")
-
-    if resp.status_code != 200:
-        print(f"[gemini_head] HTTP {resp.status_code}: {resp.text[:300]}")
-        return _refuse("Gemini had an error, so I didn't run anything. "
-                       "Try again in a moment.")
-
-    return _parse(resp, used)
 
 
 class CapReachedEscalate(Exception):
@@ -563,7 +1184,7 @@ def _parse(resp, used: int) -> HeadReply:
     # MAX_TOKENS -> stop_reason "max_tokens", the exact string ask_akira already
     # warns on, so truncation reporting is identical across providers. The text
     # is still returned: llm_json.parse detects the cut-off string and
-    # sensei refuses to execute it, which is the established path for this.
+    # akira refuses to execute it, which is the established path for this.
     if finish == "MAX_TOKENS":
         print(f"[gemini_head] hit maxOutputTokens ({MAX_OUTPUT_TOKENS}) — "
               f"envelope is truncated")
@@ -571,7 +1192,7 @@ def _parse(resp, used: int) -> HeadReply:
             return _refuse("That answer came back cut off before it started, "
                            "so I didn't run anything.")
         return HeadReply([_TextBlock(text)], "max_tokens",
-                         quota=gemini_quota.snapshot())
+                         quota=akira_quota.snapshot())
 
     if finish in ("SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT",
                   "SPII"):
@@ -584,7 +1205,7 @@ def _parse(resp, used: int) -> HeadReply:
         return _refuse("Gemini returned an empty answer, so I didn't run "
                        "anything.")
 
-    snap = gemini_quota.snapshot()
+    snap = akira_quota.snapshot()
     print(f"[gemini_head] routed on {MODEL} "
           f"(quota {used}/{snap['stop_at']}, finish={finish})")
     return HeadReply([_TextBlock(text)], "end_turn", quota=snap)
@@ -594,6 +1215,6 @@ def summary() -> dict:
     """Diagnostics for the startup banner."""
     ok, reason = readiness()
     return {"model": MODEL, "ready": ok, "reason": reason,
-            "quota": gemini_quota.snapshot(),
+            "quota": akira_quota.snapshot(),
             "escalate_on_cap": escalation_opted_in(),
             "capabilities": dict(_supports)}

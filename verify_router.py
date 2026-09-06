@@ -126,15 +126,15 @@ def check_policy(failures: list[str]) -> None:
     import action_router
     from action_router import Rollback
 
-    # Without a live sensei, tier() fails closed to GATED — which is itself the
+    # Without a live akira, tier() fails closed to GATED — which is itself the
     # behaviour to assert, and it means parallel_ok is False for everything.
-    if "sensei" in sys.modules or "__main__" in sys.modules and \
+    if "akira" in sys.modules or "__main__" in sys.modules and \
             hasattr(sys.modules.get("__main__"), "_is_dangerous_step"):
         pass
     else:
         if action_router.tier({"action": "screenshot"}) is not action_router.Tier.GATED:
             failures.append(
-                "tier() must fail closed to GATED when sensei's gate classifier "
+                "tier() must fail closed to GATED when akira's gate classifier "
                 "is unreachable")
         if action_router.parallel_ok({"action": "screenshot"}):
             failures.append("parallel_ok must be False when tier fails closed")

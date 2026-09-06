@@ -72,63 +72,68 @@ class Tier:
     going stale inside one retirement cycle.
     """
 
-    __slots__ = ("name", "model", "base_url", "key_env")
+    __slots__ = ("name", "model", "base_url", "key_env", "lora_index")
 
-    def __init__(self, name: str, model: str, base_url: str, key_env: str):
+    def __init__(self, name: str, model: str, base_url: str, key_env: str,
+                 lora_index: int = -1):
         self.name = name
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.key_env = key_env
+        self.lora_index = lora_index  # -1 = no LoRA selection (remote API)
 
     @property
     def api_key(self) -> str | None:
-        key = (os.environ.get(self.key_env) or "").strip() or None
-        # Local endpoints don't need API keys; return a dummy string so it registers as available.
-        if not key and ("localhost" in self.base_url or "127.0.0.1" in self.base_url or "ngrok" in self.base_url):
-            return "local-no-key"
-        return key
+        key = (os.environ.get(self.key_env) or "").strip()
+        if key:
+            return key
+        if "localhost" in self.base_url or "127.0.0.1" in self.base_url or "ngrok" in self.base_url:
+            return "local"
+        return None
 
     @property
     def available(self) -> bool:
         return self.api_key is not None
 
+    @property
+    def is_local(self) -> bool:
+        """True when this tier points at a local llama-server or local endpoint."""
+        return "localhost" in self.base_url or "127.0.0.1" in self.base_url or "ngrok" in self.base_url
+
     def __repr__(self) -> str:
         return f"<Tier {self.name} {self.model}>"
 
 
-# ── LOCAL LLM ADAPTERS (Llama 3.2 8B + LoRA) ──────────────────────────────────
-# Defaulted to a local vLLM server (e.g. running on Colab) with LoRA adapters.
-# The 'model' parameter maps to the LoRA adapter name.
-_LOCAL_BASE = os.environ.get("SENSEI_LOCAL_BASE_URL", "http://localhost:8000/v1")
-_LOCAL_KEY_ENV = "SENSEI_LOCAL_API_KEY"
+# ── LOCAL LLM ADAPTERS (Llama 3 8B Multi-LoRA Single Server on :8081) ──────────
+# LoRA indices match the order passed to --lora in start_ai_engines.bat:
+#   --lora akira_guard.gguf  → index 0
+#   --lora akira_api.gguf    → index 1
+#   --lora akira_mech.gguf   → index 2
+_LOCAL_BASE = os.environ.get("AKIRA_LOCAL_BASE_URL", "http://127.0.0.1:8081/v1")
+_LOCAL_KEY_ENV = "AKIRA_LOCAL_API_KEY"
 
 SERVANT_GEN = Tier(
     "SERVANT_GEN",
-    os.environ.get("SERVANT_GEN_MODEL", "servant-gen"),
-    os.environ.get("SERVANT_GEN_BASE_URL", _LOCAL_BASE),
-    os.environ.get("SERVANT_GEN_KEY_ENV", _LOCAL_KEY_ENV),
+    os.environ.get("GLM_MODEL", os.environ.get("SERVANT_GEN_MODEL", "akira-api")),
+    os.environ.get("GLM_BASE_URL", os.environ.get("SERVANT_GEN_BASE_URL", _LOCAL_BASE)),
+    os.environ.get("GLM_KEY_ENV", "GLM_API_KEY"),
+    lora_index=1,
 )
 
 SERVANT_MECH = Tier(
     "SERVANT_MECH",
-    os.environ.get("SERVANT_MECH_MODEL", "servant-mech"),
-    os.environ.get("SERVANT_MECH_BASE_URL", _LOCAL_BASE),
-    os.environ.get("SERVANT_MECH_KEY_ENV", _LOCAL_KEY_ENV),
+    os.environ.get("QWEN_MODEL", os.environ.get("SERVANT_MECH_MODEL", "akira-mech")),
+    os.environ.get("QWEN_BASE_URL", os.environ.get("SERVANT_MECH_BASE_URL", _LOCAL_BASE)),
+    os.environ.get("QWEN_KEY_ENV", "QWEN_API_KEY"),
+    lora_index=2,
 )
 
-# GUARD has been split into two LoRA adapters: shape (replaces static rules) and safety
 GUARD = Tier(
     "GUARD",
-    os.environ.get("GUARD_SAFETY_MODEL", "guard-safety"),
+    os.environ.get("GUARD_MODEL", "akira-guard"),
     os.environ.get("GUARD_BASE_URL", _LOCAL_BASE),
-    os.environ.get("GUARD_KEY_ENV", _LOCAL_KEY_ENV),
-)
-
-GUARD_SHAPE = Tier(
-    "GUARD_SHAPE",
-    os.environ.get("GUARD_SHAPE_MODEL", "guard-shape"),
-    os.environ.get("GUARD_SHAPE_BASE_URL", _LOCAL_BASE),
-    os.environ.get("GUARD_SHAPE_KEY_ENV", _LOCAL_KEY_ENV),
+    os.environ.get("GUARD_KEY_ENV", "QWEN_API_KEY"),
+    lora_index=0,
 )
 
 DEFAULT_TIMEOUT = 90.0
@@ -173,6 +178,12 @@ def call_openai_compatible(tier: Tier, *, system: str, user: str | None = None,
     }
     if json_mode:
         body["response_format"] = {"type": "json_object"}
+
+    # Per-request LoRA selection for the local multi-LoRA server.
+    # --lora-init-without-apply means no adapter is applied by default;
+    # each request must specify which one via the "lora" field.
+    if tier.is_local and tier.lora_index >= 0:
+        body["lora"] = [{"id": tier.lora_index, "scale": 1.0}]
 
     url = f"{tier.base_url}/chat/completions"
     started = time.monotonic()

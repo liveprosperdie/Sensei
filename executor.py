@@ -12,6 +12,7 @@ import zipfile
 import psutil
 import winreg
 import datetime
+import threading
 import webbrowser
 import subprocess
 import urllib.parse
@@ -20,7 +21,6 @@ import win32gui
 import requests
 import pygetwindow as gw
 import tkinter as tk
-import memory_control
 from PIL import ImageGrab
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -237,7 +237,7 @@ def _ensure_akira_tab(driver) -> None:
     creating one each time left blank-tab litter in the user's browser."""
     if hasattr(driver, "_akira_tab") and driver._akira_tab in driver.window_handles:
         return
-    # adopt a leftover blank tab (e.g. from a previous sensei run)
+    # adopt a leftover blank tab (e.g. from a previous akira run)
     try:
         current = driver.current_window_handle
     except Exception:
@@ -296,6 +296,11 @@ _VK_CODES = {
     'left': (0x25, 'ArrowLeft', ''), 'up': (0x26, 'ArrowUp', ''),
     'right': (0x27, 'ArrowRight', ''), 'down': (0x28, 'ArrowDown', ''),
 }
+
+
+
+
+
 
 
 def _ensure_target_tab(browser) -> str | None:
@@ -590,22 +595,41 @@ def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
                     break
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-        profile_dir = os.path.join(os.environ["LOCALAPPDATA"], "Sensei", "AkiraChromeProfile")
-        os.makedirs(profile_dir, exist_ok=True)
-        subprocess.Popen([
+        user_data_dir = os.environ.get("CHROME_USER_DATA_DIR")
+        if not user_data_dir:
+            # Use dedicated Akira profile to avoid profile lock conflict with user's open personal Chrome
+            user_data_dir = os.path.join(os.environ.get("LOCALAPPDATA", r"C:\Users\swast\AppData\Local"), "Akira", "AkiraChromeProfile")
+        
+        profile_name = os.environ.get("CHROME_PROFILE", "Default")
+        os.makedirs(user_data_dir, exist_ok=True)
+
+        cmd = [
             binary_path,
             f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile_dir}",
+            f"--user-data-dir={user_data_dir}",
+            f"--profile-directory={profile_name}",
             "--no-first-run",
             "--disable-session-crashed-bubble",
             "--restore-last-session=false",
-        ])
-        for _ in range(40):
+            "--remote-allow-origins=*",
+        ]
+        subprocess.Popen(cmd)
+        for _ in range(20):
             if _port_ready(port):
                 break
-            time.sleep(0.5)
+            time.sleep(0.3)
         else:
-            raise RuntimeError(f"Browser at {binary_path} did not bind port {port} within 20s")
+            # Retry fallback with dedicated fallback profile directory if primary port failed
+            fb_dir = os.path.join(user_data_dir, "FallbackProfile")
+            os.makedirs(fb_dir, exist_ok=True)
+            cmd[2] = f"--user-data-dir={fb_dir}"
+            subprocess.Popen(cmd)
+            for _ in range(20):
+                if _port_ready(port):
+                    break
+                time.sleep(0.3)
+            else:
+                raise RuntimeError(f"Browser at {binary_path} did not bind port {port} within 12s")
 
     options = Options()
     options.binary_location = binary_path
@@ -750,6 +774,39 @@ def get_browser(name: str | None = None, incognito: bool = False) -> webdriver.C
     _browsers[key] = driver
     _last_browser_name = name
     return driver
+
+
+_warmup_thread: threading.Thread | None = None
+
+def warmup_browser(name: str | None = None) -> None:
+    """Pre-warm Chrome browser asynchronously in a background daemon thread.
+    
+    Eliminates the ~1.5s cold-start latency on the first browser action so that
+    opening sites, searching, or drafting emails happens in ~15ms immediately.
+    """
+    global _warmup_thread
+    if _warmup_thread and _warmup_thread.is_alive():
+        return
+
+    def _do_warmup():
+        try:
+            t0 = time.perf_counter()
+            _ = get_browser(name)
+            dt_ms = (time.perf_counter() - t0) * 1000
+            print(f"[BROWSER] Chrome pre-warmed & attached in {dt_ms:.1f}ms (ready for instant actions)")
+        except Exception as e:
+            print(f"[BROWSER] Background browser pre-warmup warning: {e}")
+
+    _warmup_thread = threading.Thread(target=_do_warmup, daemon=True, name="AkiraBrowserWarmup")
+    _warmup_thread.start()
+
+
+# Auto-trigger asynchronous browser pre-warming on system import
+try:
+    warmup_browser()
+except Exception as _w_err:
+    print(f"[BROWSER] Auto-warmup trigger warning: {_w_err}")
+
 
 
 def _navigate(url: str) -> None:
@@ -1427,7 +1484,7 @@ def _shop_guarded_click(browser, el, spoken_name: str, retry_param: str,
                         pre_confirmed: bool = False) -> dict:
     """Shared risky-keyword recheck before any direct shopping click.
     pre_confirmed=True skips the recheck — used ONLY by checkout/address
-    branches, which sensei.py's safety net ALWAYS gates behind a spoken yes."""
+    branches, which akira.py's safety net ALWAYS gates behind a spoken yes."""
     try:
         text = (el.text or el.get_attribute("value") or
                 el.get_attribute("aria-label") or spoken_name).strip()
@@ -2215,7 +2272,7 @@ def amazon_control(action: str, parameter: str | None = None) -> dict:
       confirm address        -> pick saved address (PLACEHOLDER-UNVERIFIED)
 
     Returns {'success': bool, 'message': str} or the needs_click_confirmation
-    dict shape that _handle_click returns (so sensei.py's pause logic works).
+    dict shape that _handle_click returns (so akira.py's pause logic works).
     """
     print(f"[amazon_control] called with action={action!r}, parameter={parameter!r}")
     browser = get_browser(_last_browser_name)
@@ -2358,7 +2415,7 @@ def amazon_control(action: str, parameter: str | None = None) -> dict:
 
     if action in ("proceed to checkout", "checkout"):
         # CONFIRMED ids from cart page + post-add side sheet.
-        # This branch is ONLY reachable after sensei.py's safety net got a
+        # This branch is ONLY reachable after akira.py's safety net got a
         # spoken yes (RISKY_SHOPPING_PARAMS gate), so pre_confirmed=True.
         el = _amz_find_visible([
             'input[name="proceedToRetailCheckout"]',
@@ -2579,7 +2636,7 @@ def flipkart_control(action: str, parameter: str | None = None) -> dict:
 
     if action in ("proceed to checkout", "checkout", "place order"):
         # Flipkart's cart-page progression button is literally "Place Order".
-        # This branch is ONLY reachable after sensei.py's safety net got a
+        # This branch is ONLY reachable after akira.py's safety net got a
         # spoken yes (RISKY_SHOPPING_PARAMS gate), so pre_confirmed=True.
         # It lands on login/address selection, still pre-payment.
         _fk_close_login_popup()
@@ -2614,7 +2671,7 @@ def flipkart_control(action: str, parameter: str | None = None) -> dict:
 #   WRITES -> DOM via the logged-in browser session (api.github.com does NOT
 #             accept browser cookies; writes need a PAT). If GITHUB_TOKEN env
 #             var is set, the API is preferred for writes too.
-#   GATED  -> merge/delete/close/create-PR go through sensei.py's safety net
+#   GATED  -> merge/delete/close/create-PR go through akira.py's safety net
 #             (RISKY_GITHUB_PARAMS), the SAME fixed mechanism as checkout.
 #   OUT OF SCOPE (flagged, not built): push / force_push — no git operations.
 
@@ -2683,7 +2740,7 @@ def github_control(action: str, parameter: str | None = None) -> dict:
     Tier A (no confirmation): search repos, open repo, view file, view issues,
       view pull requests, read readme, star repo, unstar repo, fork repo,
       clone repo, create issue.
-    Gated by sensei.py safety net: create pull request, merge pull request,
+    Gated by akira.py safety net: create pull request, merge pull request,
       close issue, close pull request, delete branch, delete repo.
     NOT built: push / force push (out of scope — no git operations).
     """
@@ -2944,7 +3001,7 @@ def github_control(action: str, parameter: str | None = None) -> dict:
             return {"success": True, "message": f"Created issue: {title}."}
         return {"success": False, "message": "Filled the form but couldn't find the submit button."}
 
-    # ── GATED actions (only reachable after sensei.py's confirmation gate) ──
+    # ── GATED actions (only reachable after akira.py's confirmation gate) ──
     if action in ("close issue", "close pull request"):
         if not repo:
             return {"success": False, "message": "Open a repo first."}
@@ -3084,14 +3141,18 @@ def gmail_compose(action: str, parameter: str | None = None) -> dict:
          JS text assignment, not keystrokes.
     Deliberately avoids the Gmail MCP server for drafting: its draft_email
     tool requires a send-capable OAuth token (gmail.modify + mail.google.com),
-    which would break the token-level read-only guarantee on sensei-gmail-ro.
+    which would break the token-level read-only guarantee on akira-gmail-ro.
     """
-    print(f"[gmail_compose] action={action!r}")
-    action = (action or "").strip().lower()
-    if action not in ("draft", "generate"):
-        return {"success": False, "message": f"Unknown gmail_compose action: {action}"}
+    print(f"[gmail_compose] action={action!r}, parameter={parameter!r}")
+    action_clean = (action or "").strip().lower()
+    if action_clean not in ("draft", "generate"):
+        full_param = f"{action}|{parameter}" if parameter else (action or "")
+        parts = full_param.split("|", 2)
+        action = "draft"
+    else:
+        action = action_clean
+        parts = (parameter or "").split("|", 2)
 
-    parts = (parameter or "").split("|", 2)
     if len(parts) < 3 or not parts[0].strip():
         return {"success": False,
                 "message": "Drafting needs a recipient, a subject, and the "
@@ -3099,6 +3160,13 @@ def gmail_compose(action: str, parameter: str | None = None) -> dict:
     to, subject, body = parts[0].strip(), parts[1].strip(), parts[2].strip()
 
     if action == "generate":
+        # Pro-only: AI-authored email composition is a premium capability.
+        # The 'draft' action (user-dictated text) stays on Standard.
+        import tiers
+        if tiers.plan_for(tiers.Layer.SERVANT) != tiers.PRO:
+            return {"success": False, "speak": True,
+                    "message": "AI-generated email drafting is a Pro tier feature. "
+                               "You can still draft emails with your own text using 'draft'."}
         import gemini_content
         gen = gemini_content.generate(
             body,
@@ -3175,7 +3243,7 @@ def gmail_compose(action: str, parameter: str | None = None) -> dict:
 # write_file, edit_file, search_file) are the default route; vscode_control
 # calls the SAME functions when the user explicitly says "in VS Code".
 # Gating travels with the capability: write_file / edit_file are gated by
-# sensei.py's safety net under BOTH entry points.
+# akira.py's safety net under BOTH entry points.
 
 _vsc_last_folder: str | None = None   # session memory for path resolution
 _vsc_last_file: str | None = None
@@ -3367,7 +3435,7 @@ def stop_reading(parameter: str | None = None) -> dict:
 
 
 def write_file(parameter: str | None = None) -> dict:
-    """write_file|path|content — overwrites. GATED by sensei.py's safety net
+    """write_file|path|content — overwrites. GATED by akira.py's safety net
     (RISKY file actions) under EVERY entry point before this runs."""
     print(f"[write_file] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
@@ -3472,7 +3540,7 @@ def search_file(parameter: str | None = None) -> dict:
 #
 # GATING PATTERN: destructive bulk ops do a DRY-RUN RESOLVE first and return
 # {"needs_confirmation", "confirm_message" (spoken enumeration), "_execute"}.
-# sensei.py speaks the enumeration and only runs _execute after a spoken yes —
+# akira.py speaks the enumeration and only runs _execute after a spoken yes —
 # the same pause machinery as click confirmation. Gating lives HERE, with the
 # implementation, so no entry point can bypass it.
 
@@ -3559,7 +3627,7 @@ def _move_batch(pairs: list) -> dict:
 
 
 def _gated(confirm_message: str, execute_fn) -> dict:
-    """Standard gated-plan result — sensei.py speaks confirm_message and runs
+    """Standard gated-plan result — akira.py speaks confirm_message and runs
     execute_fn only after a spoken yes."""
     return {"needs_confirmation": True, "confirm_message": confirm_message,
             "_execute": execute_fn}
@@ -4143,8 +4211,9 @@ def read_clipboard(parameter: str | None = None) -> dict:
         content = _ps_read_clipboard()
         if content is not None:
             text = content.rstrip("\r\n")
-            return {"success": True, "speak": True,
-                    "message": f"Your clipboard says: {text}" if text else "Your clipboard is empty."}
+            wrapped = f"<untrusted_external_context>\n{text}\n</untrusted_external_context>" if text else ""
+            return {"success": True, "speak": True, "raw_content": text,
+                    "message": f"Your clipboard says: {wrapped}" if text else "Your clipboard is empty."}
     except Exception as e:
         print(f"[read_clipboard] powershell route failed: {e}")
     # LAST RESORT: tkinter (known-flaky on Windows — see header note)
@@ -4153,8 +4222,9 @@ def read_clipboard(parameter: str | None = None) -> dict:
         root.withdraw()
         content = root.clipboard_get()
         root.destroy()
-        return {"success": True, "speak": True,
-                "message": f"Your clipboard says: {content}" if content else "Your clipboard is empty."}
+        wrapped = f"<untrusted_external_context>\n{content}\n</untrusted_external_context>" if content else ""
+        return {"success": True, "speak": True, "raw_content": content,
+                "message": f"Your clipboard says: {wrapped}" if content else "Your clipboard is empty."}
     except Exception as e:
         return {"success": False, "message": f"Couldn't read clipboard: {e}"}
 
@@ -4217,7 +4287,7 @@ def write_clipboard(parameter: str | None = None) -> dict:
 
 # playlist-read-private + user-library-read added for open_playlist /
 # open_library. Scope change means the cached token lacks them — delete
-# ~/.sensei_spotify_cache once and re-auth in the browser popup.
+# ~/.akira_spotify_cache once and re-auth in the browser popup.
 _SPOTIFY_SCOPES = ("user-read-playback-state user-modify-playback-state "
                    "user-read-currently-playing playlist-read-private "
                    "user-library-read")
@@ -4245,7 +4315,7 @@ def _spotify_client():
             client_id=cid, client_secret=secret,
             redirect_uri=os.environ.get("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback"),
             scope=_SPOTIFY_SCOPES,
-            cache_path=os.path.join(os.path.expanduser("~"), ".sensei_spotify_cache"),
+            cache_path=os.path.join(os.path.expanduser("~"), ".akira_spotify_cache"),
             open_browser=True)
         client = spotipy.Spotify(auth_manager=auth, requests_timeout=10)
         _spotify_client_cache = client
@@ -4860,15 +4930,35 @@ def _open_single_app(name: str) -> str:
 
     # last resort
     try:
-        subprocess.Popen(["cmd", "/c", "start", "", name])
+        os.startfile(name)
+        return f"Opening {name}."
+    except Exception:
+        pass
+    try:
+        subprocess.Popen(["cmd", "/c", "start", "", name], shell=False)
         return f"Trying to open {name}."
     except Exception:
         return f"Couldn't find {name}."
 
 
-def open_application(parameter: str) -> str:
+def safe_open_app(name: str, is_indirect: bool = False) -> str:
+    """Open an application with safety validation for indirect/untrusted inputs.
+
+    Direct voice commands execute without overhead; indirect sources
+    (clipboard, browser titles, notes) are checked via POST /v1/validate-command.
+    """
+    if is_indirect:
+        import gateway_client
+        ok, msg = gateway_client.validate_indirect_command(name)
+        if not ok:
+            print(f"[safe_open_app] Blocked indirect app name: {name} ({msg})")
+            return "Invalid application name — blocked for safety."
+    return _open_single_app(name)
+
+
+def open_application(parameter: str, is_indirect: bool = False) -> str:
     for app in [p.strip() for p in parameter.split(",")]:
-        _open_single_app(app)
+        safe_open_app(app, is_indirect=is_indirect)
     return "Done."
 
 
@@ -4893,7 +4983,7 @@ def _close_single_app(name: str) -> str:
 def close_application(parameter: str) -> str:
     if parameter.strip().lower() == "all":
         safe = {"explorer.exe", "python.exe", "pythonw.exe", "svchost.exe",
-                "system", "registry", "smss.exe", "sensei.py"}
+                "system", "registry", "smss.exe", "akira.py"}
         for proc in psutil.process_iter(["name"]):
             try:
                 if proc.info["name"].lower() not in safe:
@@ -5392,10 +5482,6 @@ _ACTION_MAP = {
     "open_url":          _handle_open_url,
     "web_search":        _handle_web_search,
     "site_search":       _handle_site_search,
-    "search_memory":     lambda p: memory_control.search_memory(p),
-    "forget_today":      lambda _: memory_control.forget_today(),
-    "wipe_all_memory":   lambda _: memory_control.wipe_all_memory(),
-
     "fill":              fill,
     "scroll":            scroll,
     "new_tab":           new_tab,
@@ -5451,6 +5537,7 @@ _ACTION_MAP = {
     "download_image":    download_image,
     "set_wallpaper":     set_wallpaper,
     "read_clipboard":    read_clipboard,
+    "speak_clipboard":   read_clipboard,
     "write_clipboard":   write_clipboard,
     "adjust_volume":     adjust_volume,
     "adjust_brightness": adjust_brightness,
@@ -5474,8 +5561,17 @@ _ACTION_MAP = {
     "bookmark_page":     lambda _: _bookmark(),
     # Windows system/settings control. Imported as one dict so adding an
     # action there needs no edit here. Tier 2 entries are confirmation-gated
-    # by sensei's existing safety net, not by anything in this map.
+    # by akira's existing safety net, not by anything in this map.
     **_system_control.ACTIONS,
+    # ── LLM hallucination aliases ─────────────────────────────────────────
+    # Groq sometimes invents plausible action names that don't exist. These
+    # aliases route them to the closest real handler so they execute cleanly
+    # instead of failing with "Unknown action".
+    "write_text":    write_clipboard,   # "write text in notepad" → clipboard
+    "type_text":     write_clipboard,   # "type this text" → clipboard
+    "insert_text":   write_clipboard,   # "insert text" → clipboard
+    "file_search":   search_file,       # "find a file named X" → search_file
+    "folder_search": search_file,       # "find a folder named X" → search_file
 }
 
 

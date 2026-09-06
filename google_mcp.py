@@ -35,7 +35,7 @@ DENYLIST = frozenset({
     # delete_item is deliberately NOT denylisted (changed for the slides
     # delete fix): it moves ONE item to the Drive TRASH — recoverable, not
     # permanent (verified in v3.4.4: "Move items to trash"). Its only caller
-    # is slides_control's delete action, which sensei.py confirmation-gates
+    # is slides_control's delete action, which akira.py confirmation-gates
     # in code via RISKY_WORKSPACE_PARAMS — the same code-level mechanism as
     # calendar delete, per the "never prompt-level-only gates" lesson.
 })
@@ -77,11 +77,11 @@ def _get(instance: str) -> MCPServer:
         services = ",".join(s for s in services.split(",")
                             if s.strip() and s.strip() != "gmail")
         env = {"GOOGLE_WORKSPACE_SERVICES": services,
-               "GOOGLE_WORKSPACE_MCP_PROFILE": "sensei-workspace"}
+               "GOOGLE_WORKSPACE_MCP_PROFILE": "akira-workspace"}
     elif instance == "gmail":
         env = {"GOOGLE_WORKSPACE_SERVICES": "gmail",
                "GOOGLE_WORKSPACE_READ_ONLY": "true",
-               "GOOGLE_WORKSPACE_MCP_PROFILE": "sensei-gmail-ro"}
+               "GOOGLE_WORKSPACE_MCP_PROFILE": "akira-gmail-ro"}
     else:
         raise ValueError(f"unknown instance: {instance}")
     for var in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"):
@@ -114,12 +114,12 @@ def call(instance: str, tool: str, arguments: dict, *,
     """The single funnel every workspace dispatcher routes through.
     Enforces the denylist, checks auth, returns {"success","message"}.
     speak_summary=True marks a successful READ result (raw API dump) for
-    same-turn LLM synthesis into a spoken reply — see sensei.handle_response.
+    same-turn LLM synthesis into a spoken reply — see akira.handle_response.
     Set it only on read actions whose message is not directly speakable."""
     if tool in DENYLIST:
         print(f"[google_mcp] BLOCKED denylisted tool: {tool}")
         return {"success": False,
-                "message": f"The action '{tool}' is disabled by policy in Sensei."}
+                "message": f"The action '{tool}' is disabled by policy in Akira."}
     try:
         server = _get(instance)
     except (FileNotFoundError, ValueError) as e:

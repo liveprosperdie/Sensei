@@ -184,7 +184,7 @@ def check_rule_shapes() -> None:
 def check_fail_closed(dispatchable: set[str]) -> None:
     """validate() must refuse, not shrug.
 
-    Runs offline, which means guard_rules cannot reach sensei's classifier — so
+    Runs offline, which means guard_rules cannot reach akira's classifier — so
     this also proves the "classifier unavailable" path does not degrade to ALLOW.
     """
     unknown = guard_rules.validate("definitely_not_an_action", "x")
@@ -211,7 +211,7 @@ def check_fail_closed(dispatchable: set[str]) -> None:
            else "over-long parameter blocked for every action")
 
     # With no classifier reachable, nothing may come back ALLOW.
-    if guard_rules._sensei_classifier() is None:
+    if guard_rules._akira_classifier() is None:
         allowed = [a for a in sorted(dispatchable & set(guard_rules.ACTION_RULES))
                    if guard_rules.validate(a, "x").decision == guard_rules.ALLOW]
         record("FAIL" if allowed else "PASS", "fail-closed/no-classifier",

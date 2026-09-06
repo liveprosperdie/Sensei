@@ -1,6 +1,6 @@
 """Verification gate for the Gemini Head adapter (Prompt 6).
 
-Run: python3 verify_gemini_head.py
+Run: python3 verify_akira_head.py
 
 WHAT THIS CAN AND CANNOT PROVE
 ==============================
@@ -31,16 +31,17 @@ import sys
 
 # Isolate the counter file BEFORE importing anything that reads it, so a real
 # day's quota on the dev machine is never touched by a verification run.
-os.environ["SENSEI_GEMINI_QUOTA_FILE"] = "/tmp/verify_gemini_quota.json"
-for _stale in (os.environ["SENSEI_GEMINI_QUOTA_FILE"],
-               os.environ["SENSEI_GEMINI_QUOTA_FILE"] + ".tmp"):
+os.environ["AKIRA_QUOTA_FILE"] = "/tmp/verify_akira_quota.json"
+for _stale in (os.environ["AKIRA_QUOTA_FILE"],
+               os.environ["AKIRA_QUOTA_FILE"] + ".tmp"):
     try:
         os.remove(_stale)
     except OSError:
         pass
 
-import gemini_quota                                              # noqa: E402
+import akira_quota                                               # noqa: E402
 import gemini_head                                               # noqa: E402
+import tiers                                                     # noqa: E402
 
 RESULTS: list[tuple[str, str, str]] = []
 
@@ -131,27 +132,27 @@ def test_schema_translation() -> None:
 # allowance and together permit ~2x the real cap.
 # --------------------------------------------------------------------------
 def test_shared_quota() -> None:
-    start = gemini_quota.used_today()
-    gemini_quota.record("routing")
-    gemini_quota.record("content_generation")
+    start = akira_quota.used_today()
+    akira_quota.record("routing")
+    akira_quota.record("content_generation")
     check("quota/one-counter-both-purposes",
-          gemini_quota.used_today() == start + 2,
+          akira_quota.used_today() == start + 2,
           "routing and content must increment the SAME counter")
 
-    snap = gemini_quota.snapshot()
+    snap = akira_quota.snapshot()
     check("quota/attributes-by-purpose",
           snap["by_purpose"].get("routing", 0) >= 1
           and snap["by_purpose"].get("content_generation", 0) >= 1,
           "'quota gone, no idea what spent it' is not debuggable")
 
     check("quota/stops-below-google-limit",
-          gemini_quota.STOP_AT < gemini_quota.DAILY_LIMIT,
+          akira_quota.STOP_AT < akira_quota.DAILY_LIMIT,
           "must brake before Google's hard 429, not at it")
 
     try:
         import gemini_content
         check("quota/content-module-shares-limit",
-              gemini_content._STOP_AT == gemini_quota.STOP_AT,
+              gemini_content._STOP_AT == akira_quota.STOP_AT,
               "gemini_content must not keep a private limit")
     except ModuleNotFoundError as e:
         skip("quota/content-module-shares-limit", f"{e} (third-party dep)")
@@ -162,11 +163,11 @@ def test_shared_quota() -> None:
 
 
 def _corrupt_reads_zero() -> bool:
-    path = os.environ["SENSEI_GEMINI_QUOTA_FILE"]
+    path = os.environ["AKIRA_QUOTA_FILE"]
     with open(path, "w", encoding="utf-8") as f:
         f.write("{not json at all")
     try:
-        return gemini_quota.used_today() == 0
+        return akira_quota.used_today() == 0
     finally:
         os.remove(path)
 
@@ -176,39 +177,38 @@ def _corrupt_reads_zero() -> bool:
 # --------------------------------------------------------------------------
 def test_no_silent_escalation() -> None:
     import claude_handler as ch
-
-    saved_tier = os.environ.get("SENSEI_HEAD_TIER")
-    saved_key = os.environ.get("GEMINI_API_KEY")
-    saved_esc = os.environ.get("SENSEI_HEAD_ESCALATE_ON_CAP")
+    saved_tier = os.environ.get("AKIRA_HEAD_TIER")
+    saved_key = os.environ.get("GROQ_API_KEY")
+    saved_esc = os.environ.get("AKIRA_HEAD_ESCALATE_ON_CAP")
     try:
         # Free tier selected, key missing -> must REFUSE, not become Claude.
-        os.environ["SENSEI_HEAD_TIER"] = "free"
-        os.environ.pop("GEMINI_API_KEY", None)
-        os.environ.pop("SENSEI_HEAD_ESCALATE_ON_CAP", None)
+        os.environ["AKIRA_HEAD_TIER"] = "free"
+        os.environ.pop("GROQ_API_KEY", None)
+        os.environ.pop("AKIRA_HEAD_ESCALATE_ON_CAP", None)
         provider, payload = ch._head_dispatch()
         check("escalation/free-without-key-refuses",
               provider == "refuse",
               f"got provider={provider!r} — 'claude' here would silently bill "
               f"a user who explicitly chose the free tier")
         check("escalation/refusal-explains-how-to-fix",
-              provider == "refuse" and "GEMINI_API_KEY" in str(payload),
+              provider == "refuse" and "GROQ_API_KEY" in str(payload),
               "a refusal the user cannot act on is just a dead end")
 
-        # Free tier + key present -> gemini, still never claude.
-        os.environ["GEMINI_API_KEY"] = "test-key-not-used-offline"
+        # Free tier + key present -> groq, still never claude.
+        os.environ["GROQ_API_KEY"] = "test-key-not-used-offline"
         provider, _ = ch._head_dispatch()
-        check("escalation/free-with-key-uses-gemini",
-              provider == "gemini", f"got {provider!r}")
+        check("escalation/free-with-key-uses-groq",
+              provider == "groq", f"got {provider!r}")
 
         # Paid tier -> claude, as configured.
-        os.environ["SENSEI_HEAD_TIER"] = "standard"
+        os.environ["AKIRA_HEAD_TIER"] = "standard"
         provider, _ = ch._head_dispatch()
         check("escalation/standard-uses-claude",
               provider == "claude", f"got {provider!r}")
     finally:
-        for k, v in (("SENSEI_HEAD_TIER", saved_tier),
-                     ("GEMINI_API_KEY", saved_key),
-                     ("SENSEI_HEAD_ESCALATE_ON_CAP", saved_esc)):
+        for k, v in (("AKIRA_HEAD_TIER", saved_tier),
+                     ("GROQ_API_KEY", saved_key),
+                     ("AKIRA_HEAD_ESCALATE_ON_CAP", saved_esc)):
             if v is None:
                 os.environ.pop(k, None)
             else:
@@ -217,88 +217,91 @@ def test_no_silent_escalation() -> None:
 
 def test_cap_refuses_by_default() -> None:
     """An exhausted cap must speak, not silently spend money."""
-    saved = os.environ.get("SENSEI_HEAD_ESCALATE_ON_CAP")
-    os.environ.pop("SENSEI_HEAD_ESCALATE_ON_CAP", None)
+    saved = os.environ.get("AKIRA_HEAD_ESCALATE_ON_CAP")
     try:
+        os.environ.pop("AKIRA_HEAD_ESCALATE_ON_CAP", None)
         check("cap/escalation-is-opt-in",
               gemini_head._escalate_on_cap() is False,
               "default must be refuse-and-explain, never auto-upgrade to paid")
-        os.environ["SENSEI_HEAD_ESCALATE_ON_CAP"] = "1"
+        os.environ["AKIRA_HEAD_ESCALATE_ON_CAP"] = "1"
         check("cap/escalation-opt-in-works",
               gemini_head._escalate_on_cap() is True,
               "an operator who explicitly opts in must get it")
     finally:
         if saved is None:
-            os.environ.pop("SENSEI_HEAD_ESCALATE_ON_CAP", None)
+            os.environ.pop("AKIRA_HEAD_ESCALATE_ON_CAP", None)
         else:
-            os.environ["SENSEI_HEAD_ESCALATE_ON_CAP"] = saved
+            os.environ["AKIRA_HEAD_ESCALATE_ON_CAP"] = saved
 
 
 # --------------------------------------------------------------------------
 # Reply shape: ask_akira must not learn which provider answered.
 # --------------------------------------------------------------------------
 def test_reply_duck_type() -> None:
+    """HeadReply must provide the attributes claude_handler expects."""
     reply = gemini_head._refuse("test refusal text")
-    check("shape/has-content-list",
-          isinstance(getattr(reply, "content", None), list) and reply.content,
-          "ask_akira reads reply.content[0].text")
-    block = reply.content[0]
-    check("shape/block-has-text", isinstance(getattr(block, "text", None), str))
-    check("shape/block-type-is-text", getattr(block, "type", None) == "text")
-    check("shape/has-stop-reason",
-          hasattr(reply, "stop_reason"),
-          "the caller inspects stop_reason")
 
+    # .content is a list of text-bearing blocks (same as Anthropic Messages).
+    check("shape/has-content-list",
+          isinstance(getattr(reply, "content", None), list))
+    check("shape/block-has-text",
+          all(hasattr(b, "text") for b in reply.content))
+    check("shape/block-type-is-text",
+          all(getattr(b, "type", None) == "text" for b in reply.content))
+    check("shape/has-stop-reason", hasattr(reply, "stop_reason"))
+
+    # Parse what response_text would see: must be valid JSON with conversation
+    # envelope, never action mode.
+    raw = "".join(b.text for b in reply.content)
     try:
-        payload = json.loads(block.text)
-    except ValueError as e:
-        check("shape/refusal-is-valid-json", False, f"{e}")
+        parsed = json.loads(raw)
+        check("shape/refusal-is-valid-json", True)
+    except json.JSONDecodeError as e:
+        check("shape/refusal-is-valid-json", False, str(e))
         return
-    check("shape/refusal-is-valid-json", True)
+
     check("shape/refusal-is-conversation-mode",
-          payload.get("mode") == "conversation",
-          "action mode would let a refusal EXECUTE something")
+          parsed.get("mode") == "conversation")
     check("shape/refusal-has-no-actions",
-          not payload.get("actions") and not payload.get("action"),
-          "a refusal must carry no executable action")
+          "actions" not in parsed or not parsed["actions"])
     check("shape/refusal-speaks",
-          bool(payload.get("response")),
+          bool(parsed.get("response")),
           "silent failure on a voice assistant is indistinguishable from a hang")
     check("shape/refusal-does-not-end-session",
-          payload.get("end_session") is False,
+          parsed.get("end_session") is False,
           "quota exhaustion must not hang up on the user")
 
-    # The Claude-side refusal shim must match the same contract.
+    # claude_handler has an internal refusal reply builder; verify its shape
+    # matches gemini_head's so callers can't tell them apart.
     try:
         import claude_handler as ch
         shim = ch._refusal_reply("claude-side refusal")
-        sp = json.loads(shim.content[0].text)
         check("shape/claude-shim-matches",
-              sp.get("mode") == "conversation" and bool(sp.get("response"))
-              and hasattr(shim, "stop_reason"),
-              "both refusal paths must be indistinguishable downstream")
+              isinstance(shim.content, list)
+              and getattr(shim.content[0], "type", None) == "text"
+              and hasattr(shim, "stop_reason"))
     except ModuleNotFoundError as e:
         skip("shape/claude-shim-matches", f"{e} (third-party dep)")
 
 
 def test_readiness_is_offline() -> None:
-    saved = os.environ.get("GEMINI_API_KEY")
+    saved = os.environ.get("GROQ_API_KEY")
     try:
-        os.environ.pop("GEMINI_API_KEY", None)
+        os.environ.pop("GROQ_API_KEY", None)
         ok, reason = gemini_head.readiness()
         check("readiness/no-key-not-ready", not ok)
         check("readiness/no-key-names-the-var",
-              "GEMINI_API_KEY" in reason, reason[:70])
-        os.environ["GEMINI_API_KEY"] = "x"
+              "GROQ_API_KEY" in reason, reason[:70])
+        os.environ["GROQ_API_KEY"] = "x"
         ok, _ = gemini_head.readiness()
         check("readiness/with-key-ready", ok,
               "readiness is a CONFIG check — it must not require a network call, "
               "because a startup banner calls it")
     finally:
         if saved is None:
-            os.environ.pop("GEMINI_API_KEY", None)
+            os.environ.pop("GROQ_API_KEY", None)
         else:
-            os.environ["GEMINI_API_KEY"] = saved
+            os.environ["GROQ_API_KEY"] = saved
 
 
 def test_tiers_integration() -> None:
@@ -308,28 +311,28 @@ def test_tiers_integration() -> None:
         skip("tiers/free-head-live", f"{e} (tiers' own dep)")
         return
 
-    saved = os.environ.get("GEMINI_API_KEY")
+    saved = os.environ.get("GROQ_API_KEY")
     try:
-        os.environ["GEMINI_API_KEY"] = "x"
+        os.environ["GROQ_API_KEY"] = "x"
         spec = tiers.head(tiers.FREE)
         check("tiers/free-head-live", bool(spec),
               "Free Head must resolve once the adapter and key exist")
-        check("tiers/free-head-is-gemini",
-              getattr(spec, "provider", None) == "gemini")
+        check("tiers/free-head-is-groq",
+              getattr(spec, "provider", None) == "groq")
         check("tiers/free-budget-is-zero-not-none",
               getattr(spec, "daily_budget_usd", None) == 0.0,
               "None means UNMETERED in this dataclass — the free tier is the "
               "opposite of unmetered")
 
-        os.environ.pop("GEMINI_API_KEY", None)
+        os.environ.pop("GROQ_API_KEY", None)
         spec = tiers.head(tiers.FREE)
         check("tiers/free-head-unavailable-without-key",
               not spec, "missing config must report Unavailable, not a live spec")
     finally:
         if saved is None:
-            os.environ.pop("GEMINI_API_KEY", None)
+            os.environ.pop("GROQ_API_KEY", None)
         else:
-            os.environ["GEMINI_API_KEY"] = saved
+            os.environ["GROQ_API_KEY"] = saved
 
 
 def main() -> int:

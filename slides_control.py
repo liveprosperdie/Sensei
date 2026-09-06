@@ -5,7 +5,7 @@ Action format:
   generate|Name|topic brief|[slide count]        (Gemini writes the slides)
   read|<presentationId>|[slide number]
   update|<presentationId>|Slide 1 title::content;;...   (replaces slide set)
-  delete|<presentationId or name>       (moves to Drive trash — gated in sensei.py)
+  delete|<presentationId or name>       (moves to Drive trash — gated in akira.py)
 """
 
 import google_mcp
@@ -58,6 +58,13 @@ def slides_control(action: str, parameter: str | None = None) -> dict:
                                {"name": parts[0].strip(), "slides": slides})
 
     if action == "generate":
+        # Pro-only: AI-generated presentation decks are a premium capability.
+        # Interactive create/read/update stay on Standard.
+        import tiers
+        if tiers.plan_for(tiers.Layer.SERVANT) != tiers.PRO:
+            return {"success": False, "speak": True,
+                    "message": "AI-generated slide decks are a Pro tier feature. "
+                               "You can still create presentations with your own content using 'create'."}
         # Name|brief|[slide count] — content from Gemini in a separate call,
         # returned in the exact T::body;;T::body format _slides() parses.
         sub = (parameter or "").split("|")

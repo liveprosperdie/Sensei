@@ -50,6 +50,13 @@ def docs_control(action: str, parameter: str | None = None) -> dict:
             "name": parts[0].strip(), "content": content})
 
     if action == "generate":
+        # Pro-only: AI-authored content generation is a premium capability.
+        # Interactive create/read/append stay on Standard.
+        import tiers
+        if tiers.plan_for(tiers.Layer.SERVANT) != tiers.PRO:
+            return {"success": False, "speak": True,
+                    "message": "AI-generated document drafting is a Pro tier feature. "
+                               "You can still create documents with your own content using 'create'."}
         # Title|brief|[short or detailed] — content comes from Gemini in a
         # separate completion, never inline in the routing JSON (that's what
         # used to truncate long docs mid-string).

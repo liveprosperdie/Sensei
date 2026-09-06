@@ -2,7 +2,7 @@
 
 WHAT THIS IS
 ============
-Answers ONE question about the machine Sensei is running on right now: does this
+Answers ONE question about the machine Akira is running on right now: does this
 box have the physical resources to run a local model at all, and if so, at which
 capability level (base model only, or base + fine-tuned LoRA adapters).
 
@@ -32,7 +32,7 @@ WHY THE THRESHOLDS ARE LABELLED PLACEHOLDERS
 The resource floors below are named PLACEHOLDER_* on purpose. No local model or
 adapter exists in this project yet, so no floor has been MEASURED — these are
 reasoned estimates from published quantised-model footprints, not numbers
-observed on Sensei's own workload. Presenting them as measured would be false
+observed on Akira's own workload. Presenting them as measured would be false
 precision that outlives the guess: someone would later tune behaviour against a
 number nobody ever validated.
 
@@ -47,8 +47,8 @@ Stated plainly because the brief asks for a position rather than a hedge:
 CPU-only is reported as INFEASIBLE for local inference.
 
 The reasoning is specific to this product, not a general claim about CPU
-inference. Sensei is a VOICE assistant. The model sits directly in the latency
-path between "user stopped speaking" and "Sensei starts replying". CPU-only
+inference. Akira is a VOICE assistant. The model sits directly in the latency
+path between "user stopped speaking" and "Akira starts replying". CPU-only
 inference on a 7B-class quantised model runs at roughly single-digit tokens per
 second on typical consumer hardware, which puts even a short spoken reply tens
 of seconds away. At that latency a voice turn is not a slow conversation, it is
@@ -58,7 +58,7 @@ background batch job can absorb that cost; a spoken turn cannot.
 The counter-argument, fairly stated: for a long-running background task where
 nobody is waiting on the reply, CPU-only inference would be genuinely usable,
 and treating it as infeasible loses that. That is a real cost of this choice,
-which is why SENSEI_ALLOW_CPU_LOCAL=1 exists to override it. The default stays
+which is why AKIRA_ALLOW_CPU_LOCAL=1 exists to override it. The default stays
 infeasible because the default path is the voice path.
 
 FAIL-CLOSED, SAME AS GUARD
@@ -119,7 +119,7 @@ class Capability(str, Enum):
 # VRAM 8 GB adapt. — LoRA adapters add their own weights and, more importantly,
 #                    adapter-swapping wants room for more than one resident at a
 #                    time. 8 GB is the next standard tier up.
-# RAM 16 GB        — the model is not the only thing on this machine. Sensei
+# RAM 16 GB        — the model is not the only thing on this machine. Akira
 #                    already holds Whisper, Silero VAD and openWakeWord
 #                    resident, and it runs alongside whatever the user is
 #                    actually doing. 8 GB total would mean competing with the
@@ -127,16 +127,16 @@ class Capability(str, Enum):
 # RAM 32 GB adapt. — same logic, one tier up, matching the VRAM step.
 
 PLACEHOLDER_MIN_VRAM_GB_BASE = float(
-    os.environ.get("SENSEI_MIN_VRAM_GB", "6"))
+    os.environ.get("AKIRA_MIN_VRAM_GB", "6"))
 PLACEHOLDER_MIN_VRAM_GB_ADAPTERS = float(
-    os.environ.get("SENSEI_MIN_VRAM_GB_ADAPTERS", "8"))
+    os.environ.get("AKIRA_MIN_VRAM_GB_ADAPTERS", "8"))
 PLACEHOLDER_MIN_RAM_GB_BASE = float(
-    os.environ.get("SENSEI_MIN_RAM_GB", "16"))
+    os.environ.get("AKIRA_MIN_RAM_GB", "16"))
 PLACEHOLDER_MIN_RAM_GB_ADAPTERS = float(
-    os.environ.get("SENSEI_MIN_RAM_GB_ADAPTERS", "32"))
+    os.environ.get("AKIRA_MIN_RAM_GB_ADAPTERS", "32"))
 
 # See "WHY CPU-ONLY IS TREATED AS INFEASIBLE" above.
-ALLOW_CPU_LOCAL = (os.environ.get("SENSEI_ALLOW_CPU_LOCAL", "")
+ALLOW_CPU_LOCAL = (os.environ.get("AKIRA_ALLOW_CPU_LOCAL", "")
                    or "").strip().lower() in ("1", "true", "yes", "on")
 
 # Probes shell out to vendor tools. A hung driver query must not hang the voice
@@ -248,7 +248,7 @@ def _probe_nvidia() -> tuple[float | None, str | None, str | None]:
 
     nvidia-smi rather than pynvml/torch deliberately: it ships with every NVIDIA
     driver, so it needs no new Python dependency and no CUDA toolchain. torch is
-    imported by sensei.py but is the wrong probe here — torch.cuda reports what
+    imported by akira.py but is the wrong probe here — torch.cuda reports what
     THAT torch build was compiled to see, so a CPU-only wheel reports no GPU on
     a machine that has one, which is a false negative from the tool rather than
     a fact about the hardware.
@@ -398,7 +398,7 @@ def capability(hw: Hardware | None = None) -> CapabilityReport:
 
     # 2. RAM floor. Checked before GPU because it gates every path — a machine
     #    under the RAM floor cannot run local inference even with a large GPU,
-    #    since weights are staged through system memory and Sensei's own audio
+    #    since weights are staged through system memory and Akira's own audio
     #    stack is already resident.
     if hw.ram_total_gb < PLACEHOLDER_MIN_RAM_GB_BASE:
         reasons.append(
@@ -423,11 +423,11 @@ def capability(hw: Hardware | None = None) -> CapabilityReport:
                 f"is treated as INFEASIBLE for local inference, not merely "
                 f"slow: this model sits in the latency path of a spoken reply, "
                 f"and single-digit tokens/sec makes a voice turn unusable "
-                f"rather than sluggish. Set SENSEI_ALLOW_CPU_LOCAL=1 to "
+                f"rather than sluggish. Set AKIRA_ALLOW_CPU_LOCAL=1 to "
                 f"override for non-interactive or benchmarking use.")
             return verdict(Capability.INSUFFICIENT)
         reasons.append(
-            "no GPU detected, but SENSEI_ALLOW_CPU_LOCAL=1 overrides the "
+            "no GPU detected, but AKIRA_ALLOW_CPU_LOCAL=1 overrides the "
             "CPU-only block. Expect latency unsuitable for interactive voice; "
             "base model only, since adapter swapping on CPU compounds it.")
         return verdict(Capability.BASE_ONLY)
@@ -513,9 +513,9 @@ def runtime_verified(model_path: str | None = None,
     single token.
     """
     model_path = model_path or (
-        os.environ.get("SENSEI_LOCAL_MODEL_PATH") or "").strip() or None
+        os.environ.get("AKIRA_LOCAL_MODEL_PATH") or "").strip() or None
     adapter_path = adapter_path or (
-        os.environ.get("SENSEI_LOCAL_ADAPTER_PATH") or "").strip() or None
+        os.environ.get("AKIRA_LOCAL_ADAPTER_PATH") or "").strip() or None
 
     # The reason distinguishes the two real cases, mirroring
     # tiers.LocalModel.resolve(), so a maintainer who HAS set a path is told the
@@ -525,7 +525,7 @@ def runtime_verified(model_path: str | None = None,
                   f"runtime is wired into this build, so it has never been "
                   f"loaded or timed")
     else:
-        detail = ("no model is configured (SENSEI_LOCAL_MODEL_PATH unset) and "
+        detail = ("no model is configured (AKIRA_LOCAL_MODEL_PATH unset) and "
                   "no local inference runtime is wired into this build")
     return NotVerified(model_path, adapter_path, detail)
 

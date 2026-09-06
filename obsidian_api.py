@@ -7,7 +7,7 @@
 WHY REST AND NOT THE PLUGIN'S BUILT-IN MCP SERVER
 -------------------------------------------------
 The plugin ships an MCP server and its README is right that this obsoletes
-third-party Obsidian MCP servers. It still does not fit Sensei:
+third-party Obsidian MCP servers. It still does not fit Akira:
 
 1. Transport mismatch. mcp_client.MCPServer speaks JSON-RPC over stdio to a
    CHILD PROCESS it spawns. The plugin's MCP server is Streamable HTTP inside
@@ -15,12 +15,12 @@ third-party Obsidian MCP servers. It still does not fit Sensei:
    shelling out to the `mcp-remote` Node bridge — a third moving part, plus
    npx, plus the same self-signed-cert problem, all to reach a server that
    also speaks plain REST.
-2. Sensei is not a tool-loop agent. AKIRA_PROMPT mandates exactly ONE JSON
+2. Akira is not a tool-loop agent. AKIRA_PROMPT mandates exactly ONE JSON
    object per reply and executor._ACTION_MAP dispatches action|parameter
    strings deterministically. MCP's value is a tool catalogue handed to a
    model that loops over tool calls; there is no such loop here.
 3. Safety would regress. Every gate in this codebase is code-level at the
-   dispatch layer (google_mcp.DENYLIST, sensei.DANGEROUS_ACTIONS,
+   dispatch layer (google_mcp.DENYLIST, akira.DANGEROUS_ACTIONS,
    RISKY_*_PARAMS) because prompt-level-only gates are a documented failure
    mode here. The plugin's MCP surface includes command_execute (arbitrary
    command-palette execution), vault_delete, and whole-file vault_write.
@@ -33,7 +33,7 @@ third-party Obsidian MCP servers. It still does not fit Sensei:
 What we DO take from the MCP-era plugin is its real REST surface — the
 Markdown Patch 2.0 instruction engine, /search/simple/, and /active/ — rather
 than the naive read-parse-rewrite the original plan assumed. Heading-targeted
-appends happen SERVER-SIDE in one request, so Sensei never parses Markdown and
+appends happen SERVER-SIDE in one request, so Akira never parses Markdown and
 never races the user editing the same note in Obsidian.
 
 CONNECTION MODEL
@@ -218,7 +218,7 @@ def _check_version(session: requests.Session, base: str) -> None:
         return
     if parsed < _version_tuple(MIN_VERSION):
         print(f"[obsidian_api] WARNING: plugin version {version} is older than the "
-              f"minimum Sensei supports ({MIN_VERSION}). Update 'Local REST API' in "
+              f"minimum Akira supports ({MIN_VERSION}). Update 'Local REST API' in "
               f"Obsidian's Community plugins pane — note edits may fail until you do.")
     else:
         print(f"[obsidian_api] plugin version {version} OK")

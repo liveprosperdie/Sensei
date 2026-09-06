@@ -18,7 +18,7 @@ import os
 import requests
 from dotenv import load_dotenv
 
-import gemini_quota
+import akira_quota
 
 load_dotenv()
 
@@ -32,13 +32,13 @@ _MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
 _URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-# QUOTA MOVED TO gemini_quota (2026-08). The limit, the 90% safety stop and the
+# QUOTA MOVED TO akira_quota. The limit, the 90% safety stop and the
 # counter file all live there now, unchanged in format and path, because ROUTING
 # (gemini_head) draws on the SAME per-project daily allowance as this module.
 # Two private counters would each have believed they owned the whole allowance
 # and together sailed through roughly twice the real cap — see that module's
 # docstring. Names kept as aliases so the call sites below read the same.
-_STOP_AT = gemini_quota.STOP_AT
+_STOP_AT = akira_quota.STOP_AT
 _PURPOSE = "content_generation"
 
 # "short" is the default everywhere so a plain "make me a doc about X"
@@ -48,77 +48,71 @@ _LENGTH_WORDS = {"short": 400, "detailed": 2500}
 
 def generate(brief: str, format_instructions: str = "",
              length: str = "short") -> dict:
-    """One Gemini completion. Returns {"success": True, "text": ...} or an
-    honest {"success": False, "message": ...} — quota exhaustion, missing
-    key, HTTP errors, and mid-generation truncation all surface as failures,
-    never as silently shortened content."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        return {"success": False,
-                "message": "GEMINI_API_KEY isn't set. Get a free key at "
-                           "aistudio.google.com/apikey and add it to the .env file."}
+    """Content generator powered by Groq (model from GROQ_MODEL in .env).
+    Gemini free API has been decommissioned.
+    Returns {"success": True, "text": ...} or {"success": False, "message": ...}."""
+    groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if not groq_key:
+        return {
+            "success": False,
+            "message": "GROQ_API_KEY isn't set in .env. Gemini has been removed from use, so Groq is required."
+        }
 
-    used = gemini_quota.used_today()
-    if used >= _STOP_AT:
-        # Wording now says "free Gemini quota" rather than
-        # "content-generation quota": the allowance is shared with routing, so
-        # naming only this module's use of it would misdescribe what ran out.
-        return {"success": False,
-                "message": "Free Gemini quota reached for today (shared with "
-                           "voice routing), try again tomorrow or ask for "
-                           "something shorter."}
-
+    groq_model = os.environ.get("GROQ_MODEL", "qwen/qwen3.6-27b")
     words = _LENGTH_WORDS.get(length, _LENGTH_WORDS["short"])
     prompt = (f"Write the following content in roughly {words} words or fewer. "
               f"{format_instructions}\n\n{brief}")
 
     try:
-        # 120s: a detailed multi-page generation on the free tier can take
-        # over a minute; a short one returns in seconds either way.
         resp = requests.post(
-            _URL.format(model=_MODEL),
-            params={"key": api_key},
-            json={"contents": [{"parts": [{"text": prompt}]}],
-                  # 8192 covers ~2500 words plus the model's internal
-                  # thinking tokens (2.5-flash thinks by default and thinking
-                  # counts against maxOutputTokens).
-                  "generationConfig": {"maxOutputTokens": 8192}},
-            timeout=120)
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {groq_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": groq_model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are a professional content writer. Produce high-quality, clean, well-formatted prose matching the requested length and format. Do not include conversational preambles or meta commentary."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.5,
+                "max_tokens": 4096
+            },
+            timeout=60
+        )
     except requests.RequestException as e:
-        return {"success": False, "message": f"Gemini request failed: {e}"}
+        return {"success": False, "message": f"Groq request failed: {e}"}
 
-    # Count every attempt that reached Google, including errors. purpose= is
-    # recorded so the shared counter can say WHICH consumer spent the
-    # allowance — "quota gone, no idea what used it" is not debuggable.
-    gemini_quota.record(_PURPOSE)
+    # Record usage
+    akira_quota.record(_PURPOSE)
 
     if resp.status_code == 429:
-        return {"success": False,
-                "message": "Gemini says the free quota is exhausted. "
-                           "Try again tomorrow or ask for something shorter."}
+        return {
+            "success": False,
+            "message": "Groq API rate limit reached. Please wait a moment and try again."
+        }
     if resp.status_code != 200:
         detail = resp.text[:300]
-        return {"success": False,
-                "message": f"Gemini returned HTTP {resp.status_code}: {detail}"}
+        return {
+            "success": False,
+            "message": f"Groq returned HTTP {resp.status_code}: {detail}"
+        }
 
     try:
         body = resp.json()
-        candidate = body["candidates"][0]
-        text = "".join(p.get("text", "")
-                       for p in candidate["content"]["parts"]).strip()
+        raw_text = (body["choices"][0]["message"]["content"] or "").strip()
+        import re
+        text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL).strip()
     except (KeyError, IndexError, ValueError) as e:
         return {"success": False,
-                "message": f"Gemini returned an unexpected response shape: {e}"}
+                "message": f"Groq returned an unexpected response shape: {e}"}
 
     if not text:
-        return {"success": False, "message": "Gemini returned no text."}
-    if candidate.get("finishReason") == "MAX_TOKENS":
-        # truncated mid-content — the exact failure mode this module was
-        # built to eliminate; refuse rather than save a cut-off document
-        return {"success": False,
-                "message": "The generated content was too long and got cut off. "
-                           "Ask for something shorter."}
+        return {"success": False, "message": "Groq returned empty text."}
 
-    print(f"[gemini_content] generated {len(text)} chars "
-          f"(quota {used + 1}/{_STOP_AT})")
-    return {"success": True, "text": text}
+    print(f"[content_generator] generated {len(text)} chars via Groq ({groq_model})")
+    return {"success": True, "text": text}

@@ -3,7 +3,7 @@
 WHY THIS IS ONE MODULE AND NOT TWO COUNTERS
 ===========================================
 The Gemini free tier meters REQUESTS PER DAY per project, against the API key —
-not per calling module. Sensei now makes Gemini calls from two places:
+not per calling module. Akira now makes Gemini calls from two places:
 
     gemini_content.generate()   long-form prose, one call per "write me a doc"
     gemini_head.route()         action routing, ONE CALL PER UTTERANCE
@@ -25,7 +25,7 @@ is a local pre-flight brake so the app can refuse with a clear message BEFORE
 spending the request, instead of discovering the cap through a 429 mid-turn.
 Google's 429 is still handled as the real signal by both callers.
 
-No Windows/TTS/network imports: exercised headlessly by verify_gemini_head.py.
+No Windows/TTS/network imports: exercised headlessly by verify_akira_head.py.
 """
 
 from __future__ import annotations
@@ -46,9 +46,9 @@ DAILY_LIMIT = int(os.environ.get("GEMINI_DAILY_LIMIT", "250"))
 # in-flight turn to finish.
 STOP_AT = max(1, (DAILY_LIMIT * 9) // 10)
 
-QUOTA_FILE = os.environ.get("SENSEI_GEMINI_QUOTA_FILE") or os.path.join(
+QUOTA_FILE = os.environ.get("AKIRA_QUOTA_FILE") or os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
-    "Sensei", "gemini_quota.json")
+    "Akira", "akira_quota.json")
 
 # Routing runs on the voice hot path from a background thread while a content
 # generation may still be in flight. Two unsynchronised read-modify-writes lose
@@ -107,7 +107,7 @@ def record(purpose: str) -> int:
                 json.dump(data, f)
             os.replace(tmp, QUOTA_FILE)
         except OSError as e:
-            print(f"[gemini_quota] could not persist count: {e}")
+            print(f"[akira_quota] could not persist count: {e}")
         return data["count"]
 
 

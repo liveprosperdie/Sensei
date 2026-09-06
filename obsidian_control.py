@@ -492,6 +492,13 @@ def obsidian_control(action: str, parameter: str | None = None) -> dict:
                 "message": "I need an Obsidian API key first. Copy it from the "
                            "Local REST API plugin settings into OBSIDIAN_API_KEY."}
 
+    # Pro-only: the entire Obsidian vault integration is a Pro tier capability.
+    # Focus mode (above) is already gated independently.
+    import tiers
+    if tiers.plan_for(tiers.Layer.SERVANT) != tiers.PRO:
+        return {"success": False, "speak": True,
+                "message": "Obsidian vault management is a Pro tier feature."}
+
     def arg(i: int) -> str:
         return parts[i] if len(parts) > i else ""
 

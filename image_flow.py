@@ -244,7 +244,7 @@ def _search_image_urls(query: str, limit: int = 6) -> tuple[list, str | None]:
     return out, None
 
 
-# ── Picker page — a LOCAL page Sensei generates and shows in the browser so
+# ── Picker page — a LOCAL page Akira generates and shows in the browser so
 #    the user SEES the numbered candidates they hear ──────────────────────────
 
 def picker_page_path() -> str:

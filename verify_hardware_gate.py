@@ -175,13 +175,13 @@ def check_cpu_only() -> None:
           any("INFEASIBLE" in x for x in r.reasons),
           "the reason must state the position plainly")
     check("cpu-only/names-the-override",
-          any("SENSEI_ALLOW_CPU_LOCAL" in x for x in r.reasons),
+          any("AKIRA_ALLOW_CPU_LOCAL" in x for x in r.reasons),
           "a refusal must tell the user how to override it")
 
     # The override is read at import, so reload with it set. This also proves
     # the block is a policy toggle and not hardcoded.
     import os
-    os.environ["SENSEI_ALLOW_CPU_LOCAL"] = "1"
+    os.environ["AKIRA_ALLOW_CPU_LOCAL"] = "1"
     try:
         reloaded = importlib.reload(hg)
         r = reloaded.capability(
@@ -198,7 +198,7 @@ def check_cpu_only() -> None:
               r.capability is reloaded.Capability.INSUFFICIENT,
               "the CPU override must not bypass the RAM floor too")
     finally:
-        os.environ.pop("SENSEI_ALLOW_CPU_LOCAL", None)
+        os.environ.pop("AKIRA_ALLOW_CPU_LOCAL", None)
         importlib.reload(hg)
 
 
@@ -213,9 +213,9 @@ def check_stub_honest() -> None:
     import os
     for label, path in (("unset", None), ("set", "C:\\models\\qwen-7b.gguf")):
         if path:
-            os.environ["SENSEI_LOCAL_MODEL_PATH"] = path
+            os.environ["AKIRA_LOCAL_MODEL_PATH"] = path
         else:
-            os.environ.pop("SENSEI_LOCAL_MODEL_PATH", None)
+            os.environ.pop("AKIRA_LOCAL_MODEL_PATH", None)
         v = hg.runtime_verified()
         check(f"stub/{label}-not-verified",
               isinstance(v, hg.NotVerified) and not v,
@@ -223,7 +223,7 @@ def check_stub_honest() -> None:
         check(f"stub/{label}-blames-runtime",
               "no local inference runtime" in v.reason,
               "must blame the missing runtime, not the user's path")
-    os.environ.pop("SENSEI_LOCAL_MODEL_PATH", None)
+    os.environ.pop("AKIRA_LOCAL_MODEL_PATH", None)
 
     # No Verified type may exist: absence is what makes a fake pass impossible
     # rather than merely unlikely.

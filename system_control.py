@@ -7,7 +7,7 @@ REAL performance query (psutil numbers, not "go read Task Manager yourself").
 
 TIER 2 (confirmation-gated): temp cleanup, recycle bin, browser cache, disk
 cleanup, shutdown/restart/sleep/hibernate/sign out. These are registered in
-sensei.DANGEROUS_ACTIONS so the EXISTING confirmation_required safety net
+akira.DANGEROUS_ACTIONS so the EXISTING confirmation_required safety net
 gates them — this module deliberately contains no confirmation logic of its
 own, so there is exactly one confirmation mechanism in the codebase.
 
@@ -413,7 +413,7 @@ def _top_processes(limit: int = 3) -> list[str]:
         return []
 
 
-# ── Tier 2: cleanup (confirmation-gated by sensei's safety net) ───────────────
+# ── Tier 2: cleanup (confirmation-gated by akira's safety net) ───────────────
 
 def _temp_targets() -> list[str]:
     """ONLY known-safe OS temp locations. Deliberately excludes every user
@@ -550,7 +550,7 @@ def run_disk_cleanup(parameter: str = "") -> dict:
 
 
 def clear_browser_cache(parameter: str = "") -> dict:
-    """Clear cache for the browser Sensei drives, via its own settings page.
+    """Clear cache for the browser Akira drives, via its own settings page.
 
     Deliberately does NOT delete profile files directly: a running browser
     holds them locked, and wiping the wrong profile directory would take
@@ -689,7 +689,7 @@ def restart_pc(parameter: str = "") -> dict:
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────
 
-# Exported so executor's _ACTION_MAP and sensei's DANGEROUS_ACTIONS stay in
+# Exported so executor's _ACTION_MAP and akira's DANGEROUS_ACTIONS stay in
 # sync from ONE definition instead of three hand-maintained lists.
 TIER1_ACTIONS = {
     "open_settings":      open_settings,

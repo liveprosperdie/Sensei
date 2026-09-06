@@ -54,7 +54,7 @@ class MCPServer:
         self._rpc("initialize", {
             "protocolVersion": _PROTOCOL_VERSION,
             "capabilities": {},
-            "clientInfo": {"name": "sensei", "version": "1.0"},
+            "clientInfo": {"name": "akira", "version": "1.0"},
         }, timeout=30)
         self._notify("notifications/initialized")
         print(f"[mcp:{self.name}] initialized")

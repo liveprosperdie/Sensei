@@ -21,7 +21,7 @@ WHAT IT PROVES
   2. INDEPENDENT each of the five layers is switchable on its own, and mixing
                  tiers across layers works without code changes.
   3. INERT       local model slots NEVER resolve to available, with or without
-                 SENSEI_LOCAL_MODEL_PATH set. This is the non-negotiable one:
+                 AKIRA_LOCAL_MODEL_PATH set. This is the non-negotiable one:
                  a fake success path here would surface as a failure far from
                  the config that caused it.
   4. NO-SPEND    Free/Standard servant calls refuse rather than escalating to
@@ -58,7 +58,7 @@ def check(name: str, condition: bool, detail: str = "") -> None:
 # import keeps the gate from reading or corrupting a real user's history — a test
 # that resets a live reliability ledger would silently re-gate every action the
 # user had already earned.
-_TMP = tempfile.mkdtemp(prefix="sensei-verify-tiers-")
+_TMP = tempfile.mkdtemp(prefix="akira-verify-tiers-")
 os.environ["LOCALAPPDATA"] = _TMP
 
 import tiers          # noqa: E402
@@ -66,7 +66,10 @@ import reliability    # noqa: E402
 
 reliability.LEDGER_FILE = os.path.join(_TMP, "action_reliability.json")
 
-_LAYER_ENV = list(tiers._ENV.values()) + ["SENSEI_TIER"]
+_LAYER_ENV = (
+    list(tiers._ENV.values())
+    + ["AKIRA_TIER"]
+)
 
 
 def set_tiers(**kw) -> None:
@@ -77,12 +80,12 @@ def set_tiers(**kw) -> None:
     """
     for var in _LAYER_ENV:
         os.environ.pop(var, None)
-    alias = {"head": "SENSEI_HEAD_TIER", "guard": "SENSEI_GUARD_TIER",
-             "servant": "SENSEI_SERVANT_TIER",
-             "gated": "SENSEI_SERVANT_GATED_TIER",
-             "mode": "SENSEI_GUARD_MODE_TIER", "all": "SENSEI_TIER"}
+    alias_akira = {"head": "AKIRA_HEAD_TIER", "guard": "AKIRA_GUARD_TIER",
+                   "servant": "AKIRA_SERVANT_TIER",
+                   "gated": "AKIRA_SERVANT_GATED_TIER",
+                   "mode": "AKIRA_GUARD_MODE_TIER", "all": "AKIRA_TIER"}
     for key, value in kw.items():
-        os.environ[alias[key]] = value
+        os.environ[alias_akira[key]] = value
 
 
 # ── 1. the specified table, cell by cell ─────────────────────────────────────
@@ -91,8 +94,16 @@ def check_table() -> None:
     """Assert each cell's availability against the table as written."""
     # Head: Free inert (no Gemini adapter), Standard/Pro available.
     set_tiers(all="free")
-    check("table/head/free-inert", not tiers.head(),
-          "Free Head must be Unavailable — no Gemini routing adapter exists")
+    groq_key = os.environ.get("GROQ_API_KEY")
+    os.environ["GROQ_API_KEY"] = ""
+    try:
+        check("table/head/free-without-key-unavailable", not tiers.head(),
+              "Free Head must be Unavailable without GROQ_API_KEY")
+    finally:
+        if groq_key:
+            os.environ["GROQ_API_KEY"] = groq_key
+        else:
+            os.environ.pop("GROQ_API_KEY", None)
     set_tiers(all="standard")
     spec = tiers.head()
     check("table/head/standard", bool(spec) and spec.priority is False,
@@ -159,14 +170,14 @@ def check_independence() -> None:
     for layer in tiers.Layer:
         check(f"independent/default/{layer.value}",
               tiers.plan_for(layer) == tiers.FREE,
-              "SENSEI_TIER must seed every unset layer")
+              "AKIRA_TIER must seed every unset layer")
 
     # The exact mix named in the brief: Standard Head + Free Guard.
     set_tiers(all="standard", guard="free")
     check("independent/mix/standard-head-free-guard",
           tiers.plan_for(tiers.Layer.HEAD) == tiers.STANDARD
           and tiers.plan_for(tiers.Layer.GUARD) == tiers.FREE,
-          "per-layer override must beat SENSEI_TIER")
+          "per-layer override must beat AKIRA_TIER")
 
     # One layer at a time, with every other layer left at the default.
     for layer, env in tiers._ENV.items():
@@ -198,17 +209,17 @@ def check_inert() -> None:
         slot = tiers.servant(plan).local
         # Structurally present: the slot exists and names its env vars.
         check(f"inert/{plan}/slot-exists",
-              slot.path_env == "SENSEI_LOCAL_MODEL_PATH",
+              slot.path_env == "AKIRA_LOCAL_MODEL_PATH",
               "config slot must exist structurally")
 
-        os.environ.pop("SENSEI_LOCAL_MODEL_PATH", None)
+        os.environ.pop("AKIRA_LOCAL_MODEL_PATH", None)
         unset = slot.resolve()
         check(f"inert/{plan}/unset", isinstance(unset, tiers.Unavailable)
               and not unset, "must be Unavailable and falsy")
 
         # The critical case: a path IS set. A slot that flips to available
         # because a string was set is the fake success path this forbids.
-        os.environ["SENSEI_LOCAL_MODEL_PATH"] = "C:\\models\\qwen-7b.gguf"
+        os.environ["AKIRA_LOCAL_MODEL_PATH"] = "C:\\models\\qwen-7b.gguf"
         with_path = slot.resolve()
         check(f"inert/{plan}/path-set-still-inert",
               isinstance(with_path, tiers.Unavailable) and not with_path,
@@ -216,7 +227,7 @@ def check_inert() -> None:
         check(f"inert/{plan}/reason-distinguishes",
               "no local inference runtime" in with_path.reason,
               "reason must blame the missing runtime, not the path")
-        os.environ.pop("SENSEI_LOCAL_MODEL_PATH", None)
+        os.environ.pop("AKIRA_LOCAL_MODEL_PATH", None)
 
     # Free/Standard have no hosted row at all, so the whole spec is falsy.
     for plan in ("free", "standard"):
@@ -347,11 +358,11 @@ SELF_GATING = ("delete_files", "move_files", "organize_files",
 
 
 def _closure_path_source() -> str:
-    """The REAL post-confirmation closure branch, lifted out of sensei.py.
+    """The REAL post-confirmation closure branch, lifted out of akira.py.
 
-    Why AST extraction instead of importing sensei or hand-rolling an equivalent:
+    Why AST extraction instead of importing akira or hand-rolling an equivalent:
 
-      * sensei cannot be imported here — it opens audio devices at import, which
+      * akira cannot be imported here — it opens audio devices at import, which
         is why verify_guard_wiring reads its source by AST too. Same approach.
       * a hand-written "equivalent" of the branch is the failure mode this gate
         exists to prevent. It would pass while the shipped code recorded nothing,
@@ -359,17 +370,18 @@ def _closure_path_source() -> str:
         the only version of this test that can actually fail correctly.
 
     So the branch's own statements are extracted verbatim and executed against
-    stubs. If someone deletes the reliability.record call from sensei.py, the
+    stubs. If someone deletes the reliability.record call from akira.py, the
     extracted source no longer contains it and these checks fail.
     """
     import ast
+    target = "akira.py"
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "sensei.py"), encoding="utf-8") as fh:
+                           target), encoding="utf-8") as fh:
         tree = ast.parse(fh.read())
 
     for node in ast.walk(tree):
         if not (isinstance(node, ast.FunctionDef)
-                and node.name == "get_akira_response"):
+                and node.name in ("get_akira_response",)):
             continue
         # The branch guarded by `pending_action == "click_confirmed" and
         # pending_execute is not None` — the closure path.
@@ -434,7 +446,7 @@ def check_closure_ledger() -> None:
 
     src = _closure_path_source()
     check("closure/branch-located", bool(src),
-          "the post-confirmation closure branch was found in sensei.py")
+          "the post-confirmation closure branch was found in akira.py")
     check("closure/records-in-source", "reliability.record" in src,
           "the shipped closure branch contains a reliability.record call")
 
@@ -532,11 +544,11 @@ def check_gate_integration() -> None:
     # Configurability: the same bar can be turned on for Standard without a
     # code change, as required.
     set_tiers(all="standard")
-    os.environ["SENSEI_RELIABILITY_GATE"] = "1"
+    os.environ["AKIRA_RELIABILITY_GATE"] = "1"
     check("gate/standard-bar-configurable",
           tiers.guard_mode().reliability_gate is True,
           "the gate must be enableable on Standard via env")
-    os.environ.pop("SENSEI_RELIABILITY_GATE", None)
+    os.environ.pop("AKIRA_RELIABILITY_GATE", None)
 
 
 def check_probation_bootstrap() -> None:
@@ -626,7 +638,7 @@ def check_failsafe() -> None:
                          ("PRO_TIER_TYPO", "garbage"), ("enterprise", "unknown")):
         set_tiers()
         if value is not None:
-            os.environ["SENSEI_TIER"] = value
+            os.environ["AKIRA_TIER"] = value
         check(f"failsafe/{label}-defaults-free",
               tiers.plan_for(tiers.Layer.SERVANT_GATED) == tiers.FREE,
               "a config typo must reduce capability, never grant Pro")

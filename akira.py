@@ -1,5 +1,5 @@
 """
-sensei.py — Akira's ears and orchestration loop.
+akira.py — Akira's ears and orchestration loop.
 Handles wake word detection, VAD, recording, transcription, and action execution.
 """
 
@@ -22,10 +22,13 @@ import reliability
 import hardware_gate
 import background_tasks
 import system_control
+import atexit
 import office_control
 import obsidian_context
 from groq import Groq
+import socket
 import subprocess
+import sys
 import soundfile as sf
 from executor import execute, get_all_tabs, get_pc_context
 from openwakeword import Model as WakeModel
@@ -35,29 +38,74 @@ from openwakeword import Model as WakeModel
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 openwakeword.utils.download_models()
 
-# Spawn Avatar UI
-try:
-    _avatar_proc = subprocess.Popen(["python", "avatar_ui.py"])
-except Exception as e:
-    print(f"[avatar] failed to launch avatar: {e}")
+# ── Avatar Process & IPC ───────────────────────────────────────────────────────
 
-# Avatar UDP Socket
-import socket
-_avatar_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_avatar_proc: subprocess.Popen | None = None
+_avatar_sock: socket.socket | None = None
 
-# Score above which "Sensei" counts as heard. Defined here because the startup
-# banner reports it — set SENSEI_WAKE_DEBUG=1 to print live scores and tune it.
-WAKE_THRESHOLD = float(os.getenv("SENSEI_WAKE_THRESHOLD", "0.2"))
-WAKE_DEBUG     = os.getenv("SENSEI_WAKE_DEBUG", "") not in ("", "0", "false")
+def _init_avatar() -> None:
+    global _avatar_proc, _avatar_sock
+    try:
+        _avatar_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except Exception as e:
+        print(f"[avatar] socket init failed: {e}")
+        _avatar_sock = None
+
+    avatar_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "avatar_ui.py")
+    if os.path.exists(avatar_script):
+        try:
+            # sys.executable ensures the avatar launches in the active environment (where PyQt6 is installed)
+            _avatar_proc = subprocess.Popen([sys.executable, avatar_script])
+            print(f"[avatar] launched avatar UI (PID {_avatar_proc.pid})")
+        except Exception as e:
+            print(f"[avatar] failed to launch avatar: {e}")
+    else:
+        print(f"[avatar] avatar script not found at {avatar_script}")
+
+def _notify_avatar(msg: str) -> None:
+    """Send an event trigger to the avatar UI via UDP datagram."""
+    global _avatar_sock
+    if not _avatar_sock:
+        return
+    try:
+        _avatar_sock.sendto(msg.encode("utf-8"), ("127.0.0.1", 55555))
+    except Exception:
+        pass
+
+def _cleanup_avatar() -> None:
+    """Cleanly shut down the avatar UI process on exit."""
+    global _avatar_proc, _avatar_sock
+    if _avatar_sock:
+        try:
+            _avatar_sock.sendto(b"SLEEP_START", ("127.0.0.1", 55555))
+        except Exception:
+            pass
+    if _avatar_proc and _avatar_proc.poll() is None:
+        try:
+            print("[avatar] shutting down avatar UI...")
+            _avatar_proc.terminate()
+            try:
+                _avatar_proc.wait(timeout=1.5)
+            except subprocess.TimeoutExpired:
+                _avatar_proc.kill()
+        except Exception as e:
+            print(f"[avatar] cleanup exception: {e}")
+
+atexit.register(_cleanup_avatar)
+
+# Score above which "Akira" counts as heard. Defined here because the startup
+# banner reports it — set AKIRA_WAKE_DEBUG=1 to print live scores and tune it.
+WAKE_THRESHOLD = float(os.getenv("AKIRA_WAKE_THRESHOLD", "0.2"))
+WAKE_DEBUG     = os.getenv("AKIRA_WAKE_DEBUG", "") not in ("", "0", "false")
 
 # Resolve the wake model next to THIS file, not against the current working
 # directory — launching from a shortcut or any other folder otherwise fails.
 _WAKE_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "sensei.onnx")
+                           "akira.onnx")
 if not os.path.isfile(_WAKE_MODEL):
     raise SystemExit(
         f"Wake model not found: {_WAKE_MODEL}\n"
-        "sensei.onnx is gitignored, so a fresh clone won't have it — copy your "
+        "akira.onnx is gitignored, so a fresh clone won't have it — copy your "
         "trained model into the project folder."
     )
 oww_model = WakeModel(wakeword_models=[_WAKE_MODEL], inference_framework="onnx")
@@ -148,6 +196,7 @@ DANGEROUS_ACTIONS = frozenset({
     "close_application", "shutdown", "restart", "hibernate",
     "edit_file", "uninstall_application",
     "write_file",  # overwrites file content — gated same as edit_file
+    "wipe_all_memory",  # deletes all logs and core profile — gated
     # Tier 2 Windows system actions (cleanup + power). Pulled from
     # system_control.TIER2_ACTIONS so the gate list cannot drift from the
     # implementations — a new Tier 2 action is gated the moment it exists.
@@ -331,7 +380,7 @@ FAILURE_PREFIXES = (
 # Boot fingerprint — makes stale-process / wrong-file / wrong-BRANCH issues
 # instantly visible. The git line matters most: a bug report is unreadable
 # without knowing which commit was actually running.
-print(f"[BOOT] sensei: {os.path.abspath(__file__)}")
+print(f"[BOOT] akira: {os.path.abspath(__file__)}")
 print(f"[BOOT] claude_handler: {claude_handler.__file__}")
 print(f"[BOOT] prompt has github_control: "
       f"{'github_control' in getattr(claude_handler, 'AKIRA_PROMPT', '')}")
@@ -373,7 +422,7 @@ try:
 except Exception as e:
     print(f"[BOOT] features: check failed ({e.__class__.__name__})")
 
-print("Listening for 'Sensei'...")
+print("Listening for 'Akira'...")
 
 
 # ── Audio utilities ───────────────────────────────────────────────────────────
@@ -464,17 +513,11 @@ def speak_and_wait(text: str) -> None:
     """Speak text while VAD listens for barge-in. Blocks until done."""
     global akira_speaking
     akira_speaking = True
-    try:
-        _avatar_sock.sendto(b"SPEAK_START", ("127.0.0.1", 55555))
-    except Exception:
-        pass
+    _notify_avatar("SPEAK_START")
     thread = claude_handler.speak_async(text)
     thread.join()
     akira_speaking = False
-    try:
-        _avatar_sock.sendto(b"SPEAK_STOP", ("127.0.0.1", 55555))
-    except Exception:
-        pass
+    _notify_avatar("SPEAK_STOP")
     user_speaking.clear()
 
 
@@ -863,7 +906,7 @@ def run_actions(response: dict, step_results: dict | None = None,
 
 # ── Response handling ────────────────────────────────���───────────────��────────
 
-def handle_response(response: dict) -> bool:
+def handle_response(response: dict, user_text: str = "") -> bool:
     """
     Process a parsed Akira response dict.
     Returns True to keep session alive, False to end it.
@@ -871,6 +914,32 @@ def handle_response(response: dict) -> bool:
     global session_start_time, pending_action, pending_parameter
 
     mode = response.get("mode")
+    tone = (response.get("tone") or "neutral").lower()
+
+    # Detect user appreciation or praise
+    user_appreciation = False
+    if user_text:
+        lowered = user_text.lower()
+        praise_patterns = [
+            r"\bthanks?\b",
+            r"\bthank you\b",
+            r"\bgreat job\b",
+            r"\bgreat work\b",
+            r"\bgood job\b",
+            r"\bgood work\b",
+            r"\bawesome\b",
+            r"\bappreciate it\b",
+            r"\byou(?:'re| are) the best\b",
+            r"\byou rock\b",
+            r"\bperfect\b",
+        ]
+        if any(re.search(pat, lowered) for pat in praise_patterns):
+            user_appreciation = True
+
+    if user_appreciation or tone in ("happy", "excited"):
+        _notify_avatar("HAPPY_START")
+    elif tone == "calm":
+        _notify_avatar("CALM_START")
 
     if mode == "command":
         actions_to_run = response.get("actions", [])
@@ -1027,6 +1096,7 @@ def handle_response(response: dict) -> bool:
         # drop the focus note / mentioned notes with the conversation history,
         # so the next session doesn't inherit a stale note target
         obsidian_context.reset()
+        _notify_avatar("SLEEP_START")
         return False
 
     flush_stream()
@@ -1234,17 +1304,18 @@ def _build_session_context() -> str:
         tabs_str    = ", ".join(f"{t['title']}" for t in tabs[:6]) or "none"
         windows_str = ", ".join(ctx["open_windows"][:5]) or "none"
         url_str     = ctx.get("current_url") or "none"
-        # Which note is open in Obsidian, so "add this to my notes" has a
-        # default target and Akira doesn't have to ask. Costs one localhost
-        # request at session start only, never per-turn, and yields "" for
-        # anyone without the plugin — see obsidian_context.session_line().
         note_str = obsidian_context.session_line()
-        return (
-            f"[SESSION START] Open tabs: {tabs_str} | "
+        raw_ctx = (
+            f"Open tabs: {tabs_str} | "
             f"Current page: {url_str} | "
             f"Windows: {windows_str}"
             + (f" | {note_str}" if note_str else "")
-            + "\n\n"
+        )
+        return (
+            "[SESSION START]\n"
+            "<untrusted_external_context>\n"
+            f"{raw_ctx}\n"
+            "</untrusted_external_context>\n\n"
         )
     except Exception:
         return ""
@@ -1282,101 +1353,107 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
         return True  # confirmation was handled inline, stay alive
 
     print(response)
-    return handle_response(response)
+    return handle_response(response, user_text=text)
 
 
-while True:
-    try:
-        current_time = time.time()
-
-        # ── Active session ────────────────────────────────────────────
-        if session_active and (current_time - session_start_time) < SESSION_TIMEOUT:
-
-            with vad_buffer_lock:
-                if user_speaking.is_set() and vad_audio_buffer:
-                    pre_audio = np.concatenate(vad_audio_buffer)
-                    vad_audio_buffer.clear()
-                    user_speaking.clear()
-                else:
-                    pre_audio = None
-                    vad_audio_buffer.clear()
-
-            audio = record_command(pre_audio=pre_audio)
-            if audio is None:
-                session_active = False
-                oww_model.reset()
-                continue
-
-            text = transcribe_command(audio)
-            session_active = _process_command(text)
-            if session_active:
-                print("[session] continuing")
-            else:
-                oww_model.reset()
-
-        # ── Idle — listening for wake word ────────────────────────────
-        else:
-            session_active = False
-
-            # Interrupt-on-completion. This branch polls every ~80ms, so a task
-            # that finishes while Akira is idle gets announced essentially the
-            # moment it finishes, with no wake word needed.
-            #
-            # Idle is the ONLY point where speaking unprompted is safe: during a
-            # turn the mic is actively recording, so speaking there would put
-            # Akira's own voice into the transcription. Anything that completes
-            # mid-turn is announced by handle_response instead.
-            if background_tasks.has_announcements() and not user_speaking.is_set():
-                if _announce_background():
-                    # Akira's own voice just went into an open mic. Drop it and
-                    # reset the detector so it cannot self-trigger the wake word.
-                    flush_stream()
-                    oww_model.reset()
-                    last_activation_time = time.time()
-                    continue
-
-            chunk    = stream.read(1280, exception_on_overflow=False)
-            audio_np = np.frombuffer(chunk, dtype=np.int16)
-            # Look the score up by the model's real key. Positional access
-            # returned whichever model the dict happened to order first.
-            scores   = oww_model.predict(audio_np)
-            score    = scores.get(_WAKE_KEY, 0.0)
-
-            if WAKE_DEBUG:
-                # Peak amplitude proves the mic is actually delivering audio —
-                # a flat 0 here means the input device is wrong or muted, which
-                # looks identical to "wake word not working" from the outside.
-                peak = int(np.abs(audio_np).max()) if audio_np.size else 0
-                print(f"[wake] score={score:.3f} peak={peak:5d} "
-                      f"keys={list(scores)}")
-
+if __name__ == "__main__":
+    _init_avatar()
+    while True:
+        try:
             current_time = time.time()
-            if score > WAKE_THRESHOLD and (current_time - last_activation_time) > COOLDOWN_TIME:
-                print("Wake word detected!")
-                winsound.Beep(1000, 200)
-                last_activation_time = current_time
 
-                print("[v0] recording command...")
-                audio = record_command()
+            # ── Active session ────────────────────────────────────────────
+            if session_active and (current_time - session_start_time) < SESSION_TIMEOUT:
+
+                with vad_buffer_lock:
+                    if user_speaking.is_set() and vad_audio_buffer:
+                        pre_audio = np.concatenate(vad_audio_buffer)
+                        vad_audio_buffer.clear()
+                        user_speaking.clear()
+                    else:
+                        pre_audio = None
+                        vad_audio_buffer.clear()
+
+                audio = record_command(pre_audio=pre_audio)
                 if audio is None:
-                    print("[v0] record returned None (too quiet), back to idle")
+                    session_active = False
+                    oww_model.reset()
                     continue
 
-                print("[v0] transcribing...")
                 text = transcribe_command(audio)
-                print(f"[v0] heard: {text!r}")
-                session_active = _process_command(text, inject_context=True)
-
+                session_active = _process_command(text)
                 if session_active:
-                    last_activation_time = time.time()
-                    session_start_time   = time.time()
+                    print("[session] continuing")
+                else:
                     oww_model.reset()
 
-    except KeyboardInterrupt:
-        print("\nShutting down Sensei.")
-        break
-    except Exception as e:
-        # outer safety net — log and continue, never crash the main loop
-        print(f"[main loop] unhandled exception: {e!r}")
-        time.sleep(1.0)
-        continue
+            # ── Idle — listening for wake word ────────────────────────────
+            else:
+                session_active = False
+
+                # Interrupt-on-completion. This branch polls every ~80ms, so a task
+                # that finishes while Akira is idle gets announced essentially the
+                # moment it finishes, with no wake word needed.
+                #
+                # Idle is the ONLY point where speaking unprompted is safe: during a
+                # turn the mic is actively recording, so speaking there would put
+                # Akira's own voice into the transcription. Anything that completes
+                # mid-turn is announced by handle_response instead.
+                if background_tasks.has_announcements() and not user_speaking.is_set():
+                    if _announce_background():
+                        # Akira's own voice just went into an open mic. Drop it and
+                        # reset the detector so it cannot self-trigger the wake word.
+                        flush_stream()
+                        oww_model.reset()
+                        last_activation_time = time.time()
+                        continue
+
+                chunk    = stream.read(1280, exception_on_overflow=False)
+                audio_np = np.frombuffer(chunk, dtype=np.int16)
+                # Look the score up by the model's real key. Positional access
+                # returned whichever model the dict happened to order first.
+                scores   = oww_model.predict(audio_np)
+                score    = scores.get(_WAKE_KEY, 0.0)
+
+                if WAKE_DEBUG:
+                    # Peak amplitude proves the mic is actually delivering audio —
+                    # a flat 0 here means the input device is wrong or muted, which
+                    # looks identical to "wake word not working" from the outside.
+                    peak = int(np.abs(audio_np).max()) if audio_np.size else 0
+                    print(f"[wake] score={score:.3f} peak={peak:5d} "
+                          f"keys={list(scores)}")
+
+                current_time = time.time()
+                if score > WAKE_THRESHOLD and (current_time - last_activation_time) > COOLDOWN_TIME:
+                    print("Wake word detected!")
+                    _notify_avatar("WAKE_START")
+                    winsound.Beep(1000, 200)
+                    last_activation_time = current_time
+
+                    print("[v0] recording command...")
+                    audio = record_command()
+                    if audio is None:
+                        print("[v0] record returned None (too quiet), back to idle")
+                        continue
+
+                    print("[v0] transcribing...")
+                    text = transcribe_command(audio)
+                    print(f"[v0] heard: {text!r}")
+                    session_active = _process_command(text, inject_context=True)
+
+                    if session_active:
+                        last_activation_time = time.time()
+                        session_start_time   = time.time()
+                        oww_model.reset()
+
+        except KeyboardInterrupt:
+            print("\nShutting down Akira.")
+            _cleanup_avatar()
+            break
+        except Exception as e:
+            # outer safety net — log and continue, never crash the main loop
+            print(f"[main loop] unhandled exception: {e!r}")
+            time.sleep(1.0)
+            continue
+
+    _cleanup_avatar()

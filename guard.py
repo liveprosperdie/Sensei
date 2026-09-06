@@ -53,7 +53,7 @@ Read this before adding a rule, so it lands in the right file:
   action_guard.py  BETWEEN steps. Chain-level relationships — no
                    download_image in the same chain as search_image, at most one
                    download per chain. Pure, deterministic, no model. ALREADY
-                   WIRED, at sensei.py:462.
+                   WIRED, at akira.py:462.
   guard_rules.py   WITHIN one step. Is this action known, does its parameter
                    have the right shape, and does the existing risk taxonomy
                    object to it. Deterministic, no model.
@@ -71,13 +71,13 @@ review() is never called from here by the execution flow directly. action_router
 owns every call, because "should the guard run before dispatch or alongside it"
 is a timing question and the router is what holds the tier table that answers
 it. This module still has no import of, and no effect on, executor's dispatch —
-the seam is sensei, exactly as originally predicted, not executor's ~83 call
+the seam is akira, exactly as originally predicted, not executor's ~83 call
 sites.
 
 There are four call sites, all in action_router, and they differ only in timing:
 
   guard:gated    action_router.run_guarded, gated + not yet confirmed. Blocking,
-                 execute never invoked. Reached from sensei._guard_gated, which
+                 execute never invoked. Reached from akira._guard_gated, which
                  runs BEFORE the spoken confirmation is offered, so a malformed
                  gated step is dropped instead of being read out for approval.
                  An ALLOW here grants nothing: confirmation still happens.
@@ -86,12 +86,12 @@ There are four call sites, all in action_router, and they differ only in timing:
                  execute runs only if the verdict cleared.
   guard:parallel run_guarded for Tier A / A-adjacent rollback-safe steps. Guard
                  goes to a worker thread, execute stays on the caller's thread.
-  the same, via sensei.get_akira_response's confirmed branch, which routes the
+  the same, via akira.get_akira_response's confirmed branch, which routes the
                  post-approval CLOSURE (the resolved targets, which no earlier
                  guard call has seen) back through run_guarded(confirmed=True).
 
 Entry points into that machinery, for anyone tracing coverage:
-sensei.run_actions (every chain step) and sensei.get_akira_response (both
+akira.run_actions (every chain step) and akira.get_akira_response (both
 post-confirmation shapes). verify_guard_wiring.py asserts there is no fifth
 path that reaches an executor closure without passing one of these.
 
@@ -127,24 +127,26 @@ GUARD_MAX_TOKENS = 400
 # Shorter than the servant default: this sits in front of a user-visible action,
 # and a guard that takes 90s to approve "open notepad" will be removed by the
 # user long before it ever blocks anything.
-GUARD_TIMEOUT = 20.0
+GUARD_TIMEOUT = 45.0
 
-GUARD_SYSTEM = (
-    "You are a safety guard for a voice assistant that controls a Windows PC. "
-    "You are given ONE planned action and its parameter. "
-    "Decide whether it is safe to execute automatically (ALLOW), requires explicit "
-    "user confirmation first (FLAG), or is dangerously malformed (BLOCK). "
-    "Output JSON ONLY: {\"decision\": \"allow|flag|block\", \"reasons\": [\"...\"]}."
-)
+GUARD_SYSTEM = """You are a safety guard for a voice assistant that controls a \
+Windows PC. You are given ONE planned action and its parameter. Decide whether \
+executing it is safe.
 
-GUARD_SHAPE_SYSTEM = (
-    "You are the shape and routing validator for a voice assistant. "
-    "You are given ONE planned action and its parameter. "
-    "You must output JSON with a 'decision' (allow/flag/block) and 'reasons'. "
-    "Block if the action is unknown or the parameter shape is completely wrong. "
-    "Flag if the action touches a risky system component but is structurally valid. "
-    "Output JSON ONLY: {\"decision\": \"allow|flag|block\", \"reasons\": [\"...\"]}."
-)
+Reply with JSON only, no prose:
+{"decision": "allow" | "flag" | "block", "reasons": ["short reason", ...]}
+
+  allow — routine and reversible; no confirmation needed.
+  flag  — plausible but consequential: spends money, sends or publishes \
+something, deletes or overwrites data, or changes system power state. The user \
+will be asked to confirm.
+  block — the action is malformed, contradicts its stated intent, or targets \
+something it has no business touching.
+
+Judge ONLY the action in front of you. Do not assume unstated context makes it \
+safe. If you are unsure, answer flag — never allow. Keep each reason under 12 \
+words."""
+
 _DECISIONS = {ALLOW, FLAG, BLOCK}
 
 
@@ -173,46 +175,49 @@ def _parse(payload) -> Verdict:
     return Verdict(decision, reasons, source="model")
 
 
+def review(action: str, parameter=None, *, timeout: float = GUARD_TIMEOUT,
+           label: str = "guard") -> Verdict:
+    """Validate one action step statically, then with the guard model.
+
+    Returns a Verdict; never raises. The static verdict is computed first and
+    can only be tightened by the model, never loosened — see Verdict.merge.
+
+    FAST PATH: when the static validator returns a clean ALLOW (no reasons at
+    all — parameter shape is correct, no risky keywords, risk classifier says
+    safe), the model call is skipped entirely. The model's job is to catch
+    things static rules cannot express; when static has zero concerns, the
+    model adds cost (6-16s on CPU) without information. This is the single
+    biggest latency win: routine commands like 'open_application chrome' go
+    from 6s to <1ms.
+    """
+    static = guard_rules.validate(action, parameter)
+    if static.decision == BLOCK:
+        # Already refused on shape or an unknown action name. Spending a model
+        # call to re-litigate a malformed step would cost money to reach the
+        # same answer, and a model that disagreed could not be honoured anyway.
+        return static
+
+    # FAST PATH: static cleared with zero concerns → skip the model entirely.
+    # This is safe because:
+    #   1. The static validator already checked parameter shape (guard_rules)
+    #   2. It checked risky keywords (executor.RISKY_KEYWORDS)
+    #   3. It checked akira._is_dangerous_step (the live gating classifier)
+    # When all three say "no objection", the model has nothing to add.
+    if static.decision == ALLOW and not static.reasons:
+        return static
+
     user = f"action: {action}\nparameter: {parameter!r}"
-
-    # 1. Structural Validation (via guard-shape LoRA)
-    try:
-        shape_payload, _info = servant_clients.call_json(
-            servant_clients.GUARD_SHAPE, system=GUARD_SHAPE_SYSTEM, user=user,
-            max_tokens=GUARD_MAX_TOKENS, timeout=timeout, label="guard_shape")
-        shape_verdict = _parse(shape_payload)
-    except ServantUnavailable as e:
-        kind = "truncated" if "truncated" in str(e) else "unavailable"
-        shape_verdict = _failed_closed(f"guard_shape {kind}: {e}")
-    except ServantJSONError as e:
-        shape_verdict = _failed_closed(f"guard_shape reply unusable: {e}")
-
-    if shape_verdict.decision == BLOCK:
-        # Already refused on shape or an unknown action name. Spending a second model
-        # call to re-litigate a malformed step would cost time/money.
-        return shape_verdict
-
-    # 2. Safety Judgement (via guard-safety LoRA)
     try:
         payload, _info = servant_clients.call_json(
             GUARD, system=GUARD_SYSTEM, user=user,
             max_tokens=GUARD_MAX_TOKENS, timeout=timeout, label=label)
     except ServantUnavailable as e:
-        # Includes truncation: call_openai_compatible raises ServantUnavailable
-        # on finish_reason=length. The substring test only shapes the reason
-        # text for the logs — both branches fail closed, so a wording change
-        # upstream degrades this message, not the safety property. (Same
-        # convention verify_servant_tier.py's truncation check already uses.)
         kind = "truncated" if "truncated" in str(e) else "unavailable"
         return static.merge(_failed_closed(f"guard {kind}: {e}"))
     except ServantJSONError as e:
-        # Unlike the servant tier — where a malformed reply is OUR bug and is
-        # allowed to fail the call loudly — the guard cannot afford to convert a
-        # bug into an exception the caller might not catch. It is reported in the
-        # reasons and fails closed.
-        return shape_verdict.merge(_failed_closed(f"guard reply unusable: {e}"))
+        return static.merge(_failed_closed(f"guard reply unusable: {e}"))
 
-    return shape_verdict.merge(_parse(payload))
+    return static.merge(_parse(payload))
 
 
 def available() -> bool:

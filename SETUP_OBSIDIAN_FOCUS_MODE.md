@@ -40,7 +40,7 @@ gap. So the requirement is satisfiable by anyone who updates Obsidian, and the m
 pin, the folder-dragging, and the whole version-picker problem are all moot.
 
 Latest is now also the *better* choice: 5.1.0 fixes a bug where a read immediately after
-a write could return stale content, which is exactly the read-after-write pattern Sensei
+a write could return stale content, which is exactly the read-after-write pattern Akira
 uses for note updates.
 
 </details>
@@ -64,7 +64,7 @@ OBSIDIAN_API_KEY=paste-the-key-here
 ### About the HTTPS certificate
 
 The plugin serves **HTTPS on port 27124 by default**, using a **self-signed**
-certificate. That is expected, and Sensei handles it: on first connection it fetches the
+certificate. That is expected, and Akira handles it: on first connection it fetches the
 plugin's own certificate and pins it as the trusted CA, so the connection is verified
 rather than blindly trusted.
 
@@ -82,7 +82,7 @@ OBSIDIAN_API_URL=http://127.0.0.1:27123
 
 ## Step 3 — Check it
 
-Start Sensei with Obsidian running and say:
+Start Akira with Obsidian running and say:
 
 > "Is Obsidian connected?"
 

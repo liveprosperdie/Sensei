@@ -8,7 +8,7 @@ path really overlaps. Neither proves the thing that matters most: that a real
 execution path cannot reach an executor closure without a verdict.
 
 That gap was not hypothetical. guard.py's docstring claimed "NOT WIRED YET" long
-after the wiring landed, and in the opposite direction sensei's post-confirmation
+after the wiring landed, and in the opposite direction akira's post-confirmation
 branch called `pending_execute()` directly — so the single most dangerous path in
 the app (a resolved, approved file deletion) was the one path the guard never
 saw. Both are the same class of bug: a safety layer whose reachability is
@@ -19,11 +19,11 @@ So this file asserts reachability two ways, because neither alone is enough:
   BEHAVIOURAL  drive action_router.run_guarded down all four of its timing paths
                with a counting stub in place of guard.review, and require a call
                on every one. Catches a path that stops consulting the guard.
-  STATIC (AST) scan sensei.py for closure calls that bypass the router. Catches a
+  STATIC (AST) scan akira.py for closure calls that bypass the router. Catches a
                NEW path that never goes through run_guarded at all — which a
                behavioural test of run_guarded structurally cannot see.
 
-Runs offline: no selenium, pyaudio, pywin32, network or API key. sensei is never
+Runs offline: no selenium, pyaudio, pywin32, network or API key. akira is never
 imported (it opens audio devices at import); its gate classifier is stubbed and
 its source is read by AST, the same approach verify_router and
 verify_guard_coverage already use.
@@ -55,8 +55,8 @@ def _read(fname: str) -> str:
         return fh.read()
 
 
-# ── sensei stub ─────────────────────────────────────────────────────────────
-# action_router.tier() asks sensei._is_dangerous_step whether a step is gated,
+# ── akira stub ──────────────────────────────────────────────────────────────
+# action_router.tier() asks akira._is_dangerous_step whether a step is gated,
 # resolving it lazily out of sys.modules. Installing a stub lets this gate drive
 # GATED and non-GATED deliberately instead of accepting tier()'s offline
 # fail-closed answer (always GATED), which would leave the parallel and serial
@@ -65,14 +65,14 @@ def _read(fname: str) -> str:
 DANGEROUS = {"delete_files"}
 
 
-def _install_sensei_stub() -> None:
-    mod = types.ModuleType("sensei")
+def _install_akira_stub() -> None:
+    mod = types.ModuleType("akira")
     mod._is_dangerous_step = lambda step: (
         (step.get("action") or "").strip() in DANGEROUS)
-    sys.modules["sensei"] = mod
+    sys.modules["akira"] = mod
 
 
-_install_sensei_stub()
+_install_akira_stub()
 
 import action_router  # noqa: E402
 import guard  # noqa: E402
@@ -211,8 +211,8 @@ def check_parallel_switch() -> None:
 
 # ── 4. STATIC: no path bypasses the router ──────────────────────────────────
 
-def _sensei_tree() -> ast.Module:
-    return ast.parse(_read("sensei.py"))
+def _akira_tree() -> ast.Module:
+    return ast.parse(_read("akira.py"))
 
 
 def check_navigation_waits_for_verdict() -> None:
@@ -259,7 +259,7 @@ def check_navigation_waits_for_verdict() -> None:
 
 
 def check_no_direct_closure_call() -> None:
-    """`pending_execute()` must never be invoked directly in sensei.
+    """`pending_execute()` must never be invoked directly in akira.
 
     This is the exact bypass that existed: the post-confirmation branch called
     the closure itself, so the resolved targets the executor had just computed
@@ -268,7 +268,7 @@ def check_no_direct_closure_call() -> None:
     one it is there to catch.
     """
     offenders = [
-        node.lineno for node in ast.walk(_sensei_tree())
+        node.lineno for node in ast.walk(_akira_tree())
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         and node.func.id == "pending_execute"
     ]
@@ -287,7 +287,7 @@ def check_router_is_the_only_seam() -> None:
     """
     wanted = {"run_actions", "_guard_gated", "get_akira_response"}
     found: set[str] = set()
-    for node in ast.walk(_sensei_tree()):
+    for node in ast.walk(_akira_tree()):
         if not isinstance(node, ast.FunctionDef) or node.name not in wanted:
             continue
         for inner in ast.walk(node):
@@ -312,7 +312,7 @@ def check_origin_is_recorded() -> None:
     a real closure to pending_execute must also assign pending_origin.
     """
     bad: list[int] = []
-    for node in ast.walk(_sensei_tree()):
+    for node in ast.walk(_akira_tree()):
         for field in ("body", "orelse", "finalbody"):
             block = getattr(node, field, None)
             if not isinstance(block, list):

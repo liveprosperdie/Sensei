@@ -10,14 +10,14 @@ carrying a reason a user can act on.
 
 THE FIVE LAYERS ARE SEPARATE ENV VARS, NOT ONE tier=pro SWITCH
 --------------------------------------------------------------
-    SENSEI_TIER                  default for any layer not set below
-    SENSEI_HEAD_TIER             Head (brain)
-    SENSEI_GUARD_TIER            Guard model
-    SENSEI_SERVANT_TIER          Servant for A / A-adjacent work
-    SENSEI_SERVANT_GATED_TIER    Servant for Gated work
-    SENSEI_GUARD_MODE_TIER       parallel / serial / reliability-gate policy
+    AKIRA_TIER                  default for any layer not set below
+    AKIRA_HEAD_TIER             Head (brain)
+    AKIRA_GUARD_TIER            Guard model
+    AKIRA_SERVANT_TIER          Servant for A / A-adjacent work
+    AKIRA_SERVANT_GATED_TIER    Servant for Gated work
+    AKIRA_GUARD_MODE_TIER       parallel / serial / reliability-gate policy
 
-So `SENSEI_TIER=standard SENSEI_GUARD_TIER=free` runs a Standard Head against a
+So `AKIRA_TIER=standard AKIRA_GUARD_TIER=free` runs a Standard Head against a
 Free Guard with no code change, which is the stated requirement.
 
 MIXING IS UNRESTRICTED BUT THREE COMBINATIONS ARE GENUINELY BROKEN
@@ -27,19 +27,16 @@ combinations still run, because a maintainer testing a specific pairing needs
 them to. The concrete failures:
 
 1. HEAD=free + SERVANT=free/standard  ->  ROUTING WORKS, SERVANT WORK DOES NOT.
-   This entry USED to read "nothing works", because Free Head was an inert slot
-   with no Gemini routing adapter. That is no longer true: gemini_head.py seats
-   Gemini as a real Head, so with GEMINI_API_KEY set the routing layer resolves
-   and voice turns are planned normally.
+   Free Head routes via Groq (GROQ_MODEL in .env, e.g. qwen/qwen3.6-27b) with
+   GROQ_API_KEY set. Gemini has been completely removed from use. Voice turns
+   are classified and planned with sub-second latency.
 
    What remains genuinely broken is the SERVANT half — Free/Standard Servant is
    still inert (no local runtime, and servant_allowed() refuses to escalate to
    hosted inference on those tiers). So Akira can work out what to do and run
    anything the executor handles directly, but any step needing servant
    inference cannot serve. Free tier is now PARTIALLY usable rather than
-   entirely unusable, and the Free Head has a hard per-day request cap
-   (gemini_quota) shared with content generation — roughly 225 turns/day at the
-   conservative default, which caching cannot extend.
+   entirely unusable.
 
 2. GUARD_MODE=standard|pro + SERVANT_GATED=free  ->  CONTRADICTION.
    Guard mode enables the serial Gated path while the Servant layer says Gated
@@ -59,7 +56,7 @@ WHY THE LOCAL ROWS ARE INERT AND STAY INERT
 -------------------------------------------
 No local inference runtime exists anywhere in this codebase and no fine-tuning
 dataset exists, so `LocalModel.resolve()` ALWAYS returns Unavailable. Setting
-SENSEI_LOCAL_MODEL_PATH changes the reason text, never the availability — a slot
+AKIRA_LOCAL_MODEL_PATH changes the reason text, never the availability — a slot
 that flipped to "available" because a path string was set would be a fake
 success path, and the first real call would fail somewhere far from the config
 that caused it. Wiring a runtime is separate future work; this is the seam it
@@ -71,6 +68,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from enum import Enum
+from dotenv import load_dotenv
+
+load_dotenv()
 
 import reliability
 import servant_clients
@@ -88,16 +88,16 @@ class Layer(str, Enum):
 
 
 _ENV = {
-    Layer.HEAD: "SENSEI_HEAD_TIER",
-    Layer.GUARD: "SENSEI_GUARD_TIER",
-    Layer.SERVANT: "SENSEI_SERVANT_TIER",
-    Layer.SERVANT_GATED: "SENSEI_SERVANT_GATED_TIER",
-    Layer.GUARD_MODE: "SENSEI_GUARD_MODE_TIER",
+    Layer.HEAD: "AKIRA_HEAD_TIER",
+    Layer.GUARD: "AKIRA_GUARD_TIER",
+    Layer.SERVANT: "AKIRA_SERVANT_TIER",
+    Layer.SERVANT_GATED: "AKIRA_SERVANT_GATED_TIER",
+    Layer.GUARD_MODE: "AKIRA_GUARD_MODE_TIER",
 }
 
 
 def plan_for(layer: Layer) -> str:
-    """Resolve one layer's plan: its own env var, else SENSEI_TIER, else free.
+    """Resolve one layer's plan: its own env var, else AKIRA_TIER, else free.
 
     Defaults to FREE rather than PRO deliberately. An unset or misspelled env
     var must not silently grant the most capable tier — the failure direction
@@ -105,7 +105,7 @@ def plan_for(layer: Layer) -> str:
     are now unlocked".
     """
     raw = (os.environ.get(_ENV[layer])
-           or os.environ.get("SENSEI_TIER") or FREE).strip().lower()
+           or os.environ.get("AKIRA_TIER") or FREE).strip().lower()
     return raw if raw in _PLANS else FREE
 
 
@@ -136,6 +136,7 @@ class HeadSpec:
     key_env: str
     daily_budget_usd: float | None   # None = unmetered
     priority: bool
+    daily_turns_cap: int = 0
 
     def __bool__(self) -> bool:
         return True
@@ -194,8 +195,8 @@ class LocalModel:
     usable handle, because there is no runtime to hand back.
     """
     plan: str
-    path_env: str = "SENSEI_LOCAL_MODEL_PATH"
-    adapter_env: str = "SENSEI_LOCAL_ADAPTER_PATH"
+    path_env: str = "AKIRA_LOCAL_MODEL_PATH"
+    adapter_env: str = "AKIRA_LOCAL_ADAPTER_PATH"
     adapters: bool = False
 
     @property
@@ -227,53 +228,35 @@ class LocalModel:
 def head(plan: str | None = None) -> HeadSpec | Unavailable:
     """Head (brain) for a plan.
 
-    FREE IS LIVE. It was an inert slot until the Gemini routing adapter existed;
-    gemini_head.py now provides the three things the Head role needs and
-    gemini_content.py never had — strict JSON-schema output matching
-    ROUTING_SCHEMA, the action-name grammar, and a documented prompt-caching
-    story (Gemini's implicit prefix caching, see that module's docstring).
+    FREE TIER — NO SERVER INVOLVEMENT AT ALL
+    Free tier is intentionally excluded from the gateway — no caps, no server
+    round-trip, no auth required. Free Head routes directly to its local configured
+    model (e.g. Groq with GROQ_MODEL in .env).
 
-    The only remaining way for Free Head to be Unavailable is CONFIGURATION:
-    no GEMINI_API_KEY. That is a state the user can fix, and the reason says how.
-    Readiness is a config check only — no network call — because this function
-    is called from a startup banner and a status command.
-
-    Still no silent escalation to paid Claude, on either path: a user who chose
-    Free to avoid spending money must not be billed for crossing a line they
-    never saw. Mid-session cap exhaustion is handled in gemini_head (spoken
-    refusal; opt-in escalation only), not here — an exhausted daily allowance
-    means "set up and used up", which is not the same as "not set up", and
-    reporting it as layer-level unavailability would conflate the two.
+    STANDARD & PRO TIERS — SERVER GATED WITH GROQ FALLBACK
+    Standard: 30 turns/day Claude head.
+    Pro: 53 turns/day Claude head (priority routing).
+    Both fall back to Groq free API when their Claude daily cap is reached.
     """
     plan = plan or plan_for(Layer.HEAD)
     if plan == FREE:
-        # Imported lazily: gemini_head pulls in requests, and tiers is imported
-        # by headless verification that must not require it at module scope.
-        try:
-            import gemini_head
-        except Exception as e:                                    # noqa: BLE001
+        groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+        if not groq_key:
             return Unavailable("Head", FREE,
-                               f"the Gemini Head adapter could not be imported "
-                               f"({e!r}). Set SENSEI_HEAD_TIER=standard to use "
-                               f"paid Claude.")
-        ok, reason = gemini_head.readiness()
-        if not ok:
-            return Unavailable("Head", FREE, reason)
-        return HeadSpec(FREE, "gemini", "GEMINI_HEAD_MODEL", "GEMINI_API_KEY",
-                        # 0.0, not None: None means UNMETERED in this dataclass,
-                        # and the free tier is the opposite of unmetered. It is
-                        # capped in REQUESTS PER DAY rather than dollars, which
-                        # no USD field can express — gemini_quota owns that
-                        # count. 0.0 states the true dollar budget: zero.
+                               "GROQ_API_KEY is not set in .env. Set GROQ_API_KEY to use the Free Head.")
+        return HeadSpec(FREE, "groq", "GROQ_MODEL", "GROQ_API_KEY",
                         daily_budget_usd=0.0,
-                        priority=False)
+                        priority=False,
+                        daily_turns_cap=0)
     if plan == STANDARD:
         return HeadSpec(STANDARD, "anthropic", "CLAUDE_MODEL", "ANTHROPIC_API_KEY",
-                        daily_budget_usd=_budget("SENSEI_HEAD_BUDGET_USD", 5.0),
-                        priority=False)
+                        daily_budget_usd=_budget("AKIRA_HEAD_BUDGET_USD", 5.0),
+                        priority=False,
+                        daily_turns_cap=30)
     return HeadSpec(PRO, "anthropic", "CLAUDE_MODEL", "ANTHROPIC_API_KEY",
-                    daily_budget_usd=_budget("SENSEI_HEAD_BUDGET_USD_PRO", 25.0),
-                    priority=True)
+                    daily_budget_usd=_budget("AKIRA_HEAD_BUDGET_USD_PRO", 25.0),
+                    priority=True,
+                    daily_turns_cap=53)
 
 
 def guard(plan: str | None = None):
@@ -363,7 +346,7 @@ def servant_allowed(plan: str | None = None) -> Unavailable | None:
         "servant", plan,
         f"{local.reason} The {plan} tier has no hosted servant fallback by "
         f"design — it is not permitted to spend money on hosted inference. "
-        f"Set SENSEI_SERVANT_TIER=pro and a TOGETHER_API_KEY/FIREWORKS_API_KEY "
+        f"Set AKIRA_SERVANT_TIER=pro and a TOGETHER_API_KEY/FIREWORKS_API_KEY "
         f"to allow hosted servant calls.")
 
 
@@ -394,7 +377,7 @@ def servant_gated(plan: str | None = None):
         return Unavailable(
             "Gated actions", FREE,
             "Gated actions are not available on the Free tier. Set "
-            "SENSEI_SERVANT_GATED_TIER=standard to enable them with the full "
+            "AKIRA_SERVANT_GATED_TIER=standard to enable them with the full "
             "confirmation flow.")
     return GatedSeat(plan, adapters=(plan == PRO))
 
@@ -412,11 +395,11 @@ def guard_mode(plan: str | None = None) -> GuardMode:
                          reliability_gate=False)
     if plan == STANDARD:
         return GuardMode(STANDARD, parallel=True, serial_gated=True,
-                         reliability_gate=_flag("SENSEI_RELIABILITY_GATE", False))
+                         reliability_gate=_flag("AKIRA_RELIABILITY_GATE", False))
     # Pro: the gate is ON by default here and configurable, so the same bar can
     # be applied to Standard for testing without a code change.
     return GuardMode(PRO, parallel=True, serial_gated=True,
-                     reliability_gate=_flag("SENSEI_RELIABILITY_GATE", True))
+                     reliability_gate=_flag("AKIRA_RELIABILITY_GATE", True))
 
 
 # ── The one composite decision ───────────────────────────────────────────────
@@ -516,15 +499,11 @@ def warnings() -> list[str]:
                  plan_for(Layer.GUARD))
 
     if h == FREE and s in (FREE, STANDARD):
-        # No longer "nothing will work" — the Free Head is live. Reporting a
-        # stale catastrophic warning would train the operator to ignore this
-        # list, which is worse than not printing it at all.
         out.append(
-            "HEAD=free + SERVANT=%s: routing works (Gemini Head), but the %s "
+            "HEAD=free + SERVANT=%s: routing works (Groq Head), but the %s "
             "Servant may not escalate to hosted inference and has no local "
-            "runtime, so any step needing servant inference cannot serve. The "
-            "Free Head is also capped per day (shared with content generation). "
-            "Set SENSEI_SERVANT_TIER=pro for servant work." % (s, s))
+            "runtime, so any step needing servant inference cannot serve. "
+            "Set AKIRA_SERVANT_TIER=pro for servant work." % (s, s))
     if sg == FREE and gm in (STANDARD, PRO):
         out.append(
             f"GUARD_MODE={gm} + SERVANT_GATED=free: the serial Gated path and "

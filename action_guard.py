@@ -2,7 +2,7 @@
 action_guard.py — hard, code-level rules for action chains.
 
 The AKIRA_PROMPT states these rules, but prompts are conventions — this
-module is the enforcement. sensei.run_actions() sanitizes every chain
+module is the enforcement. akira.run_actions() sanitizes every chain
 through here BEFORE anything executes, so no LLM output can violate:
 
   1. download_image NEVER runs in the same chain as search_image.
