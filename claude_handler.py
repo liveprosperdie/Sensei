@@ -168,15 +168,19 @@ def response_text(message) -> str:
     return "\n".join(parts)
 
 
-client = (anthropic.Anthropic(
-    api_key=os.environ.get("ANTHROPIC_API_KEY"),
-    # Default for the FAST path (routing, narration, confirmation, summaries).
-    # These are all small max_tokens calls that sit between the user speaking
-    # and Akira answering, so they must fail fast rather than hang — 30s of
-    # silence is already too much dead air on a voice interface.
-    timeout=30.0,
-    max_retries=1,
-) if anthropic is not None else None)
+def _init_anthropic_client():
+    if anthropic is None:
+        return None
+    key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if not key:
+        return None
+    try:
+        return anthropic.Anthropic(api_key=key, timeout=30.0, max_retries=1)
+    except Exception as e:
+        print(f"[claude_handler] Anthropic client initialization skipped: {e}")
+        return None
+
+client = _init_anthropic_client()
 
 # ── Timeouts for the reasoning tier ──────────────────────────────────────────
 # The reasoning passes are a different shape from the fast path: they generate
@@ -1677,11 +1681,16 @@ def _head_dispatch() -> tuple[str, object]:
     if prov_env == "groq":
         return "groq", None
 
+    has_anthropic = bool((os.environ.get("ANTHROPIC_API_KEY") or "").strip())
+    has_groq = bool((os.environ.get("GROQ_API_KEY") or "").strip())
+    if not has_anthropic and has_groq:
+        return "groq", None
+
     try:
         import tiers
     except Exception as e:                                        # noqa: BLE001
-        print(f"[routing_call] tiers unavailable, using Claude: {e!r}")
-        return "claude", None
+        print(f"[routing_call] tiers unavailable: {e!r}")
+        return "groq" if has_groq else ("claude", None)
 
     try:
         plan = tiers.plan_for(tiers.Layer.HEAD)
@@ -1691,6 +1700,8 @@ def _head_dispatch() -> tuple[str, object]:
         if getattr(spec, "provider", None) == "groq":
             return "groq", None
         if plan != tiers.FREE:
+            if not has_anthropic and has_groq:
+                return "groq", None
             return "claude", None
         return "refuse", "Gemini free API has been decommissioned. Free Head requires GROQ_API_KEY in .env."
     except Exception as e:                                        # noqa: BLE001
