@@ -609,7 +609,7 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         return _emit("netflix_control", f"search|{m.group(1).strip()}")
 
     # Amazon Search
-    m = re.search(r'(?:search|find|buy|look\s+up)\s+(.+?)\s+(?:on|in|through|via)\s+amazon', text_clean)
+    m = re.search(r'(?:search|find|buy|look\s+up)\s+(?:for\s+)?(.+?)\s+(?:on|in|through|via)\s+(?:this\s+)?amazon(?:\s+window|\s+tab|\s+page)?', text_clean)
     if m:
         return _emit("amazon_control", f"search|{m.group(1).strip()}")
 
@@ -767,6 +767,14 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         return _emit("open_system_tool", tool)
 
     # ── 23. YouTube Control ──────────────────────────────────────────────
+    if re.search(r'(?:skip|next)\s+(?:this\s+)?(?:out|video|song|track)?', text_clean):
+        return _emit("youtube_control", "next")
+    if re.search(r'(?:like|dislike|thumbs\s+up|thumbs\s+down)\s+(?:this\s+)?(?:video|song|track)?', text_clean):
+        return _emit("youtube_control", "like" if ("like" in text_clean or "up" in text_clean) else "dislike")
+    if re.search(r'(?:open|show|go\s+to)\s+(?:the\s+)?comments?\s*(?:section)?', text_clean):
+        return _emit("youtube_control", "comments")
+    if re.search(r'(?:sign\s+in|log\s+in)\s+(?:to\s+)?youtube', text_clean):
+        return _emit("youtube_control", "sign_in")
     m = re.search(r'(?:on\s+)?youtube\s+(?:video\s+)?(pause|play|resume|stop|next|skip|previous|mute|unmute|fullscreen|full\s*screen)', text_clean)
     if m:
         return _emit("youtube_control", m.group(1).strip().replace(" ", ""))
