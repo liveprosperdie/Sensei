@@ -585,6 +585,38 @@ def _verify_seek(browser, before: float | None, expect_delta: float) -> bool:
     return ok
 
 
+def _sync_chrome_profile(dest_dir: str):
+    """Sync logged-in accounts, preferences, and cookies from main Chrome profile into Akira Chrome profile."""
+    local_appdata = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+    main_profile_src = os.path.join(local_appdata, "Google", "Chrome", "User Data", "Default")
+    if not os.path.exists(main_profile_src):
+        return
+    dest_profile = os.path.join(dest_dir, "Default")
+    os.makedirs(dest_profile, exist_ok=True)
+    items = ["Preferences", "Login Data", "Web Data", "Network"]
+    for item in items:
+        src = os.path.join(main_profile_src, item)
+        dst = os.path.join(dest_profile, item)
+        if not os.path.exists(src):
+            continue
+        try:
+            if os.path.isdir(src):
+                os.makedirs(dst, exist_ok=True)
+                for f in os.listdir(src):
+                    if f.endswith("-journal") or f.endswith(".lock") or f == "LOCK":
+                        continue
+                    sf, df = os.path.join(src, f), os.path.join(dst, f)
+                    if os.path.isfile(sf):
+                        try:
+                            shutil.copy2(sf, df)
+                        except Exception:
+                            pass
+            else:
+                shutil.copy2(src, dst)
+        except Exception:
+            pass
+
+
 def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
     binary_name = os.path.basename(binary_path).lower()
     if not _port_ready(port):
@@ -600,6 +632,7 @@ def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
             # Use dedicated Akira profile to avoid profile lock conflict with user's open personal Chrome
             local_appdata = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
             user_data_dir = os.path.join(local_appdata, "Akira", "AkiraChromeProfile")
+            _sync_chrome_profile(user_data_dir)
         
         profile_name = os.environ.get("CHROME_PROFILE", "Default")
         os.makedirs(user_data_dir, exist_ok=True)
@@ -1130,6 +1163,39 @@ def youtube_control(parameter: str) -> str:
                 "paused": "Paused.",
                 "already_playing": "It's already playing.",
                 "playing": "Playing."}.get(state, "Done.")
+
+    if param in ("next", "next video", "skip"):
+        browser.execute_script("const btn = document.querySelector('.ytp-next-button'); if(btn) btn.click();")
+        return "Skipped to next video."
+
+    if param in ("like", "like video", "like song"):
+        browser.execute_script("""
+            const btn = document.querySelector('like-button-view-model button, button[title*="like"], button[aria-label*="like"]');
+            if (btn) btn.click();
+        """)
+        return "Liked the video."
+
+    if param in ("dislike", "dislike video"):
+        browser.execute_script("""
+            const btn = document.querySelector('dislike-button-view-model button, button[title*="dislike"], button[aria-label*="dislike"]');
+            if (btn) btn.click();
+        """)
+        return "Disliked the video."
+
+    if param in ("comments", "comment", "comments section", "open comments"):
+        browser.execute_script("""
+            const section = document.querySelector('#comments, ytd-comments');
+            if (section) { section.scrollIntoView({behavior: 'smooth'}); }
+        """)
+        return "Scrolled to comments section."
+
+    if param in ("sign_in", "signin", "login", "log in"):
+        browser.execute_script("""
+            const btn = document.querySelector('ytd-masthead a[href*="accounts.google.com"], a[aria-label*="Sign in"]');
+            if (btn) btn.click();
+            else window.location.href = "https://accounts.google.com";
+        """)
+        return "Opening YouTube sign-in page."
 
     if param == "skip ad":
         browser.execute_script("""
@@ -5602,6 +5668,7 @@ _ACTION_MAP = {
     "write_text":    write_clipboard,   # "write text in notepad" → clipboard
     "type_text":     write_clipboard,   # "type this text" → clipboard
     "insert_text":   write_clipboard,   # "insert text" → clipboard
+    "click_element": _handle_click,     # "click element" → _handle_click
     "file_search":   search_file,       # "find a file named X" → search_file
     "folder_search": search_file,       # "find a folder named X" → search_file
 }

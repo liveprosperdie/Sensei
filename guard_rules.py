@@ -253,6 +253,7 @@ ACTION_RULES: dict[str, Rule] = {
     "type_text": TEXT,        # → write_clipboard
     "insert_text": TEXT,      # → write_clipboard
     "fill_input": SUB_MULTI,  # → fill
+    "click_element": TEXT,    # → click
     "file_search": TEXT,      # → search_file
     "folder_search": TEXT,    # → search_file
 }
