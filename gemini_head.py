@@ -117,6 +117,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 from dataclasses import dataclass, field
 
 import requests
@@ -597,3 +598,163 @@ def summary() -> dict:
             "quota": gemini_quota.snapshot(),
             "escalate_on_cap": escalation_opted_in(),
             "capabilities": dict(_supports)}
+
+
+# ── Sub-millisecond Fast Pattern Pre-Router & Cloud Fallbacks ────────────────
+
+def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
+    """Sub-millisecond pattern pre-router for unambiguous voice commands.
+    Returns a Claude-shaped HeadReply or None if LLM routing is needed."""
+    if not messages:
+        return None
+    last_msg = messages[-1]
+    if last_msg.get("role") != "user":
+        return None
+    raw_text = (last_msg.get("content") or "").strip()
+    if not raw_text or raw_text.startswith("[ACTION RESULT"):
+        return None
+    text = raw_text.lower().rstrip(".!?,")
+
+    # App launches
+    m_open = re.match(r"^(?:open|launch|start|go to|visit)\s+(.+)$", text)
+    if m_open:
+        target = m_open.group(1).strip()
+        if target in ("chrome", "google chrome", "browser", "brave", "edge"):
+            return _reply({"mode": "command", "actions": [{"action": "open_application", "parameter": target}]})
+        if target in ("notepad", "calculator", "task manager", "cmd", "terminal", "powershell", "spotify", "discord", "vscode", "vs code", "code"):
+            return _reply({"mode": "command", "actions": [{"action": "open_application", "parameter": target}]})
+        if target in ("youtube", "github", "google", "gmail", "netflix", "amazon", "flipkart", "instagram", "reddit", "twitter", "x"):
+            return _reply({"mode": "command", "actions": [{"action": "open_site_tab", "parameter": target}]})
+        if target.startswith("http://") or target.startswith("https://") or "." in target:
+            return _reply({"mode": "command", "actions": [{"action": "open_site_tab", "parameter": target}]})
+        return _reply({"mode": "command", "actions": [{"action": "open_application", "parameter": target}]})
+
+    # Bluetooth
+    if "bluetooth" in text:
+        if any(w in text for w in ("on", "enable", "turn on", "start")):
+            return _reply({"mode": "command", "actions": [{"action": "system_control", "parameter": "bluetooth_on"}]})
+        if any(w in text for w in ("off", "disable", "turn off", "stop")):
+            return _reply({"mode": "command", "actions": [{"action": "system_control", "parameter": "bluetooth_off"}]})
+
+    # WiFi
+    if "wifi" in text or "wi-fi" in text:
+        if any(w in text for w in ("on", "enable", "turn on")):
+            return _reply({"mode": "command", "actions": [{"action": "system_control", "parameter": "wifi_on"}]})
+        if any(w in text for w in ("off", "disable", "turn off")):
+            return _reply({"mode": "command", "actions": [{"action": "system_control", "parameter": "wifi_off"}]})
+
+    # Volume
+    m_vol = re.search(r"volume\s+(?:to\s+)?(\d+)", text)
+    if m_vol:
+        return _reply({"mode": "command", "actions": [{"action": "system_control", "parameter": f"volume:{m_vol.group(1)}"}]})
+    if "mute" in text and "volume" in text:
+        return _reply({"mode": "command", "actions": [{"action": "system_control", "parameter": "volume:0"}]})
+    if "max volume" in text or "maximum volume" in text:
+        return _reply({"mode": "command", "actions": [{"action": "system_control", "parameter": "volume:100"}]})
+
+    # Brightness
+    m_bright = re.search(r"brightness\s+(?:to\s+)?(\d+)", text)
+    if m_bright:
+        return _reply({"mode": "command", "actions": [{"action": "system_control", "parameter": f"brightness:{m_bright.group(1)}"}]})
+    if "max brightness" in text or "maximum brightness" in text:
+        return _reply({"mode": "command", "actions": [{"action": "system_control", "parameter": "brightness:100"}]})
+
+    # Screenshot
+    if "screenshot" in text:
+        return _reply({"mode": "command", "actions": [{"action": "system_control", "parameter": "screenshot"}]})
+
+    # Tabs
+    if text in ("open new tab", "new tab"):
+        return _reply({"mode": "command", "actions": [{"action": "new_tab", "parameter": ""}]})
+    if text in ("close tab", "close current tab"):
+        return _reply({"mode": "command", "actions": [{"action": "close_tab", "parameter": ""}]})
+    if text in ("list open tabs", "list tabs", "show open tabs"):
+        return _reply({"mode": "command", "actions": [{"action": "list_tabs", "parameter": ""}]})
+
+    return None
+
+
+def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list[dict], schema: dict | None = None) -> HeadReply | None:
+    """Route via Groq Cloud API using OpenAI-compatible chat completion."""
+    if not groq_key:
+        return None
+    model = (os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
+    sys_text = "\n\n".join(b["text"] for b in system_blocks if isinstance(b, dict) and b.get("text"))
+    api_msgs = [{"role": "system", "content": sys_text}]
+    for m in messages:
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        content = m.get("content") or ""
+        if isinstance(content, list):
+            content = "".join(b.get("text", "") for b in content if isinstance(b, dict))
+        if content:
+            api_msgs.append({"role": role, "content": content})
+
+    body = {
+        "model": model,
+        "messages": api_msgs,
+        "temperature": 0.0,
+        "max_tokens": 1600,
+        "response_format": {"type": "json_object"}
+    }
+    headers = {
+        "Authorization": f"Bearer {groq_key}",
+        "Content-Type": "application/json"
+    }
+    try:
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=body, timeout=12)
+        if r.status_code == 200:
+            data = r.json()
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
+            finish = choice.get("finish_reason", "stop")
+            stop_reason = "max_tokens" if finish == "length" else "end_turn"
+            print(f"[gemini_head] routed via Groq model={model}")
+            return HeadReply([_TextBlock(content)], stop_reason, provider="groq")
+        else:
+            print(f"[gemini_head] Groq API returned HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[gemini_head] Groq API request failed: {e}")
+    return None
+
+
+def _route_via_openrouter(openrouter_key: str, messages: list[dict], system_blocks: list[dict], schema: dict | None = None) -> HeadReply | None:
+    """Route via OpenRouter Cloud API."""
+    if not openrouter_key:
+        return None
+    model = (os.environ.get("OPENROUTER_MODEL") or "openrouter/free").strip()
+    sys_text = "\n\n".join(b["text"] for b in system_blocks if isinstance(b, dict) and b.get("text"))
+    api_msgs = [{"role": "system", "content": sys_text}]
+    for m in messages:
+        role = "assistant" if m.get("role") == "assistant" else "user"
+        content = m.get("content") or ""
+        if isinstance(content, list):
+            content = "".join(b.get("text", "") for b in content if isinstance(b, dict))
+        if content:
+            api_msgs.append({"role": role, "content": content})
+
+    body = {
+        "model": model,
+        "messages": api_msgs,
+        "temperature": 0.0,
+        "max_tokens": 1600,
+        "response_format": {"type": "json_object"}
+    }
+    headers = {
+        "Authorization": f"Bearer {openrouter_key}",
+        "Content-Type": "application/json"
+    }
+    try:
+        r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=12)
+        if r.status_code == 200:
+            data = r.json()
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
+            finish = choice.get("finish_reason", "stop")
+            stop_reason = "max_tokens" if finish == "length" else "end_turn"
+            print(f"[gemini_head] routed via OpenRouter model={model}")
+            return HeadReply([_TextBlock(content)], stop_reason, provider="openrouter")
+        else:
+            print(f"[gemini_head] OpenRouter API returned HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[gemini_head] OpenRouter API request failed: {e}")
+    return None
