@@ -217,12 +217,34 @@ _EXTRACT_SCRIPT = """
             });
         } catch(e) {}
 
-        // 4. Buttons (explicit and implicit)
+        // 4. Buttons (explicit and implicit) — including aria-label-only icon buttons
+        //    (YouTube subscribe/like/thumbs-up, etc. have NO innerText but a rich aria-label)
         try {
             document.querySelectorAll('button, [role="button"], [onclick], input[type="button"], input[type="submit"]').forEach(el => {
                 if (!isVisible(el)) return;
-                const text = getText(el);
-                addElement(el, 'button', text || 'button', null);
+                // getText already pulls aria-label as a fallback, but force it
+                // here for icon-only buttons where innerText is empty.
+                const ariaLbl = (el.getAttribute('aria-label') || el.getAttribute('data-tooltip-text') || el.getAttribute('title') || '').trim();
+                const text = getText(el) || ariaLbl || 'button';
+                addElement(el, 'button', text, null);
+            });
+        } catch(e) {}
+
+        // 4b. ARIA-label-only clickable elements NOT already captured above
+        //     Catches YouTube subscribe button, thumbs-up, share, etc.
+        try {
+            document.querySelectorAll('[aria-label]:not([data-akira-index])').forEach(el => {
+                if (!isVisible(el)) return;
+                const tag = el.tagName.toLowerCase();
+                // Only pick up things that are obviously interactive
+                const isClickable = tag === 'button' || tag === 'a' ||
+                    el.getAttribute('role') === 'button' ||
+                    el.hasAttribute('onclick') ||
+                    el.getAttribute('tabindex') === '0';
+                if (!isClickable) return;
+                const lbl = (el.getAttribute('aria-label') || '').trim();
+                if (!lbl) return;
+                addElement(el, 'button', lbl, el.href || null);
             });
         } catch(e) {}
 

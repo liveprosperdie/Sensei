@@ -589,12 +589,25 @@ def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
                     break
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-        profile_dir = os.path.join(os.environ["LOCALAPPDATA"], "Sensei", "AkiraChromeProfile")
-        os.makedirs(profile_dir, exist_ok=True)
+        # FIX: use the real Chrome user profile so the user's Google account,
+        # saved passwords, and extensions are available.
+        # Set AKIRA_CHROME_PROFILE in .env to a profile directory name like
+        # "Default" or "Profile 1". Falls back to the real Default profile.
+        # DO NOT use a Sensei-specific scratch dir — that creates a guest session.
+        env_profile = (os.environ.get("AKIRA_CHROME_PROFILE") or "").strip()
+        is_brave = "brave" in binary_name
+        if is_brave:
+            base_user_data = os.path.join(os.environ["LOCALAPPDATA"],
+                                          "BraveSoftware", "Brave-Browser", "User Data")
+        else:
+            base_user_data = os.path.join(os.environ["LOCALAPPDATA"],
+                                          "Google", "Chrome", "User Data")
+        profile_arg = env_profile if env_profile else "Default"
         subprocess.Popen([
             binary_path,
             f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile_dir}",
+            f"--user-data-dir={base_user_data}",
+            f"--profile-directory={profile_arg}",
             "--no-first-run",
             "--disable-session-crashed-bubble",
             "--restore-last-session=false",
@@ -5055,16 +5068,39 @@ def new_tab(parameter: str | None = None) -> str:
 
 
 def open_site_tab(parameter: str) -> str:
-    """Opens the requested site in Akira's tab if it's still blank/unused,
-    otherwise in a NEW tab, separate from the user's existing tabs."""
+    """Opens the requested site. Reuses an existing tab showing that domain
+    before creating a new one, so repeated 'open GitHub' doesn't pile up tabs."""
     browser = get_browser(_last_browser_name)
     url = resolve_site_url(parameter.strip())
+    site_key = parameter.strip().lower()
+
+    # FIX: scan ALL open handles for a tab already showing this domain/site.
+    # If found, switch to it and reuse it — no new tab needed.
+    try:
+        target_domain = url.split("//")[-1].split("/")[0].replace("www.", "")
+        current_handle = browser.current_window_handle
+        for handle in browser.window_handles:
+            try:
+                browser.switch_to.window(handle)
+                tab_url = browser.current_url or ""
+                if target_domain and target_domain in tab_url:
+                    print(f"[open_site_tab] reusing existing tab for {site_key}: {tab_url[:60]}")
+                    browser._akira_tab = handle
+                    return f"Switched to existing {parameter} tab."
+            except Exception:
+                continue
+        # Restore the handle we started from before deciding to open a new one
+        try:
+            browser.switch_to.window(current_handle)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[open_site_tab] tab scan error: {e}")
 
     # Reuse Akira's blank working tab instead of creating a duplicate.
-    # _ensure_akira_tab eagerly creates an about:blank tab; if it's still
-    # unused, navigate it directly rather than opening yet another tab.
     akira_tab = getattr(browser, "_akira_tab", None)
     if akira_tab and akira_tab in browser.window_handles:
+        original_handle = None
         try:
             original_handle = browser.current_window_handle
         except Exception:
@@ -5091,6 +5127,7 @@ def open_site_tab(parameter: str) -> str:
             return f"Opened {parameter} in a new tab."
         time.sleep(0.3)
     return f"Tried to open {parameter} but couldn't confirm the new tab."
+
 
 
 def list_open_tabs() -> str:
@@ -5139,31 +5176,161 @@ def close_tab(parameter: str) -> str:
     return f"Couldn't find an open tab matching '{parameter}' to close."
 
 
+
 def fill(parameter: str) -> str:
+    """fill|field description|text to type[|submit]
+
+    Robust field finder: tries element_matcher first, then falls back to
+    semantic JS selectors (email, password, search, textarea) so login forms
+    work even when the DOM index miss-assigns the field.
+    """
     if not parameter or "|" not in parameter:
         return "I need a field description and text to type."
     parts = parameter.split("|")
     instruction, text = parts[0].strip(), parts[1].strip()
     should_submit = len(parts) > 2 and parts[2].strip().lower() == "submit"
     browser = get_browser(_last_browser_name)
-    elements = extract_interactive_elements(browser, max_elements=100)
-    from element_matcher import find_element_index
-    index = find_element_index(elements, instruction)
-    if index is None or index >= len(elements):
-        return "Couldn't find that field."
-    el = browser.find_elements(By.CSS_SELECTOR, f'[data-akira-index="{index}"]')
-    if not el:
-        return "Couldn't locate field in DOM."
+
+    el_found = None
+
+    # --- Primary: element_matcher via data-akira-index ---
     try:
-        el[0].click()
-        el[0].clear()
-        el[0].send_keys(text)
-        if should_submit:
-            from selenium.webdriver.common.keys import Keys
-            el[0].send_keys(Keys.RETURN)
+        elements = extract_interactive_elements(browser, max_elements=100)
+        from element_matcher import find_element_index
+        index = find_element_index(elements, instruction)
+        if index is not None and index < len(elements):
+            candidates = browser.find_elements(By.CSS_SELECTOR,
+                                               f'[data-akira-index="{index}"]')
+            if candidates:
+                el_found = candidates[0]
     except Exception as e:
-        return f"Couldn't type: {e}"
-    return f"Typed '{text}'." + (" Submitted." if should_submit else "")
+        print(f"[fill] element_matcher failed: {e}")
+
+    # --- Fallback: semantic JS for common field types ---
+    if el_found is None:
+        hint = instruction.lower()
+        # Map spoken field names to CSS selector priority lists
+        _FIELD_SELECTORS = [
+            # Email / username
+            ('email',    ['input[type="email"]', 'input[name="email"]',
+                          'input[autocomplete="email"]', 'input[placeholder*="email" i]',
+                          'input[name="username"]', 'input[id*="email" i]']),
+            # Password
+            ('password', ['input[type="password"]', 'input[name="password"]',
+                          'input[id*="password" i]']),
+            # Search / query
+            ('search',   ['input[type="search"]', 'input[name="q"]',
+                          'input[name="search"]', 'input[placeholder*="search" i]']),
+            # Generic text / message box
+            ('message',  ['textarea', 'div[contenteditable="true"]',
+                          'input[type="text"]']),
+            ('text',     ['textarea', 'div[contenteditable="true"]',
+                          'input[type="text"]']),
+        ]
+        for keyword, selectors in _FIELD_SELECTORS:
+            if keyword not in hint:
+                continue
+            for sel in selectors:
+                try:
+                    cands = browser.find_elements(By.CSS_SELECTOR, sel)
+                    visible = [c for c in cands
+                               if c.is_displayed() and c.is_enabled()]
+                    if visible:
+                        el_found = visible[0]
+                        print(f"[fill] fallback matched '{sel}' for hint={hint!r}")
+                        break
+                except Exception:
+                    continue
+            if el_found:
+                break
+
+    if el_found is None:
+        return f"Couldn't find the '{instruction}' field on this page."
+
+    # --- Type: ActionChains click, triple-select-all, then paste via clipboard ---
+    from selenium.webdriver.common.action_chains import ActionChains
+    from selenium.webdriver.common.keys import Keys
+    try:
+        ActionChains(browser).move_to_element(el_found).click().perform()
+        time.sleep(0.15)
+        # Triple Ctrl+A to select ALL existing text before overwriting
+        ActionChains(browser).key_down(Keys.CONTROL).send_keys('a')\
+            .key_up(Keys.CONTROL).perform()
+        time.sleep(0.05)
+        el_found.send_keys(text)
+        if should_submit:
+            el_found.send_keys(Keys.RETURN)
+    except Exception as e:
+        return f"Couldn't type into field: {e}"
+    return f"Typed into '{instruction}'." + (" Submitted." if should_submit else "")
+
+
+def type_in_app(parameter: str) -> dict:
+    """Type text into a currently open native Windows application.
+
+    Format:  type_in_app|app name|text to type
+    Example: type_in_app|Notepad|Write an essay on AI in India.
+
+    Uses clipboard-paste so all Unicode characters work correctly and there
+    is no per-keystroke delay (pyautogui.typewrite is ASCII-only and slow).
+    """
+    if not parameter or parameter.count("|") < 1:
+        return {"success": False,
+                "message": "Format: type_in_app|app name|text to type"}
+    parts = parameter.split("|", 2)
+    app_name = parts[0].strip()
+    text = parts[1].strip() if len(parts) > 1 else ""
+    if not text:
+        return {"success": False, "message": "No text to type."}
+
+    import pygetwindow as gw  # already a dependency via requirements
+    import pyautogui
+
+    # Find the window
+    target = app_name.lower()
+    win = None
+    for w in gw.getAllWindows():
+        if w.title and target in w.title.lower():
+            win = w
+            break
+
+    if win is None:
+        # App might have just launched — wait up to 3 s
+        for _ in range(6):
+            time.sleep(0.5)
+            for w in gw.getAllWindows():
+                if w.title and target in w.title.lower():
+                    win = w
+                    break
+            if win:
+                break
+
+    if win is None:
+        return {"success": False,
+                "message": f"Couldn't find a window for '{app_name}'. Is it open?"}
+
+    try:
+        win.activate()
+        time.sleep(0.3)
+    except Exception as e:
+        print(f"[type_in_app] activate failed: {e} — continuing anyway")
+
+    # Paste via clipboard for reliability
+    try:
+        import base64 as _b64_local
+        payload = _b64_local.b64encode(text.encode("utf-8")).decode("ascii")
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Set-Clipboard -Value ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{payload}')))"],
+            capture_output=True, timeout=5)
+        pyautogui.hotkey("ctrl", "a")   # select all existing text first
+        time.sleep(0.1)
+        pyautogui.hotkey("ctrl", "v")   # paste
+        time.sleep(0.2)
+        return {"success": True, "message": f"Typed text into {app_name}."}
+    except Exception as e:
+        return {"success": False, "message": f"Couldn't type into {app_name}: {e}"}
+
 
 
 # ── Action dispatch ───────────────────────────────────────────────────────────
@@ -5392,6 +5559,7 @@ _ACTION_MAP = {
     "web_search":        _handle_web_search,
     "site_search":       _handle_site_search,
     "fill":              fill,
+    "type_in_app":       type_in_app,
     "scroll":            scroll,
     "new_tab":           new_tab,
     "open_site_tab":     open_site_tab,
