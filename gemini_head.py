@@ -678,7 +678,7 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list[dic
     """Route via Groq Cloud API using OpenAI-compatible chat completion."""
     if not groq_key:
         return None
-    model = (os.environ.get("GROQ_MODEL") or "llama-3.3-70b-versatile").strip()
+    model = (os.environ.get("GROQ_MODEL") or "qwen/qwen3.6-27b").strip()
     sys_text = "\n\n".join(b["text"] for b in system_blocks if isinstance(b, dict) and b.get("text"))
     api_msgs = [{"role": "system", "content": sys_text}]
     for m in messages:
