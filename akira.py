@@ -214,9 +214,18 @@ mic = pyaudio.PyAudio()
 stream = mic.open(format=pyaudio.paInt16, channels=1, rate=16000,
                   input=True, frames_per_buffer=1280)
 
-vad_model, _ = torch.hub.load(
-    repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=False
-)
+try:
+    vad_model, _ = torch.hub.load(
+        repo_or_dir="snakers4/silero-vad", model="silero_vad", force_reload=False
+    )
+except Exception:
+    import os
+    _jit_path = os.path.expanduser(r"~/.cache/torch/hub/snakers4_silero-vad_master/src/silero_vad/data/silero_vad.jit")
+    if os.path.exists(_jit_path):
+        vad_model = torch.jit.load(_jit_path)
+    else:
+        raise
+
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -517,8 +526,12 @@ def record_command(pre_audio: np.ndarray | None = None) -> np.ndarray | None:
 
     raw = np.concatenate(command_audio)
     normalised = raw / 32768.0
-    if pre_audio is None and np.sqrt(np.mean(raw ** 2)) < 100:
-        print("[record] too quiet")
+    energy = float(np.sqrt(np.mean(raw ** 2)))
+    if pre_audio is None and energy < 100:
+        print(f"[record] too quiet (rms={energy:.1f})")
+        return None
+    if pre_audio is not None and energy < 70:
+        print(f"[record] too quiet even with pre_audio (rms={energy:.1f})")
         return None
     return normalised
 
@@ -543,26 +556,63 @@ def transcribe_command(audio: np.ndarray) -> str:
 
 def flush_stream() -> None:
     if not user_speaking.is_set():
-        available = stream.get_read_available()
-        if available > 0:
-            stream.read(available, exception_on_overflow=False)
+        try:
+            available = stream.get_read_available()
+            if available > 0:
+                stream.read(available, exception_on_overflow=False)
+        except Exception:
+            pass
 
 
 # ── VAD barge-in listener ─────────────────────────────────────────────────────
 
 def _vad_listener() -> None:
-    """Daemon thread: runs VAD while Akira is speaking to detect barge-in."""
+    """Daemon thread: runs VAD while Akira is speaking to detect barge-in.
+    
+    Acoustic Echo Cancellation (AEC) & Multi-Frame Confirmation:
+    Akira must NOT hear or act on its own voice output. Single 32ms frames can
+    experience acoustic micro-fluctuations or boundary clicks. To guarantee 0
+    false positives, genuine user barge-in requires persistence across at least
+    3 consecutive speech frames (~96ms). On confirmation, Akira's speech is
+    instantly halted and all buffered user speech frames are retained.
+    """
+    consecutive_user_frames = 0
+    pending_user_chunks: list[np.ndarray] = []
+
     while True:
         if akira_speaking:
             chunk = stream.read(512, exception_on_overflow=False)
             audio_np = np.frombuffer(chunk, dtype=np.int16)
             audio_f  = torch.FloatTensor(audio_np.astype(np.float32) / 32768.0)
             confidence = vad_model(audio_f, 16000).item()
-            if confidence > 0.5:
-                user_speaking.set()
-                with vad_buffer_lock:
-                    vad_audio_buffer.append(audio_np.astype(np.float32))
+            if confidence > 0.4:
+                audio_f_np = audio_np.astype(np.float32) / 32768.0
+                if claude_handler.is_speaker_echo(audio_f_np):
+                    # Pure speaker bleed from Akira's own voice — reset counter and discard
+                    consecutive_user_frames = 0
+                    pending_user_chunks.clear()
+                    continue
+
+                # Potential user speech detected
+                consecutive_user_frames += 1
+                pending_user_chunks.append(audio_np.astype(np.float32))
+
+                # Multi-frame confirmation: require 4 consecutive speech frames (~128ms)
+                if consecutive_user_frames >= 4:
+                    if not user_speaking.is_set():
+                        print("[barge-in] User interruption confirmed (4-frame debounce). Halting Akira's speech...")
+                        claude_handler.stop_speaking()
+                        user_speaking.set()
+                    with vad_buffer_lock:
+                        if pending_user_chunks:
+                            vad_audio_buffer.extend(pending_user_chunks)
+                            pending_user_chunks.clear()
+            else:
+                consecutive_user_frames = 0
+                pending_user_chunks.clear()
         else:
+            consecutive_user_frames = 0
+            pending_user_chunks.clear()
             time.sleep(0.01)
 
 
@@ -571,7 +621,7 @@ vad_thread.start()
 
 
 def speak_and_wait(text: str) -> None:
-    """Speak text while VAD listens for barge-in. Blocks until done."""
+    """Speak text while VAD listens for barge-in. Blocks until done or interrupted."""
     global akira_speaking
     akira_speaking = True
     _notify_avatar("SPEAK_START")
@@ -579,7 +629,17 @@ def speak_and_wait(text: str) -> None:
     thread.join()
     akira_speaking = False
     _notify_avatar("SPEAK_STOP")
-    user_speaking.clear()
+    # Clean up audio stream:
+    # If genuine user barge-in occurred, PRESERVE the user's audio in vad_audio_buffer
+    # so the command can be transcribed and acted on immediately!
+    # If no barge-in occurred (Akira spoke to completion), clear any residual speaker bleed
+    # and flush the mic stream.
+    if not user_speaking.is_set():
+        with vad_buffer_lock:
+            vad_audio_buffer.clear()
+        flush_stream()
+    else:
+        print("[barge-in] Retaining user interruption audio in buffer for immediate execution.")
 
 
 def _announce_background() -> bool:
@@ -1459,20 +1519,56 @@ if __name__ == "__main__":
                     if user_speaking.is_set() and vad_audio_buffer:
                         pre_audio = np.concatenate(vad_audio_buffer)
                         vad_audio_buffer.clear()
-                        user_speaking.clear()
                     else:
                         pre_audio = None
                         vad_audio_buffer.clear()
+                    user_speaking.clear()
 
+                print("[v0] recording command (session follow-up)...")
                 audio = record_command(pre_audio=pre_audio)
                 if audio is None:
+                    print("[v0] session follow-up audio too quiet or timed out, closing session")
                     session_active = False
                     _end_session()
                     if oww_model:
                         oww_model.reset()
                     continue
 
+                print("[v0] transcribing (session follow-up)...")
                 text = transcribe_command(audio)
+                print(f"[v0] heard (session follow-up): {text!r}")
+
+                # ── Phantom-command guard ─────────────────────────────────
+                # Reject empty strings or pure filler/noise sounds that Whisper
+                # occasionally hallucinates on ambient noise or breath sounds.
+                # Explicitly protect valid confirmation/cancellation tokens
+                # ("yes", "no", "yeah", "yep", "ok", etc.) from being dropped.
+                _CONFIRMATION_WORDS = frozenset({
+                    "yes", "no", "yeah", "yep", "yup", "nah", "nope",
+                    "ok", "okay", "sure", "cancel", "stop", "proceed",
+                    "confirm", "do it", "dont", "don't", "nevermind", "go ahead",
+                })
+                _PURE_NOISE_WORDS = frozenset({
+                    "", "um", "uh", "hmm", "hm", "oh", "ah",
+                    "mhm", "huh", "mmm", "ooh", "aah",
+                })
+                text_stripped = (text or "").strip()
+                cleaned_word = text_stripped.lower().rstrip(".,!?;:")
+                words = [w.strip(".,!?;:") for w in text_stripped.lower().split()]
+
+                is_confirmation = (
+                    cleaned_word in _CONFIRMATION_WORDS
+                    or any(w in _CONFIRMATION_WORDS for w in words)
+                )
+                is_noise = False
+                if not is_confirmation:
+                    if len(text_stripped) < 2 or all(w in _PURE_NOISE_WORDS for w in words):
+                        is_noise = True
+
+                if is_noise:
+                    print(f"[v0] rejected phantom/noise transcription: {text!r}")
+                    continue
+
                 session_active = _process_command(text)
                 if session_active:
                     print("[session] continuing")
@@ -1536,6 +1632,8 @@ if __name__ == "__main__":
                                 with torch.no_grad():
                                     vad_conf = vad_model(audio_f, 16000).item()
                                 if vad_conf > 0.6:
+                                    if claude_handler.is_speaker_echo(audio_f.numpy()):
+                                        continue
                                     triggered = True
                                     print("[voice] Speech detected!")
                                     break

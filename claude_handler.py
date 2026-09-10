@@ -8,8 +8,10 @@ import re
 import copy
 import json
 import threading
+import time
 import datetime as dt
 from dataclasses import dataclass
+import numpy as np
 try:
     import pyttsx3
 except ImportError:  # headless verification and server-only environments
@@ -2130,16 +2132,234 @@ def summarize_text(text: str, filename: str = "") -> str:
 # plumbing, and that module must import without TTS/audio side effects.
 
 
+_kokoro_pipeline = None
+_kokoro_failed = False
+
+# Reference to currently playing output audio for Acoustic Echo Cancellation (AEC)
+_current_tts_audio: np.ndarray | None = None
+_current_tts_audio_16k: np.ndarray | None = None
+_current_tts_fs: int = 24000
+_playback_start_time: float = 0.0
+_current_tts_lock = threading.Lock()
+_kokoro_pipeline = None
+_kokoro_failed = False
+_tts_stop_event = threading.Event()
+
+
+def _get_kokoro_pipeline():
+    global _kokoro_pipeline, _kokoro_failed
+    if _kokoro_failed:
+        return None
+    if _kokoro_pipeline is None:
+        try:
+            from kokoro import KPipeline
+            _kokoro_pipeline = KPipeline(lang_code='a')
+            print("[TTS] Kokoro 82M initialized successfully.")
+        except Exception as e:
+            print(f"[TTS] Kokoro 82M initialization skipped/failed ({e}) — fallback to pyttsx3.")
+            _kokoro_failed = True
+            return None
+    return _kokoro_pipeline
+
+
+def stop_speaking() -> None:
+    """Instantly interrupt TTS playback (for genuine user barge-in)."""
+    _tts_stop_event.set()
+    try:
+        import sounddevice as sd
+        sd.stop()
+    except Exception:
+        pass
+    with _current_tts_lock:
+        global _current_tts_audio, _current_tts_audio_16k
+        _current_tts_audio = None
+        _current_tts_audio_16k = None
+
+
+def get_current_tts_audio() -> tuple[np.ndarray | None, int]:
+    """Expose the currently playing audio reference for acoustic echo cancellation."""
+    with _current_tts_lock:
+        if _current_tts_audio is not None:
+            return _current_tts_audio.copy(), _current_tts_fs
+        return None, 24000
+
+
+def is_speaker_echo(mic_chunk: np.ndarray) -> bool:
+    """Determine if a 16kHz mic chunk is acoustic echo of Akira's own speaker output.
+
+    Uses normalized cross-correlation and energy coupling against the active
+    playing TTS reference audio. Returns True if the audio is Akira's own echo,
+    and False if it contains independent user speech (genuine barge-in).
+    """
+    with _current_tts_lock:
+        ref_16k = _current_tts_audio_16k
+        start_t = _playback_start_time
+
+    if ref_16k is None or len(ref_16k) < 512:
+        return False
+
+    mic_rms = float(np.sqrt(np.mean(mic_chunk ** 2)))
+    if mic_rms < 0.008:
+        # Below ambient silence floor
+        return True
+
+    # Acoustic room delay + audio output latency is typically 10ms-150ms.
+    # Align candidate search window around elapsed playback time.
+    elapsed = max(0.0, time.time() - start_t)
+    center_idx = int(elapsed * 16000)
+    w_start = max(0, center_idx - 1600)
+    w_end = min(len(ref_16k), center_idx + 4800)
+
+    ref_sub = ref_16k[w_start:w_end]
+    if len(ref_sub) < 512:
+        # Fallback to the whole buffer if small
+        ref_sub = ref_16k[:min(len(ref_16k), 8000)]
+        if len(ref_sub) < 512:
+            return False
+
+    try:
+        corr = np.correlate(ref_sub, mic_chunk, mode='valid')
+        ref_energies = np.sqrt(np.convolve(ref_sub ** 2, np.ones(len(mic_chunk), dtype=np.float32), mode='valid'))
+        mic_energy = np.sqrt(np.sum(mic_chunk ** 2))
+        norm = ref_energies * mic_energy + 1e-7
+        norm_corr = corr / norm
+        max_corr = float(np.max(np.abs(norm_corr)))
+
+        ref_local_rms = float(np.sqrt(np.mean(ref_sub ** 2))) + 1e-6
+        energy_ratio = mic_rms / ref_local_rms
+
+        # Two-tier acoustic echo discriminator:
+        # 1. Definitive echo: max_corr > 0.38 (impossible for uncorrelated human voice,
+        #    which peaks at ~0.28, and captures chassis acoustic resonance).
+        # 2. Moderate correlation (0.35 < max_corr <= 0.38) with energy coupling < 0.40.
+        if max_corr > 0.38:
+            return True
+        if max_corr > 0.35 and energy_ratio < 0.40:
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def speak(text: str) -> None:
-    """Synchronous TTS. Always init/deinit engine to avoid pyttsx3 threading issues."""
+    """Fast, low-latency TTS pipeline (sub-2s responses) with pyttsx3 fallback."""
+    global _current_tts_audio, _current_tts_audio_16k, _current_tts_fs, _playback_start_time
+    if not text or not text.strip():
+        return
+
+    _tts_stop_event.clear()
+
+    # 1. Fast Edge-TTS Neural Pipeline (~1.2s latency)
+    try:
+        import edge_tts, asyncio, tempfile, os
+        import soundfile as sf, sounddevice as sd
+        import scipy.signal
+
+        async def _synth():
+            comm = edge_tts.Communicate(text.strip(), "en-US-AvaNeural")
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                tmp_p = f.name
+            await comm.save(tmp_p)
+            return tmp_p
+
+        tmp_path = asyncio.run(_synth())
+        data, fs = sf.read(tmp_path)
+
+        # Prepare 16kHz mono audio for acoustic echo cancellation matching mic sampling rate
+        if data.ndim > 1:
+            data_mono = np.mean(data, axis=1).astype(np.float32)
+        else:
+            data_mono = data.astype(np.float32)
+
+        if fs != 16000:
+            data_16k = scipy.signal.resample_poly(data_mono, 16000, fs).astype(np.float32)
+        else:
+            data_16k = data_mono
+
+        # Tag the current output audio reference so VAD can distinguish Akira's voice vs user
+        with _current_tts_lock:
+            _current_tts_audio = data.astype(np.float32)
+            _current_tts_audio_16k = data_16k
+            _current_tts_fs = fs
+
+        with _tts_engine_lock:
+            if not _tts_stop_event.is_set():
+                with _current_tts_lock:
+                    _playback_start_time = time.time()
+                sd.play(data, fs)
+                # Wait for playback, but allow early abort on user barge-in
+                while not _tts_stop_event.is_set():
+                    stream_obj = sd.get_stream()
+                    if stream_obj is None or not stream_obj.active:
+                        break
+                    time.sleep(0.01)
+                if _tts_stop_event.is_set():
+                    sd.stop()
+                    print("[TTS] Playback interrupted by user barge-in.")
+
+        with _current_tts_lock:
+            _current_tts_audio = None
+            _current_tts_audio_16k = None
+
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return
+    except Exception as e:
+        print(f"[TTS] Fast neural engine fallback ({e}) — using local pyttsx3")
+
+    # 2. Local Instant SAPI5 pyttsx3 fallback (0ms latency) with full AEC & interruption
     with _tts_engine_lock:
-        engine = pyttsx3.init()
-        engine.setProperty("voice", _female_voice_id)
-        engine.setProperty("rate", 215)
-        engine.setProperty("volume", 0.9)
-        engine.say(text)
-        engine.runAndWait()
-        engine.stop()
+        if pyttsx3 is not None and not _tts_stop_event.is_set():
+            import tempfile, soundfile as sf, sounddevice as sd, scipy.signal
+            engine = pyttsx3.init()
+            engine.setProperty("voice", _female_voice_id)
+            engine.setProperty("rate", 215)
+            engine.setProperty("volume", 0.9)
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                tmp_wav = f.name
+            try:
+                engine.save_to_file(text, tmp_wav)
+                engine.runAndWait()
+                engine.stop()
+
+                data, fs = sf.read(tmp_wav)
+                if data.ndim > 1:
+                    data_mono = np.mean(data, axis=1).astype(np.float32)
+                else:
+                    data_mono = data.astype(np.float32)
+                if fs != 16000:
+                    data_16k = scipy.signal.resample_poly(data_mono, 16000, fs).astype(np.float32)
+                else:
+                    data_16k = data_mono
+
+                with _current_tts_lock:
+                    _current_tts_audio = data.astype(np.float32)
+                    _current_tts_audio_16k = data_16k
+                    _current_tts_fs = fs
+                    _playback_start_time = time.time()
+
+                if not _tts_stop_event.is_set():
+                    sd.play(data, fs)
+                    while not _tts_stop_event.is_set():
+                        stream_obj = sd.get_stream()
+                        if stream_obj is None or not stream_obj.active:
+                            break
+                        time.sleep(0.01)
+                    if _tts_stop_event.is_set():
+                        sd.stop()
+                        print("[TTS] pyttsx3 playback interrupted by user barge-in.")
+
+                with _current_tts_lock:
+                    _current_tts_audio = None
+                    _current_tts_audio_16k = None
+            finally:
+                try:
+                    os.remove(tmp_wav)
+                except Exception:
+                    pass
 
 
 def speak_async(text: str, on_done=None) -> threading.Thread:

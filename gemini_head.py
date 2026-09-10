@@ -502,35 +502,48 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list,
     """
     groq_sys = (
         "You are Akira AI system assistant. Analyze user intent and respond strictly with a single JSON object.\n"
-        "Canonical action names:\n"
-        "- adjust_volume (param: '0'..'100')\n"
-        "- adjust_brightness (param: '0'..'100')\n"
-        "- web_search (param: 'query|browser:chrome')\n"
-        "- open_url (param: 'https://...')\n"
-        "- open_site_tab (param: 'youtube', 'netflix', 'spotify')\n"
-        "- switch_tab (param: 'tab_title_or_site')\n"
-        "- close_tab (param: '')\n"
-        "- new_tab (param: 'optional search query')\n"
-        "- list_tabs (param: '')\n"
-        "- youtube_control (param: 'play [song]', 'pause', 'resume', 'next', 'like', etc.)\n"
-        "- spotify_control (param: 'play [song]', 'pause', 'resume', 'next', 'previous')\n"
-        "- browser_control (param: 'back', 'forward', 'refresh')\n"
-        "- open_application / close_application (param: 'app_name')\n"
-        "- switch_window, maximize_window, minimize_window\n"
-        "- screenshot, read_clipboard, write_clipboard\n"
-        "- lock_pc, sleep_pc, shutdown_pc, restart_pc\n"
-        "- search_file, open_file, open_folder, index_stats, manage_index_scope\n"
-        "\nContextual Tab and Prior Action Resolution Rules:\n"
+        "Canonical action names and pipe syntax:\n"
+        "- System: adjust_volume (0..100|mute), adjust_brightness (0..100), lock_pc, sleep_pc, shutdown_pc, restart_pc, "
+        "empty_recycle_bin, clear_temp_files, run_disk_cleanup, toggle_wifi (on|off), battery_status, performance_stats\n"
+        "- Apps: open_application (app), close_application (app), switch_window (app), maximize_window, minimize_window, open_settings\n"
+        "- Browser: web_search (query|browser:chrome), open_url (url), site_search (site|query), open_site_tab (site), "
+        "switch_tab (tab_title), close_tab (tab_title), new_tab (query), list_tabs, browser_control (back|forward|reload), "
+        "click (text), fill (field|text), scroll (up|down|pixels)\n"
+        "- Media: youtube_control (play [song]|pause|resume|next|like|volume 80), spotify_control (play [song]|pause|resume|next|previous), "
+        "netflix_control (search|q; play title|t; pause; resume; volume|70)\n"
+        "- Clipboard: screenshot, read_clipboard, write_clipboard (text), generate_to_clipboard (brief), speak_clipboard, stop_reading, read_more\n"
+        "- Files: search_file (name|folder), open_file (path), open_folder (path), list_folder (path), summarize_file (path), "
+        "file_to_doc (file|Doc Title|extract), copy_files (pattern|dest), compress_files (pattern|zip), extract_files (zip|dest), "
+        "create_file (path|content), write_file (path|content), edit_file (path|find|replace), move_files (pattern|dest), delete_files (pattern|folder), "
+        "organize_folder (folder), bulk_rename_files (pattern|new_name), index_stats, manage_index_scope (include|path / exclude|path)\n"
+        "- Images: search_image (query), download_image (pick/url|path), set_wallpaper (path)\n"
+        "- Google Workspace: calendar_control (list|days; create|Title|start|end; get|id; delete|id), "
+        "docs_control (create|Title|content; generate|Title|brief|short; read|id; append|id|text), "
+        "sheets_control (create|Title|cells; generate|Title|brief; read|id; write|id|range|values), "
+        "slides_control (create|Title|slides; generate|Title|brief|count; read|id; update|id|slides; delete|id), "
+        "gmail_control (search|query; read|id; unread|count; labels), gmail_compose (draft|to|sub|body; generate|to|sub|brief)\n"
+        "- Notes: obsidian_control (progress|note|summary; append|note|section|text; create|title|content; read|note; search|term; "
+        "moc|title|notes; link|note|targets; diagram|note|mermaid; focus|on/off; organize|content)\n"
+        "- Office: office_control (word|generate|Title|brief; word|open; word|insert|text; excel|generate|Title|brief; excel|open; powerpoint|open; teams|focus), "
+        "meet_control (join|url; mute; camera off; leave), "
+        "vscode_control (action|param), github_control (search repos|q; open repo|name; star repo; clone repo|dest; repo notes|repo), "
+        "amazon_control (search|q; select result|item; add to cart; proceed to checkout), flipkart_control (search|q; select result|item; add to cart; proceed to checkout)\n"
+        "\nContextual Tab & History Rules:\n"
         "1. Check [RECENT ACTIONS THIS SESSION] and [CURRENT BROWSER TABS] before choosing actions.\n"
-        "2. When resolving ambiguous tab references (e.g. 'the tab that was opened before', 'the tab opened before', 'that tab', 'the other one', 'switch back', 'no I meant the previous one'):\n"
-        "   - Prioritize the tab most recently opened or acted upon in [RECENT ACTIONS THIS SESSION] over any other open tab.\n"
-        "   - Emit 'switch_tab' with the specific tab title or site name from recent actions.\n"
-        "   - Do NOT guess an unrelated open tab. If confidence is genuinely low and the target cannot be determined from recent history or tabs, ask a brief clarifying question in conversation mode (e.g. 'Did you mean the YouTube tab or another tab?').\n"
-        "   - Do NOT emit 'new_tab', 'open_site_tab', or 'web_search' when referring to an already-open or recently-acted tab.\n"
+        "2. When resolving ambiguous tab references, prioritize recently acted tabs and emit 'switch_tab'. Prioritize the tab most recently opened or acted upon.\n"
+        "3. Do NOT emit 'new_tab', 'open_site_tab', or 'web_search' when referring to an already-open or recently-acted tab.\n"
+        "4. For Word documents or reports, use office_control with word|generate|Title|brief.\n"
+        "5. For composed long text, essays, or reports to clipboard/notepad, ALWAYS emit generate_to_clipboard with a SHORT 1-line brief. NEVER write full essays or multi-paragraph text inline inside write_clipboard.\n"
         "\nOutput format:\n"
         "Output tone must be one of: 'neutral', 'happy', 'calm', 'excited', 'focused'.\n"
-        "For commands: {\"mode\": \"command\", \"action\": \"canonical_action_name\", \"parameter\": \"value\", \"tone\": \"focused\"}\n"
-        "For chat: {\"mode\": \"conversation\", \"response\": \"reply\", \"tone\": \"neutral\", \"end_session\": false}"
+        "For single command: {\"mode\": \"command\", \"action\": \"canonical_action_name\", \"parameter\": \"value\", \"tone\": \"focused\"}\n"
+        "For chained/multi command: {\"mode\": \"command\", \"actions\": [{\"action\": \"action_1\", \"parameter\": \"param_1\"}, {\"action\": \"action_2\", \"parameter\": \"param_2\"}], \"tone\": \"focused\"}\n"
+        "For chat: {\"mode\": \"conversation\", \"response\": \"reply\", \"tone\": \"neutral\", \"end_session\": false}\n"
+        "\nChaining examples:\n"
+        "User: \"open notepad and write hello world\" -> {\"mode\": \"command\", \"actions\": [{\"action\": \"open_application\", \"parameter\": \"notepad\"}, {\"action\": \"write_clipboard\", \"parameter\": \"hello world\"}], \"tone\": \"focused\"}\n"
+        "User: \"open notepad and write an essay on artificial intelligence\" -> {\"mode\": \"command\", \"actions\": [{\"action\": \"open_application\", \"parameter\": \"notepad\"}, {\"action\": \"generate_to_clipboard\", \"parameter\": \"essay on artificial intelligence\"}], \"tone\": \"focused\"}\n"
+        "User: \"close excel and open spotify\" -> {\"mode\": \"command\", \"actions\": [{\"action\": \"open_application\", \"parameter\": \"spotify\"}, {\"action\": \"close_application\", \"parameter\": \"excel\"}], \"tone\": \"focused\"}\n"
+        "User: \"open word and write a report about quantum computing\" -> {\"mode\": \"command\", \"action\": \"office_control\", \"parameter\": \"word|generate|Quantum Computing|report about quantum computing\", \"tone\": \"focused\"}"
     )
 
     import model_pool
@@ -556,8 +569,19 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list,
         obj = result.parsed
         if not obj:
             obj, _ = llm_json.parse(raw_text)
+        if not obj and raw_text:
+            m_json = re.search(r'(\{[\s\S]*\})', raw_text)
+            if m_json:
+                obj, _ = llm_json.parse(m_json.group(1))
 
         if obj and isinstance(obj, dict) and "mode" in obj:
+            # If a reasoning model wrapped a valid command inside conversation response:
+            if obj.get("mode") == "conversation" and isinstance(obj.get("response"), str):
+                m_inner = re.search(r'(\{\s*"mode"\s*:\s*"command"[\s\S]*?\})', obj["response"])
+                if m_inner:
+                    inner_obj, _ = llm_json.parse(m_inner.group(1))
+                    if inner_obj and isinstance(inner_obj, dict) and inner_obj.get("mode") == "command":
+                        obj = inner_obj
             obj = _normalize_payload(obj)
             raw_text = json.dumps(obj)
         elif raw_text:
@@ -689,6 +713,15 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
     if any(re.search(p, text_clean) for p in _CORRECTION_PATTERNS):
         return None
 
+    # Compound conjunction guard: when user utterance contains chained/compound commands
+    # (e.g. "open notepad and write hello", "turn volume to 50 then play lofi", "after that close excel"),
+    # do NOT greedily match the first action via regex. Fall through to LLM to emit the full actions[] chain.
+    _COMPOUND_CONJUNCTIONS = (
+        r'\b(?:and|then|after\s+that|also|plus|afterwards)\b',
+    )
+    if any(re.search(p, text_clean) for p in _COMPOUND_CONJUNCTIONS):
+        return None
+
     def _emit(action: str, parameter: str = "") -> HeadReply:
         envelope = json.dumps({"mode": "command", "action": action, "parameter": parameter, "tone": "focused"})
         print(f"[gemini_head] routed via Fast Pre-Router in 0.1ms -> {action}")
@@ -717,9 +750,26 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
     if m:
         return _emit("web_search", f"{m.group(1).strip()}|browser:{m.group(2).strip()}")
 
+    # ── 3b. Site Search (specific platform: netflix, reddit, youtube, amazon, etc.) ──
+    _KNOWN_SITES = (
+        r"netflix|reddit|youtube|spotify|amazon|flipkart|github|twitter|x\.com|"
+        r"instagram|pinterest|stackoverflow|wikipedia|makemytrip|ixigo|imdb"
+    )
+    m_site = re.search(rf'(?:search|look\s+up|find)\s+({_KNOWN_SITES})\s+(?:for\s+)?(.+)', text_clean)
+    if m_site:
+        site = m_site.group(1).strip()
+        query = m_site.group(2).strip()
+        return _emit("site_search", f"{site}|{query}")
+
+    m_site2 = re.search(rf'(?:search|look\s+up|find)\s+(.+?)\s+(?:on|in)\s+({_KNOWN_SITES})', text_clean)
+    if m_site2:
+        query = m_site2.group(1).strip()
+        site = m_site2.group(2).strip()
+        return _emit("site_search", f"{site}|{query}")
+
     # ── 4. Web Search (generic — default to chrome) ──────────────────────
-    m = re.search(r'(?:search|google|look\s+up)\s+(?:for\s+)?(?:on\s+(?:the\s+)?(?:web|internet|google)\s+)?(.+)', text_clean)
-    if m and not re.search(r'(?:file|folder|image|index|on\s+(?:amazon|flipkart|github|youtube|netflix|spotify))', text_clean):
+    m = re.search(r'(?:^|\b(?:please\s+)?)(?:search|google|look\s+up)\s+(?:for\s+)?(?:on\s+(?:the\s+)?(?:web|internet|google)\s+)?(.+)', text_clean)
+    if m and not re.search(r'(?:file|folder|image|index|doc|sheet|slide|drive|calendar|on\s+(?:amazon|flipkart|github|youtube|netflix|spotify))', text_clean):
         query = m.group(1).strip()
         if len(query) > 3 and not query.startswith(("on ", "in ")):
             return _emit("web_search", f"{query}|browser:chrome")
@@ -748,7 +798,7 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         "excel|word|powerpoint|outlook|onenote|winrar|gitbash|capcut|"
         "adobe|acrobat|protonvpn|vpn|copilot|chatgpt|store|xbox|settings"
     )
-    m = re.search(rf'(?:open|launch|start|run)\s+({_APPS})', text_clean)
+    m = re.search(rf'\b(?:open|launch|start|run)\s+({_APPS})\b', text_clean)
     if m:
         app = m.group(1).strip()
         if app == "code":
@@ -758,16 +808,26 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         return _emit("open_application", app)
 
     # ── 8. Close Application ─────────────────────────────────────────────
-    m = re.search(r'(?:close|quit|exit|kill|stop)\s+(\w+(?:\s+\w+)?)', text_clean)
+    _NON_APP_TARGETS = (
+        "tab", "window", "all tabs", "this tab", "the tab", "browser",
+        "talking", "reading", "speaking", "it", "that", "this", "me",
+        "now", "here", "the door", "door", "down", "up", "off", "playing"
+    )
+    m = re.search(r'\b(?:close|quit|exit|kill)\s+(?:the\s+app(?:lication)?\s+)?(\w+(?:\s+\w+)?)\b', text_clean)
+    if not m:
+        m = re.search(r'\bstop\s+(?:running\s+(?:the\s+app(?:lication)?\s+)?|(?:the\s+app(?:lication)?\s+))(\w+(?:\s+\w+)?)\b', text_clean)
     if m:
         target = m.group(1).strip()
-        if target not in ("tab", "window", "all tabs", "this tab", "the tab", "browser"):
+        if target not in _NON_APP_TARGETS and not target.endswith(("ing", "ed")):
             return _emit("close_application", target)
 
     # ── 9. Switch Window ─────────────────────────────────────────────────
-    m = re.search(r'(?:switch|go|change|alt.?tab)\s+(?:to\s+|window\s+(?:to\s+)?)?(\w+(?:\s+\w+)?)', text_clean)
-    if m and re.search(r'switch|alt.?tab', text_clean):
-        return _emit("switch_window", m.group(1).strip())
+    if not re.search(r'\bswitch\s+(?:on|off)\b', text_clean):
+        m = re.search(r'\b(?:switch\s+(?:window\s+)?to\s+|switch\s+window\s+(?:to\s+)?|alt\s*tab\s+(?:to\s+)?)(\w+(?:\s+\w+)?)\b', text_clean)
+        if m:
+            target = m.group(1).strip()
+            if target not in ("tab", "the tab", "user", "account", "accounts", "off", "on"):
+                return _emit("switch_window", target)
 
     # ── 10. Maximize / Minimize Window ───────────────────────────────────
     if re.search(r'maximize\s+(?:the\s+)?(?:current\s+)?window', text_clean):
@@ -800,15 +860,15 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         return _emit("lock_pc", "")
 
     # ── 16. Sleep PC ─────────────────────────────────────────────────────
-    if re.search(r'(?:put\s+(?:the\s+)?(?:pc|computer)\s+to\s+sleep|sleep\s+(?:the\s+)?(?:pc|computer|mode))', text_clean):
+    if re.search(r'\b(?:put\s+(?:the\s+)?(?:pc|computer|system)\s+to\s+sleep|sleep\s+(?:the\s+)?(?:pc|computer|mode))\b', text_clean) or re.match(r'^(?:please\s+)?(?:go\s+to\s+)?sleep\s+(?:the\s+)?(?:pc|computer)$', text_clean):
         return _emit("sleep_pc", "")
 
     # ── 17. Shutdown ─────────────────────────────────────────────────────
-    if re.search(r'(?:shut\s*down|power\s+off|turn\s+off)\s+(?:the\s+)?(?:pc|computer)?', text_clean):
+    if re.search(r'(?:shut\s*down|power\s+off|turn\s+off)\s+(?:the\s+)?(?:pc|computer|system|laptop|machine)\b', text_clean) or re.match(r'^(?:please\s+)?(?:shut\s*down|power\s+off)$', text_clean):
         return _emit("shutdown_pc", "")
 
     # ── 18. Restart ──────────────────────────────────────────────────────
-    if re.search(r'restart\s+(?:the\s+)?(?:pc|computer)?', text_clean):
+    if re.search(r'(?:restart|reboot)\s+(?:the\s+)?(?:pc|computer|system|laptop|machine)\b', text_clean) or re.match(r'^(?:please\s+)?(?:restart|reboot)$', text_clean):
         return _emit("restart_pc", "")
 
     # ── 19. Toggle WiFi ──────────────────────────────────────────────────
@@ -875,10 +935,21 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         return _emit("youtube_control", f"play {query}")
 
     # B. Interactive Controls & Actions
-    if re.search(r'(?:skip|next)\s+(?:this\s+)?(?:out|video|song|track)?', text_clean):
+    if re.search(r'\b(?:skip|next)\s+(?:this\s+|the\s+)?(?:video|song|track)\b', text_clean):
         return _emit("youtube_control", "next")
-    if re.search(r'(?:like|dislike|thumbs\s+up|thumbs\s+down)\s+(?:this\s+)?(?:video|song|track)?', text_clean):
-        return _emit("youtube_control", "like" if ("like" in text_clean or "up" in text_clean) else "dislike")
+    if re.match(r'^(?:please\s+)?(?:skip|next)(?:\s+(?:this|it))?$', text_clean):
+        return _emit("youtube_control", "next")
+
+    # Thumbs up / down
+    if re.search(r'\b(?:give\s+(?:this\s+)?a\s+)?thumbs\s+(up|down)\b', text_clean):
+        return _emit("youtube_control", "like" if "up" in text_clean else "dislike")
+    # Explicit like / dislike of video/song/track
+    if re.search(r'\b(like|dislike)\s+(?:this\s+|the\s+)?(?:video|song|track)\b', text_clean) and not re.search(r'\b(?:would|i|you|we|looks?|feels?|sounds?|seems?)\s+like\b', text_clean):
+        return _emit("youtube_control", "like" if ("like" in text_clean and "dislike" not in text_clean) else "dislike")
+    # Standalone like/dislike command: "like this", "like it", "dislike this", "dislike it"
+    if re.match(r'^(?:please\s+)?(like|dislike)\s+(?:this|it)$', text_clean):
+        m = re.match(r'^(?:please\s+)?(like|dislike)', text_clean)
+        return _emit("youtube_control", m.group(1))
     if re.search(r'(?:open|show|go\s+to)\s+(?:the\s+)?comments?\s*(?:section)?', text_clean):
         return _emit("youtube_control", "comments")
     if re.search(r'(?:sign\s+in|log\s+in)\s+(?:to\s+)?youtube', text_clean):
@@ -918,9 +989,9 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         return _emit("browser_control", "refresh")
 
     # ── 27. New Tab ──────────────────────────────────────────────────────
-    if re.search(r'\b(?:open|new)\s+(?:a\s+)?(?:new\s+)?tab\b', text_clean):
-        if not re.search(r'\b(?:youtube|spotify|netflix|play|video|song)\b', text_clean):
-            m_search = re.search(r'\b(?:open|new)\s+(?:a\s+)?(?:new\s+)?tab\s+(?:and\s+)?(?:search\s+(?:for\s+)?|with\s+)?(.+)', text_clean)
+    if re.search(r'^(?:please\s+)?(?:open|create|start)\s+(?:a\s+)?(?:new\s+)?tab\b|\b(?:open|create)\s+(?:a\s+)?new\s+tab\b', text_clean):
+        if not re.search(r'\b(?:youtube|spotify|netflix|play|video|song|why|what|how|where|which|in|on)\b', text_clean):
+            m_search = re.search(r'\b(?:open|create|start)\s+(?:a\s+)?(?:new\s+)?tab\s+(?:and\s+)?(?:search\s+(?:for\s+)?|with\s+)?(.+)', text_clean)
             param = m_search.group(1).strip().rstrip("?.!") if m_search else ""
             return _emit("new_tab", param)
 
@@ -973,18 +1044,25 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         to_person = m.group(1).strip()
         brief = m.group(2).strip()
         subject = brief[:35].strip().capitalize()
-        return _emit("gmail_compose", f"draft|{to_person}|{subject}|{brief}")
+        return _emit("gmail_compose", f"generate|{to_person}|{subject}|{brief}")
 
     # ── 36. Background Status ────────────────────────────────────────────
     if re.search(r'(?:check|show|get|what\'?s?)\s+(?:the\s+)?(?:background|pending)\s+(?:tasks?|status|jobs?)', text_clean):
         return _emit("background_status", "")
 
-    # ── 36b. Reminders / Notes (map to calendar_control or create_file) ──
-    # "take notes / note down / create a note" → create_file
-    m = re.search(r'(?:take\s+(?:a\s+)?note|note\s+(?:down|this)|write\s+(?:a\s+)?note|make\s+a\s+note)\s*(?:about|that|:|-)?\s*(.*)', text_clean)
-    if m:
-        content = m.group(1).strip()
-        return _emit("create_file", f"akira_notes.txt|{content}")
+    # ── 36b. Reminders / Notes (map to calendar_control, obsidian_control, or create_file) ──
+    # "write a note in obsidian about X" → obsidian_control
+    m_obs = re.search(r'(?:take\s+(?:a\s+)?note|note\s+(?:down|this)|write\s+(?:a\s+)?note|make\s+a\s+note|add\s+(?:a\s+)?note)\s+(?:in|into|to|on)?\s*(?:my\s+)?obsidian(?:\s+vault)?\s*(?:about|that|:|-)?\s*(.*)', text_clean)
+    if m_obs:
+        content = m_obs.group(1).strip()
+        return _emit("obsidian_control", f"progress|Daily Note|{content}")
+
+    # "take notes / note down / create a note" → create_file (generic text file only when obsidian is not mentioned)
+    if "obsidian" not in text_clean and "vault" not in text_clean:
+        m = re.search(r'(?:take\s+(?:a\s+)?note|note\s+(?:down|this)|write\s+(?:a\s+)?note|make\s+a\s+note)\s*(?:about|that|:|-)?\s*(.*)', text_clean)
+        if m:
+            content = m.group(1).strip()
+            return _emit("create_file", f"akira_notes.txt|{content}")
 
     # "remind me / set a reminder / create a reminder" → calendar_control
     m = re.search(r'(?:remind\s+me|set\s+(?:a\s+)?reminder|create\s+(?:a\s+)?reminder|add\s+(?:a\s+)?reminder)\s*(?:about|to|for|that)?\s*(.*)', text_clean)
@@ -999,13 +1077,13 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         return _emit("calendar_control", f"add|{content}")
 
     # ── 37. Power Management (sleep / hibernate / shutdown / restart) ───
-    if re.search(r'(?:put\s+(?:the\s+)?(?:pc|computer)\s+to\s+)?sleep(?:\s+(?:mode|the\s+pc|the\s+computer))?', text_clean):
+    if re.search(r'\b(?:put\s+(?:the\s+)?(?:pc|computer|system)\s+to\s+sleep|sleep\s+(?:the\s+)?(?:pc|computer|mode))\b', text_clean) or re.match(r'^(?:please\s+)?(?:go\s+to\s+)?sleep\s+(?:the\s+)?(?:pc|computer)$', text_clean):
         return _emit("sleep_pc", "")
-    if re.search(r'hibernate(?:\s+(?:the\s+)?(?:pc|computer))?', text_clean):
+    if re.search(r'\bhibernate\s+(?:the\s+)?(?:pc|computer|system|laptop)\b', text_clean) or re.match(r'^(?:please\s+)?hibernate$', text_clean):
         return _emit("hibernate", "")
-    if re.search(r'(?:shutdown|turn\s+off)\s+(?:the\s+)?(?:pc|computer|system)', text_clean):
+    if re.search(r'(?:shutdown|turn\s+off)\s+(?:the\s+)?(?:pc|computer|system)\b', text_clean) or re.match(r'^(?:please\s+)?(?:shutdown|turn\s+off)$', text_clean):
         return _emit("shutdown", "")
-    if re.search(r'(?:restart|reboot)\s+(?:the\s+)?(?:pc|computer|system)', text_clean):
+    if re.search(r'(?:restart|reboot)\s+(?:the\s+)?(?:pc|computer|system)\b', text_clean) or re.match(r'^(?:please\s+)?(?:restart|reboot)$', text_clean):
         return _emit("restart", "")
 
     # ── 38. System Cleanup & Maintenance ────────────────────────────────
@@ -1023,7 +1101,7 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
         return _emit("speak_clipboard", "")
     if re.search(r'stop\s+(?:reading|speaking|talking)', text_clean):
         return _emit("stop_reading", "")
-    if re.search(r'(?:continue|read)\s+more', text_clean):
+    if re.match(r'^(?:please\s+)?(?:continue|read\s+more|continue\s+reading)$', text_clean):
         return _emit("read_more", "")
 
     # ── 39b. Web Form Field Input ─────────────────────────────────────────
@@ -1268,11 +1346,13 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
     if m:
         return _emit("organize_folder", m.group(1).strip())
 
-    m = re.search(r'click\s+(?:on\s+)?(.+)', text_clean)
+    m = re.match(r'^(?:please\s+)?click\s+(?:on\s+)?(.+)', text_clean)
     if m:
-        return _emit("click", m.group(1).strip())
+        target = m.group(1).strip()
+        if not target.startswith(("sound", "noise")):
+            return _emit("click", target)
 
-    m = re.search(r'fill\s+(?:form\s+)?(.+)', text_clean)
+    m = re.search(r'\bfill\s+(?:out\s+)?(?:the\s+)?form\s*(?:with\s+)?(.*)', text_clean)
     if m:
         return _emit("fill", m.group(1).strip())
 
