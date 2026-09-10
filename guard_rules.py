@@ -143,6 +143,7 @@ SUB_UNSCREENED = Rule(1, 2, screen=False, split_pipe=True)     # "sub" or "sub|a
 SUB_ARGS = Rule(1, 3)                # "app|sub|args"
 SUB_MULTI = Rule(1, 6)               # multi-field commands (e.g. gmail_compose generate|to|subject|body)
 SUB_MULTI_UNSCREENED = Rule(1, 6, screen=False, split_pipe=True)  # multi-field unscreened (office_control generate/insert briefs)
+SUB_VAULT = Rule(1, 999)             # vault free text and markdown notes (arbitrary pipes in tables/content)
 FILL = Rule(1, 3)                    # "field|text" or "field|text|submit" (Mech Servant fill+enter)
 
 # ACTION_RULES — every key in executor._ACTION_MAP must appear here.
@@ -189,7 +190,7 @@ ACTION_RULES: dict[str, Rule] = {
     # ── Microsoft Office (COM) ────────────────────────────────────────────
     "office_control": SUB_MULTI_UNSCREENED,
     # ── Obsidian ──────────────────────────────────────────────────────────
-    "obsidian_control": SUB_MULTI,
+    "obsidian_control": SUB_VAULT,
     # ── files ─────────────────────────────────────────────────────────────
     "create_file": SUB_MULTI,
     "read_file": OPAQUE_TEXT,
