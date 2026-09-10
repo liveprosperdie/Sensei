@@ -14,13 +14,26 @@ import io
 import os
 import unittest
 from unittest.mock import patch
-from fastapi.testclient import TestClient
+
+try:
+    from fastapi.testclient import TestClient
+    from gateway_server.main import app
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
+    TestClient = None
+    app = None
 
 os.environ["AKIRA_JWT_SECRET"] = "super-secret-test-jwt-key-32-chars-minimum!!"
 os.environ["AKIRA_ENV"] = "test"
 
-from gateway_server import auth
-from gateway_server.main import app
+try:
+    from gateway_server import auth
+    HAS_AUTH = True
+except ImportError:
+    HAS_AUTH = False
+    auth = None
+
 import claude_handler
 import gateway_client
 import tiers
@@ -29,7 +42,10 @@ import tiers
 class TestFreeTier(unittest.TestCase):
 
     def setUp(self):
-        self.client = TestClient(app)
+        if HAS_FASTAPI and app is not None and HAS_AUTH:
+            self.client = TestClient(app)
+        else:
+            self.client = None
 
     def test_free_tier_head_dispatch_is_local_groq(self):
         """Free tier resolves directly to local Groq head, never gateway."""
@@ -62,6 +78,22 @@ class TestFreeTier(unittest.TestCase):
         # Non-negotiable check: gateway_client must NOT have been called
         mock_gw.assert_not_called()
 
+    def test_free_fallback_servant_gated_is_unblocked(self):
+        """Free/fallback tier now has access to full gated capability seat (zero cost-gate refusal)."""
+        seat = tiers.servant_gated("free")
+        self.assertTrue(bool(seat), "servant_gated('free') must return truthy GatedSeat, not Unavailable")
+        self.assertEqual(seat.plan, "free")
+        # fine-tuned LoRA task adapters remain Pro-exclusive
+        self.assertFalse(seat.adapters, "Adapters must remain Pro-exclusive")
+
+    def test_free_fallback_guard_mode_enforces_serial_gated(self):
+        """Free/fallback tier must enforce serial_gated=True for identical safety to Standard."""
+        mode = tiers.guard_mode("free")
+        self.assertTrue(mode.serial_gated, "serial_gated must be True on free/fallback tier")
+        self.assertTrue(mode.parallel, "parallel speculative guard must be True on free/fallback tier")
+        self.assertFalse(mode.reliability_gate, "reliability_gate bypass is Pro-exclusive")
+
+    @unittest.skipUnless(HAS_FASTAPI and HAS_AUTH, "fastapi and jwt required for server gateway test")
     def test_server_v1_route_rejects_free_tier_with_403(self):
         """Server gateway must return HTTP 403 Forbidden if a Free-tier token hits /v1/route."""
         free_token = auth.issue_jwt("free_user_123", "free")
