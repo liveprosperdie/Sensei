@@ -63,6 +63,28 @@ def generate(brief: str, format_instructions: str = "",
     prompt = (f"Write the following content in roughly {words} words or fewer. "
               f"{format_instructions}\n\n{brief}")
 
+    # Primary: route through model_pool across verified endpoints with automatic rotation
+    try:
+        import model_pool
+        pool = model_pool.get_pool()
+        if pool.get_available_endpoints():
+            result = pool.call_model(
+                messages=[{"role": "user", "content": prompt}],
+                system="You are a professional content writer. Produce high-quality, clean, well-formatted prose matching the requested length and format. Do not include conversational preambles or meta commentary.",
+                json_mode=False,
+                timeout=60.0,
+                max_tokens=4096,
+            )
+            text = (result.text or "").strip()
+            import re
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+            if text:
+                akira_quota.record(_PURPOSE)
+                print(f"[content_generator] generated {len(text)} chars via {result.provider} ({result.model})")
+                return {"success": True, "text": text}
+    except Exception as e:
+        print(f"[content_generator] model_pool route failed ({e!r}), attempting single-endpoint fallback")
+
     try:
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",

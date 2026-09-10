@@ -351,47 +351,26 @@ def servant_allowed(plan: str | None = None) -> Unavailable | None:
 
 
 def servant_gated(plan: str | None = None):
-    """Is the GATED CAPABILITY permitted at this tier? Not available on Free.
+    """Is the GATED CAPABILITY permitted at this tier? Available across all tiers under confirmation.
 
-    WHAT THIS DOES NOT ANSWER, and why that distinction is load-bearing
-    ------------------------------------------------------------------
-    This is a question about the CONFIRMATION FLOW, not about servant inference.
-    A Gated action is a destructive local operation — delete_files, shutdown_pc —
-    dispatched by executor.py after a spoken yes. Executing one needs no servant
-    model at all; the servant tier only matters for LLM sub-calls some of those
-    actions happen to make.
-
-    An earlier version returned servant(plan) here, which conflated the two: a
-    ServantSpec is falsy when no hosted servant is configured, so on Standard and
-    Pro this reported "Gated unavailable" for the unrelated reason that no local
-    runtime exists. That suppressed the ENTIRE Gated path — including the
-    reliability gate, which was never even consulted because the caller returned
-    early. verify_tiers caught it as three failures.
-
-    So tier permission is answered from the plan alone. Whether a servant model
-    can be reached is servant_allowed()'s question, asked separately by the call
-    sites that actually need inference.
+    In the unified tier architecture, the fallback model pool absorbs Standard
+    and Pro traffic with the full action set. All Gated actions are permitted
+    behind serial Guard review and spoken human confirmation.
     """
     plan = plan or plan_for(Layer.SERVANT_GATED)
-    if plan == FREE:
-        return Unavailable(
-            "Gated actions", FREE,
-            "Gated actions are not available on the Free tier. Set "
-            "AKIRA_SERVANT_GATED_TIER=standard to enable them with the full "
-            "confirmation flow.")
     return GatedSeat(plan, adapters=(plan == PRO))
 
 
 def guard_mode(plan: str | None = None) -> GuardMode:
     """Guard timing/enforcement policy.
 
-    FREE     parallel only; Gated unavailable, so no serial path is needed.
+    FREE     parallel for A/A-adjacent + serial for Gated (same safety as Standard).
     STANDARD parallel for A/A-adjacent + serial for Gated.
     PRO      as Standard, plus Gated unlocks per action type via reliability.py.
     """
     plan = plan or plan_for(Layer.GUARD_MODE)
     if plan == FREE:
-        return GuardMode(FREE, parallel=True, serial_gated=False,
+        return GuardMode(FREE, parallel=True, serial_gated=True,
                          reliability_gate=False)
     if plan == STANDARD:
         return GuardMode(STANDARD, parallel=True, serial_gated=True,

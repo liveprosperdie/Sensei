@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import collections
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 import re
 import threading
 import time
@@ -234,6 +237,71 @@ class PoolExhaustedError(RuntimeError):
         self.retry_after = retry_after
         msg = message or f"All free models are rate-limited. Retry after {retry_after:.1f}s"
         super().__init__(msg)
+
+
+# ── Floor of Last Resort: Local On-Device Fallback (Requirement #12 & #13) ────
+_LOCAL_FLOOR_RUNNER: Callable | None = None
+
+def set_local_floor_runner(runner: Callable | None) -> None:
+    """Register custom or mocked runner for the on-device floor-of-last-resort model."""
+    global _LOCAL_FLOOR_RUNNER
+    _LOCAL_FLOOR_RUNNER = runner
+
+def _try_local_floor_fallback(
+    messages: list[dict],
+    system: str | None = None,
+    session_id: str | None = None
+) -> ModelCallResult | None:
+    """Engages local quantized model when all pool providers are down (Requirement #12).
+    
+    Logs telemetry event (Requirement #13) and executes single-action routing floor.
+    """
+    import logging
+    import datetime
+    import json
+    telemetry_logger = logging.getLogger("akira.telemetry.fallback")
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    telemetry_logger.info(
+        json.dumps({
+            "event": "fallback_routing",
+            "user_id": session_id or "local_session",
+            "timestamp": now_iso,
+            "tier_from": "free_pool",
+            "reason": "all_providers_down"
+        })
+    )
+
+    if callable(_LOCAL_FLOOR_RUNNER):
+        return _LOCAL_FLOOR_RUNNER(messages, system, session_id)
+
+    local_path = (os.environ.get("AKIRA_LOCAL_MODEL_PATH") or "").strip()
+    if not local_path or not os.path.exists(local_path):
+        return None
+
+    try:
+        from llama_cpp import Llama
+        llm = Llama(model_path=local_path, n_ctx=1024, verbose=False)
+        last_usr = ""
+        for m in reversed(messages):
+            if m.get("role") == "user":
+                last_usr = m.get("content", "")
+                break
+        res = llm(f"You are Akira system assistant. Respond strictly in JSON.\nUser: {last_usr}\nJSON:", max_tokens=120)
+        txt = res["choices"][0]["text"].strip()
+        parsed, _ = llm_json.parse(txt)
+        return ModelCallResult(
+            text=txt,
+            parsed=parsed,
+            provider="local_on_device",
+            model="quantized_floor",
+            elapsed_ms=180.0,
+            retries_made=0
+        )
+    except Exception as err:
+        logger = logging.getLogger("akira.model_pool")
+        logger.warning("[model_pool] Local floor model inference failed: %s", err)
+        return None
+
 
 
 # ── Canonical Candidate Pool (Groq Free Tier Only) ───────────────────────────
@@ -516,6 +584,7 @@ class ModelPoolManager:
         preferred_provider: str | None = None,
         session_id: str | None = None,
         on_attempt: Callable[[ModelEndpoint], None] | None = None,
+        temperature: float | None = None,
     ) -> ModelCallResult:
         """Call the optimal model from the pool with automatic failover on 429 / transport errors.
         
@@ -545,6 +614,11 @@ class ModelPoolManager:
 
             if endpoint is None:
                 # No more unexhausted models available right now
+                # Attempt floor-of-last-resort local on-device fallback (Requirement #12)
+                local_res = _try_local_floor_fallback(messages, system, session_id)
+                if local_res is not None:
+                    return local_res
+
                 wait_time = self.get_pool_exhaustion_wait()
                 if tried_names or self.get_available_endpoints():
                     raise PoolExhaustedError(
@@ -574,6 +648,10 @@ class ModelPoolManager:
                 payload["response_format"] = {"type": "json_object"}
             if max_tokens:
                 payload["max_tokens"] = max_tokens
+            if temperature is not None:
+                payload["temperature"] = temperature
+            elif json_mode:
+                payload["temperature"] = 0.0
 
             url = endpoint.get_url()
             headers = endpoint.get_headers()

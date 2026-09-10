@@ -195,6 +195,7 @@ class HeadReply:
     content: list
     stop_reason: str | None
     provider: str = "gemini"
+    model: str = "default"
     quota: dict = field(default_factory=dict)
 
     @property
@@ -510,14 +511,14 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list,
         "switch_tab (tab_title), close_tab (tab_title), new_tab (query), list_tabs, browser_control (back|forward|reload), "
         "click (text), fill (field|text), scroll (up|down|pixels)\n"
         "- Media: youtube_control (play [song]|pause|resume|next|like|volume 80), spotify_control (play [song]|pause|resume|next|previous), "
-        "netflix_control (search|q; play title|t; pause; resume; volume|70)\n"
-        "- Clipboard: screenshot, read_clipboard, write_clipboard (text), generate_to_clipboard (brief), speak_clipboard, stop_reading, read_more\n"
+        "netflix_control (search|query; play title|title; pause; resume; volume|70)\n"
+        "- Clipboard: screenshot, read_clipboard, write_clipboard (exact text), generate_to_clipboard (brief), speak_clipboard, stop_reading, read_more\n"
         "- Files: search_file (name|folder), open_file (path), open_folder (path), list_folder (path), summarize_file (path), "
         "file_to_doc (file|Doc Title|extract), copy_files (pattern|dest), compress_files (pattern|zip), extract_files (zip|dest), "
         "create_file (path|content), write_file (path|content), edit_file (path|find|replace), move_files (pattern|dest), delete_files (pattern|folder), "
         "organize_folder (folder), bulk_rename_files (pattern|new_name), index_stats, manage_index_scope (include|path / exclude|path)\n"
         "- Images: search_image (query), download_image (pick/url|path), set_wallpaper (path)\n"
-        "- Google Workspace: calendar_control (list|days; create|Title|start|end; get|id; delete|id), "
+        "- Google Workspace: calendar_control (list|days; create|Title|YYYY-MM-DD HH:MM|YYYY-MM-DD HH:MM|desc; get|id; delete|id), "
         "docs_control (create|Title|content; generate|Title|brief|short; read|id; append|id|text), "
         "sheets_control (create|Title|cells; generate|Title|brief; read|id; write|id|range|values), "
         "slides_control (create|Title|slides; generate|Title|brief|count; read|id; update|id|slides; delete|id), "
@@ -528,22 +529,39 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list,
         "meet_control (join|url; mute; camera off; leave), "
         "vscode_control (action|param), github_control (search repos|q; open repo|name; star repo; clone repo|dest; repo notes|repo), "
         "amazon_control (search|q; select result|item; add to cart; proceed to checkout), flipkart_control (search|q; select result|item; add to cart; proceed to checkout)\n"
+        "\nCore Generation & Anti-Echo Rules (P0 Correctness):\n"
+        "1. NEVER echo the literal user prompt into content parameters (e.g. user says 'write an email to marcus about the budget meeting, mention it's moved to Thursday' -> parameter must be 'generate|marcus|Budget Meeting|meeting moved to Thursday', NEVER literal body text).\n"
+        "2. TWO-STAGE GENERATION PATTERN: Routing models route intent; specialized generators write content. ALWAYS use the 'generate' action pattern when text needs to be authored:\n"
+        "   - Email: gmail_compose with parameter 'generate|recipient|Subject|topic brief'.\n"
+        "   - Word Doc/Report: office_control with parameter 'word|generate|Title|topic brief'.\n"
+        "   - Google Doc: docs_control with parameter 'generate|Title|topic brief|short'.\n"
+        "   - Notepad / Clipboard: generate_to_clipboard with parameter '1-line topic brief'.\n"
+        "   - Obsidian Notes: obsidian_control with parameter 'create|Title|structured content or key bullet points'.\n"
+        "3. Literal write_clipboard or draft is ONLY for short phrases literally dictated word-for-word by the user (e.g. 'type hello world').\n"
+        "\nAction Chaining & Sequential Rules:\n"
+        "1. When user requests multiple steps joined by 'then', 'and then', 'after that', or multiple verbs, ALWAYS emit {\"mode\": \"command\", \"actions\": [...]}.\n"
+        "2. EVERY requested step must be present in 'actions' in strict chronological order — NEVER drop or omit trailing steps.\n"
         "\nContextual Tab & History Rules:\n"
         "1. Check [RECENT ACTIONS THIS SESSION] and [CURRENT BROWSER TABS] before choosing actions.\n"
-        "2. When resolving ambiguous tab references, prioritize recently acted tabs and emit 'switch_tab'. Prioritize the tab most recently opened or acted upon.\n"
-        "3. Do NOT emit 'new_tab', 'open_site_tab', or 'web_search' when referring to an already-open or recently-acted tab.\n"
-        "4. For Word documents or reports, use office_control with word|generate|Title|brief.\n"
-        "5. For composed long text, essays, or reports to clipboard/notepad, ALWAYS emit generate_to_clipboard with a SHORT 1-line brief. NEVER write full essays or multi-paragraph text inline inside write_clipboard.\n"
+        "2. When resolving ambiguous tab references, prioritize recently acted tabs and emit 'switch_tab'.\n"
+        "3. Do NOT emit 'new_tab', 'open_site_tab', or 'web_search' when referring to an already-open tab.\n"
+        "4. Ambiguous command phrasing:\n"
+        "   - 'search netflix for [X]' -> netflix_control: 'search|[X]'\n"
+        "   - 'look up [X] on youtube' -> site_search: 'youtube|[X]'\n"
+        "   - 'stop, open spotify instead' -> open_site_tab: 'spotify'\n"
+        "   - 'write me a note on [topic]' -> obsidian_control: 'create|[Topic]|key principles and notes on [topic]'\n"
+        "   - Calendar relative dates: compute real ISO datetime strings (e.g. 'next Tuesday at 3pm' -> YYYY-MM-DD 15:00).\n"
         "\nOutput format:\n"
-        "Output tone must be one of: 'neutral', 'happy', 'calm', 'excited', 'focused'.\n"
-        "For single command: {\"mode\": \"command\", \"action\": \"canonical_action_name\", \"parameter\": \"value\", \"tone\": \"focused\"}\n"
-        "For chained/multi command: {\"mode\": \"command\", \"actions\": [{\"action\": \"action_1\", \"parameter\": \"param_1\"}, {\"action\": \"action_2\", \"parameter\": \"param_2\"}], \"tone\": \"focused\"}\n"
-        "For chat: {\"mode\": \"conversation\", \"response\": \"reply\", \"tone\": \"neutral\", \"end_session\": false}\n"
+        "Tone must be one of: 'neutral', 'happy', 'calm', 'excited', 'focused'.\n"
+        "Single command: {\"mode\": \"command\", \"action\": \"canonical_action_name\", \"parameter\": \"value\", \"tone\": \"focused\"}\n"
+        "Chained/multi command: {\"mode\": \"command\", \"actions\": [{\"action\": \"action_1\", \"parameter\": \"param_1\"}, {\"action\": \"action_2\", \"parameter\": \"param_2\"}], \"tone\": \"focused\"}\n"
+        "Chat: {\"mode\": \"conversation\", \"response\": \"reply\", \"tone\": \"neutral\", \"end_session\": false}\n"
         "\nChaining examples:\n"
-        "User: \"open notepad and write hello world\" -> {\"mode\": \"command\", \"actions\": [{\"action\": \"open_application\", \"parameter\": \"notepad\"}, {\"action\": \"write_clipboard\", \"parameter\": \"hello world\"}], \"tone\": \"focused\"}\n"
-        "User: \"open notepad and write an essay on artificial intelligence\" -> {\"mode\": \"command\", \"actions\": [{\"action\": \"open_application\", \"parameter\": \"notepad\"}, {\"action\": \"generate_to_clipboard\", \"parameter\": \"essay on artificial intelligence\"}], \"tone\": \"focused\"}\n"
-        "User: \"close excel and open spotify\" -> {\"mode\": \"command\", \"actions\": [{\"action\": \"open_application\", \"parameter\": \"spotify\"}, {\"action\": \"close_application\", \"parameter\": \"excel\"}], \"tone\": \"focused\"}\n"
-        "User: \"open word and write a report about quantum computing\" -> {\"mode\": \"command\", \"action\": \"office_control\", \"parameter\": \"word|generate|Quantum Computing|report about quantum computing\", \"tone\": \"focused\"}"
+        "User: \"open notepad, write a short paragraph about climate change, then open spotify and play lo-fi music\" -> {\"mode\": \"command\", \"actions\": [{\"action\": \"open_application\", \"parameter\": \"notepad\"}, {\"action\": \"generate_to_clipboard\", \"parameter\": \"short paragraph about climate change\"}, {\"action\": \"spotify_control\", \"parameter\": \"play lofi music\"}], \"tone\": \"focused\"}\n"
+        "User: \"search reddit for r/programming, then open notepad and write down 3 things I should look into there\" -> {\"mode\": \"command\", \"actions\": [{\"action\": \"site_search\", \"parameter\": \"reddit|r/programming\"}, {\"action\": \"open_application\", \"parameter\": \"notepad\"}, {\"action\": \"generate_to_clipboard\", \"parameter\": \"3 things to look into from r/programming\"}], \"tone\": \"focused\"}\n"
+        "User: \"write a note in obsidian about today's meeting, then send an email to sarah summarizing it\" -> {\"mode\": \"command\", \"actions\": [{\"action\": \"obsidian_control\", \"parameter\": \"create|Today's Meeting|Summary of discussions, decisions, and action items from today's meeting\"}, {\"action\": \"gmail_compose\", \"parameter\": \"generate|sarah|Meeting Summary|summarizing key decisions and next steps from today's meeting\"}], \"tone\": \"focused\"}\n"
+        "User: \"open word, write a one-paragraph report on renewable energy, then copy the report to the clipboard as well\" -> {\"mode\": \"command\", \"actions\": [{\"action\": \"office_control\", \"parameter\": \"word|generate|Renewable Energy|one-paragraph report on renewable energy\"}, {\"action\": \"generate_to_clipboard\", \"parameter\": \"one-paragraph report on renewable energy\"}], \"tone\": \"focused\"}\n"
+        "User: \"close spotify, open chrome, search netflix for stranger things, then pause\" -> {\"mode\": \"command\", \"actions\": [{\"action\": \"close_application\", \"parameter\": \"spotify\"}, {\"action\": \"open_application\", \"parameter\": \"chrome\"}, {\"action\": \"netflix_control\", \"parameter\": \"search|stranger things\"}, {\"action\": \"netflix_control\", \"parameter\": \"pause\"}], \"tone\": \"focused\"}"
     )
 
     import model_pool
@@ -590,7 +608,7 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list,
             raw_text = json.dumps({"mode": "conversation", "response": "How can I help with that?", "tone": "neutral", "end_session": False})
 
         print(f"[gemini_head] routed via {result.provider} ({result.model}) in {result.elapsed_ms:.1f}ms (retries={result.retries_made})")
-        return HeadReply([_TextBlock(raw_text)], "end_turn", provider="groq")
+        return HeadReply([_TextBlock(raw_text)], "end_turn", provider="groq", model=result.model)
 
 
     except model_pool.PoolExhaustedError as e:

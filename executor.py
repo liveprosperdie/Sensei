@@ -3324,6 +3324,10 @@ def gmail_compose(action: str, parameter: str | None = None) -> dict:
         if not gen.get("success"):
             return gen
         body = gen["text"]
+        # Post-processing: strip markdown bold/italics/headers so raw syntax never lands in the Gmail DOM
+        body = re.sub(r'\*\*(.+?)\*\*', r'\1', body)
+        body = re.sub(r'__(.+?)__', r'\1', body)
+        body = re.sub(r'^#{1,6}\s+', '', body, flags=re.MULTILINE)
 
     browser = get_browser(_last_browser_name)
     try:
@@ -4390,6 +4394,9 @@ def write_clipboard(parameter: str | None = None) -> dict:
     print(f"[write_clipboard] called with parameter={parameter!r}")
     if not parameter:
         return {"success": False, "message": "Tell me what to write to the clipboard."}
+    if parameter.strip().lower().startswith("generate|"):
+        brief = parameter.split("|", 1)[1].strip()
+        return generate_to_clipboard(brief)
     wrote = False
     try:
         # base64 the content INTO the PowerShell command — no quoting, no

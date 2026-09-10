@@ -48,7 +48,16 @@ def exchange_auth_code(code: str, nonce: str) -> tuple[str, str, str] | None:
 
     user_id = entry["user_id"]
     # Verify live tier once again against subscription database
-    live_tier = _USER_TIERS.get(user_id, entry["tier"])
+    live_tier = entry["tier"]
+    try:
+        from gateway_server import subscriptions
+        st = subscriptions.get_user_status(user_id)
+        if st and st.get("tier"):
+            live_tier = st["tier"]
+        else:
+            live_tier = _USER_TIERS.get(user_id, entry["tier"])
+    except Exception:
+        live_tier = _USER_TIERS.get(user_id, entry["tier"])
 
     refresh_token = secrets.token_urlsafe(48)
     _REFRESH_TOKENS[refresh_token] = {
@@ -98,8 +107,18 @@ def refresh_jwt(refresh_token: str, secret: str | None = None) -> tuple[str, str
     if user_id in _REVOKED_USERS:
         return None
 
-    # Re-fetch live tier from Stripe/website DB
-    live_tier = _USER_TIERS.get(user_id, "standard")
+    # Re-fetch live tier from Stripe/website DB or subscriptions table
+    live_tier = "standard"
+    try:
+        from gateway_server import subscriptions
+        st = subscriptions.get_user_status(user_id)
+        if st and st.get("tier"):
+            live_tier = st["tier"]
+        else:
+            live_tier = _USER_TIERS.get(user_id, "standard")
+    except Exception:
+        live_tier = _USER_TIERS.get(user_id, "standard")
+
     new_jwt = issue_jwt(user_id, live_tier, secret=secret)
     return new_jwt, live_tier
 

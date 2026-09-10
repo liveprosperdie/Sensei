@@ -77,21 +77,37 @@ def get_today_str() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
 
 
+def log_fallback_event(user_id: str, tier: str, reason: str) -> None:
+    """Internal telemetry: logs fallback transitions for analytics/capacity (Requirement #13)."""
+    telemetry_logger = logging.getLogger("akira.telemetry.fallback")
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    telemetry_logger.info(
+        json.dumps({
+            "event": "fallback_routing",
+            "user_id": user_id,
+            "timestamp": now_iso,
+            "tier_from": tier,
+            "reason": reason
+        })
+    )
+
+
 def check_and_increment_turn(user_id: str, tier: str) -> QuotaVerdict:
-    """Atomic quota check and increment for Standard & Pro tiers.
+    """Atomic quota check and increment for Standard, Pro, and Fallback tiers.
 
     - Free tier does not call this function (Free is 100% local and unmetered).
-    - Checks Claude cap (Standard=30, Pro=53).
-    - If Claude cap reached OR Redis is down, automatically shifts to Groq free API fallback.
+    - Checks Claude cap (Standard=30, Pro=53, Fallback=0).
+    - If Claude cap reached OR user is on fallback tier OR Redis is down, automatically shifts to Groq free API fallback.
     - If Groq fallback is also exhausted, returns allowed=False (HTTP 429).
     """
-    if tier not in ("standard", "pro"):
+    valid_tiers = ("standard", "pro", "fallback_permanent", "fallback_tier", "fallback")
+    if tier not in valid_tiers:
         return QuotaVerdict(
             allowed=False, use_fallback=False, used_today=0, cap=0, remaining=0,
             reason=f"Unknown tier '{tier}'."
         )
 
-    claude_cap = config.TIER_CAPS.get(tier, 30)
+    claude_cap = config.TIER_CAPS.get(tier, 0 if "fallback" in tier else 30)
     fallback_cap = config.TIER_CAPS.get("fallback_groq", 250)
     today = get_today_str()
 
@@ -146,6 +162,8 @@ def check_and_increment_turn(user_id: str, tier: str) -> QuotaVerdict:
         fb_res = r.eval(_LUA_ATOMIC_INCR, 1, fallback_key, fallback_cap)
         if fb_res != -1:
             fb_used = int(fb_res)
+            fallback_reason = "trial_expired" if "fallback" in tier else "quota_exhausted"
+            log_fallback_event(user_id, tier, fallback_reason)
             logger.info("[QUOTA] User %s exceeded Claude cap (%d/%d). Auto-shifted to Groq fallback (%d/%d).",
                         user_id, claude_cap, claude_cap, fb_used, fallback_cap)
             return QuotaVerdict(
