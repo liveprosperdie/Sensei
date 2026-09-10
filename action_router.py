@@ -495,7 +495,7 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None,
         verdict = guard.review(action, parameter, label="guard:serial", **kwargs)
         print(f"[router] {action} tier={step_tier.value} serial "
               f"(rollback={why}) {verdict}")
-        if not verdict.allowed:
+        if verdict.decision == guard_rules.BLOCK or (not confirmed and not verdict.allowed):
             # Nothing ran, so there is nothing to undo — which is the entire
             # point of paying the guard's latency serially for these.
             return Outcome(step_tier, verdict, executed=False)
