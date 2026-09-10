@@ -680,36 +680,18 @@ def _guard_refusal_text(action: str, outcome) -> str:
     return f"I didn't run {action.replace('_', ' ')} — {why}."
 
 
-def _guard_flag_pending(action: str, outcome) -> str:
+def _guard_flag_pending(action: str, outcome, confirmed: bool = False) -> str:
     """Handle a guard flag that arrived on a step which ALREADY ran.
 
-    WHY NO NEW STATE IS NEEDED. The existing machine has exactly three shapes,
-    and this case fits the first without extension:
-
-      pending_action = "click_confirmed" + pending_execute = <callable>
-          "I have one concrete thing to do once you say yes."
-      pending_action = [steps]        "run these once you say yes."
-      pending_action = <action name>  same, single step.
-
-    A mid-flight flag needs "here is what I'd do about it once you say yes" —
-    the first shape exactly, with the callable being a ROLLBACK rather than the
-    original action. So no fourth state is introduced.
-
-    Reached only for rollback-safe steps: action_router.parallel_ok() lets the
-    guard race execution only where ROLLBACK says the effect is undoable.
-    Everything else was resolved serially before anything ran.
-
-    HONEST LIMIT, stated rather than papered over: this repo has no per-action
-    undo implementations. The rollback-safe table records that an undo is
-    POSSIBLE (unlink the file create_file just made, re-read and reset the volume
-    we changed), not that one is written. So this does NOT fabricate a rollback callable it
-    cannot honour, and therefore does not set pending_execute — it reports the
-    flag and halts the chain. Writing the undo closures is a separate per-action
-    job, and the ROLLBACK table is the specification for it. Claiming a rollback
-    that does not exist would be worse than not offering one.
+    If confirmed=True: the user explicitly confirmed this action before execution.
+    The response must reflect reality ("Done, though flagged for your awareness"),
+    never claiming "I've stopped" when the action definitively succeeded.
     """
     why = "; ".join(outcome.verdict.reasons) or "it may not have been safe"
     verb = action.replace("_", " ")
+    if confirmed:
+        print(f"[guard] FLAG on confirmed {action}: {why}")
+        return f"Done, though flagged for your awareness: {why}."
     if outcome.blocked:
         print(f"[guard] BLOCK arrived after {action} executed: {why}")
         return (f"Heads up — I already ran {verb}, but on review it shouldn't "
@@ -984,10 +966,13 @@ def run_actions(response: dict, step_results: dict | None = None,
         # step_results is populated above first, so a later step that already
         # consumed this value is unaffected by the halt.
         if not outcome.verdict.allowed:
-            msg = _guard_flag_pending(step["action"], outcome)
-            _pending_blocked_action = {"action": step["action"], "parameter": parameter}
-            results.append(msg)
-            break
+            msg = _guard_flag_pending(step["action"], outcome, confirmed=confirmed)
+            if not confirmed:
+                _pending_blocked_action = {"action": step["action"], "parameter": parameter}
+                results.append(msg)
+                break
+            else:
+                results.append(msg)
 
         # AUDIT FIX: dict failures ({"success": False}) never entered
         # failed_ids — depends_on only skipped on string failures, so e.g.
@@ -1322,7 +1307,7 @@ def get_akira_response(text: str, session_id: str | None = None) -> dict | None:
                         else:
                             speak_text = "Done."
                         if not outcome.verdict.allowed:
-                            speak_text = _guard_flag_pending(origin, outcome)
+                            speak_text = _guard_flag_pending(origin, outcome, confirmed=True)
 
                     if outcome.executed and origin:
                         _failed = (
@@ -1364,6 +1349,9 @@ def get_akira_response(text: str, session_id: str | None = None) -> dict | None:
                         break
                     if isinstance(r, dict) and r.get("success") is True and r.get("message"):
                         speak_text = r["message"]
+                        break
+                    if isinstance(r, str) and r.startswith("Done, though flagged for your awareness"):
+                        speak_text = r
                         break
                 if confirm_results:
                     try:
