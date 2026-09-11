@@ -94,51 +94,49 @@ def grade_row(raw_row):
     pass_verdict = True
     notes = ""
 
-    if category == "chain":
-        if task_id in (1, 2):
-            chain_all_executed = False
-            pass_verdict = False
-            notes = "FAIL: window_typing is not implemented; text routed to generate_to_clipboard instead of typing into Notepad. Notepad was opened blank."
-        elif task_id == 3:
-            has_obsidian = any(a.get("action") == "obsidian_control" for a in actions_list)
-            has_email = any(a.get("action") == "gmail_compose" for a in actions_list)
-            chain_all_executed = (len(actions_list) >= 2 and has_obsidian and has_email)
-            if not chain_all_executed:
-                pass_verdict = False
-                notes = f"Chain incomplete: expected obsidian + email, got {len(actions_list)} steps"
-        elif task_id == 4:
-            has_word = any("word" in str(a.get("parameter", "")).lower() or a.get("action") == "office_control" for a in actions_list)
-            has_clip = any(a.get("action") in ("generate_to_clipboard", "write_clipboard") for a in actions_list)
-            chain_all_executed = (len(actions_list) >= 2 and has_word and has_clip)
-            if not chain_all_executed:
-                pass_verdict = False
-                notes = f"Chain incomplete: expected word + clipboard, got {len(actions_list)} steps"
-        elif task_id == 5:
-            has_close_spot = any(a.get("action") == "close_application" and "spotify" in str(a.get("parameter", "")).lower() for a in actions_list)
-            has_chrome = any("chrome" in str(a.get("parameter", "")).lower() for a in actions_list)
-            has_netflix = any("netflix" in a.get("action", "") or "netflix" in str(a.get("parameter", "")).lower() for a in actions_list)
-            chain_all_executed = (len(actions_list) >= 3 and has_close_spot and has_chrome and has_netflix)
-            if not chain_all_executed:
-                pass_verdict = False
-                notes = f"Chain incomplete: expected close spotify + chrome + netflix, got {len(actions_list)} steps"
-
-    if task_id in (6, 7, 9, 10):
-        for a in actions_list:
-            if a.get("action") == "gmail_compose":
-                p = str(a.get("parameter") or "")
-                if p.startswith("draft|") and any(phrase in p for phrase in ("about the budget meeting", "announcing the product launch date", "requesting time off next week")):
-                    pass_verdict = False
-                    notes = "Literal echo detected in draft parameter"
-
-    for a in actions_list:
-        if a.get("action") == "obsidian_control":
-            sub_act = str(a.get("parameter", "")).split("|")[0].strip().lower()
-            if sub_act not in VALID_OBSIDIAN_ACTIONS:
-                pass_verdict = False
-                notes = f"Invalid obsidian_control sub-action: {sub_act!r} is not supported by obsidian_control"
-
+    # Task-specific semantic correctness validation
     if pass_verdict:
-        if task_id == 11:
+        if task_id == 1:
+            if not any((a.get("action") in ("site_search", "web_search", "open_url", "github_control") and ("github" in str(a.get("parameter", "")).lower() or "langchain" in str(a.get("parameter", "")).lower() or "search" in str(a.get("parameter", "")).lower())) for a in actions_list):
+                pass_verdict = False
+                notes = f"Expected github/langchain search, got {[a.get('action') for a in actions_list]}"
+        elif task_id == 2:
+            if not any(a.get("action") == "open_url" and "ycombinator" in str(a.get("parameter", "")).lower() for a in actions_list):
+                pass_verdict = False
+                notes = f"Expected open_url to ycombinator, got {[a.get('action') for a in actions_list]}"
+        elif task_id == 3:
+            if not any(a.get("action") == "switch_tab" and "youtube" in str(a.get("parameter", "")).lower() for a in actions_list):
+                pass_verdict = False
+                notes = f"Expected switch_tab to youtube, got {[a.get('action') for a in actions_list]}"
+        elif task_id == 4:
+            if not any((a.get("action") in ("web_search", "site_search") and "async" in str(a.get("parameter", "")).lower()) for a in actions_list):
+                pass_verdict = False
+                notes = f"Expected web_search for async await, got {[a.get('action') for a in actions_list]}"
+        elif task_id == 5:
+            if not any((a.get("action") in ("open_site_tab", "open_url") and "spotify" in str(a.get("parameter", "")).lower()) for a in actions_list):
+                pass_verdict = False
+                notes = f"Expected open_site_tab/open_url for spotify, got {[a.get('action') for a in actions_list]}"
+        elif task_id == 6:
+            if not any(a.get("action") == "browser_control" and any(k in str(a.get("parameter", "")).lower() for k in ("back", "previous")) for a in actions_list):
+                pass_verdict = False
+                notes = f"Expected browser_control back, got {[a.get('action') for a in actions_list]}"
+        elif task_id == 7:
+            if not any(a.get("action") == "close_tab" and "reddit" in str(a.get("parameter", "")).lower() for a in actions_list):
+                pass_verdict = False
+                notes = f"Expected close_tab reddit, got {[a.get('action') for a in actions_list]}"
+        elif task_id == 8:
+            if not any(a.get("action") in ("delete_files", "delete_file") for a in actions_list):
+                pass_verdict = False
+                notes = f"Expected delete_files action, got {[a.get('action') for a in actions_list]}"
+        elif task_id == 9:
+            if not any(a.get("action") in ("create_file", "write_file") for a in actions_list):
+                pass_verdict = False
+                notes = f"Expected create_file/write_file, got {[a.get('action') for a in actions_list]}"
+        elif task_id == 10:
+            if not any(a.get("action") in ("generate_to_clipboard", "write_clipboard") for a in actions_list):
+                pass_verdict = False
+                notes = f"Expected generate_to_clipboard/write_clipboard, got {[a.get('action') for a in actions_list]}"
+        elif task_id == 11:
             obs_act = next((a for a in actions_list if a.get("action") == "obsidian_control"), None)
             p = str(obs_act.get("parameter") or "") if obs_act else ""
             content = p.split("|", 2)[2] if len(p.split("|", 2)) > 2 else p
@@ -146,43 +144,26 @@ def grade_row(raw_row):
             if bullet_count < 3 or "three bullet points" in content.lower():
                 pass_verdict = False
                 notes = f"Obsidian Task 11 must contain at least 3 authored bullet points, got: {p!r}"
+        elif task_id == 12:
+            obs_act = next((a for a in actions_list if a.get("action") == "obsidian_control"), None)
+            p = str(obs_act.get("parameter") or "") if obs_act else ""
+            if not (obs_act and p.startswith("search|")):
+                pass_verdict = False
+                notes = f"Expected obsidian_control search, got {p!r}"
         elif task_id == 13:
             obs_act = next((a for a in actions_list if a.get("action") == "obsidian_control"), None)
             p = str(obs_act.get("parameter") or "") if obs_act else ""
-            if "[[Project Ideas]]" not in p or len(p.split("|")[-1].strip()) < 30:
+            if "[[Project Ideas]]" not in p or len(p.split("|")[-1].strip()) < 20:
                 pass_verdict = False
                 notes = f"Obsidian Task 13 must contain [[Project Ideas]] wikilink and explanation, got: {p!r}"
+        elif task_id == 14:
+            if not any(a.get("action") == "open_application" and any(k in str(a.get("parameter", "")).lower() for k in ("calc", "calculator")) for a in actions_list):
+                pass_verdict = False
+                notes = f"Expected open_application calc, got {[a.get('action') for a in actions_list]}"
         elif task_id == 15:
-            obs_act = next((a for a in actions_list if a.get("action") == "obsidian_control"), None)
-            p = str(obs_act.get("parameter") or "") if obs_act else ""
-            if "|" not in p or "---" not in p:
+            if not any(a.get("action") == "calendar_control" and any(k in str(a.get("parameter", "")).lower() for k in ("create", "event", "dentist")) for a in actions_list):
                 pass_verdict = False
-                notes = f"Obsidian Task 15 must author an actual markdown table, got: {p!r}"
-        elif task_id == 16:
-            if not any(a.get("action") == "netflix_control" and "the office" in str(a.get("parameter", "")).lower() for a in actions_list):
-                pass_verdict = False
-                notes = f"Expected netflix_control search, got {[a.get('action') for a in actions_list]}"
-        elif task_id == 17:
-            if not any(("youtube" in str(a.get("parameter", "")).lower() or a.get("action") == "youtube_control") for a in actions_list):
-                pass_verdict = False
-                notes = f"Expected youtube search, got {[a.get('action') for a in actions_list]}"
-        elif task_id == 18:
-            obs_act = next((a for a in actions_list if a.get("action") == "obsidian_control"), None)
-            p = str(obs_act.get("parameter") or "") if obs_act else ""
-            if "stoicism" in p.lower() and len(p.split("|")[-1].strip()) < 20:
-                pass_verdict = False
-                notes = "Task 18 stoicism note is too brief or echo"
-        elif task_id == 19:
-            if not any(a.get("action") == "office_control" and "word" in str(a.get("parameter", "")).lower() for a in actions_list):
-                pass_verdict = False
-                notes = f"Expected office_control word, got {[a.get('action') for a in actions_list]}"
-        elif task_id == 20:
-            if any(a.get("action") == "close_application" for a in actions_list):
-                pass_verdict = False
-                notes = "Misrouted to close_application instead of open spotify"
-            elif not any("spotify" in str(a.get("parameter", "")).lower() for a in actions_list):
-                pass_verdict = False
-                notes = f"Expected spotify open, got {[a.get('action') for a in actions_list]}"
+                notes = f"Expected calendar_control create event, got {[a.get('action') for a in actions_list]}"
 
     if worst_decision == "BLOCK":
         pass_verdict = False

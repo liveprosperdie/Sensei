@@ -183,6 +183,7 @@ ROLLBACK: dict[str, Rollback] = {
     # hijacking seam (swapped wallet address, a command staged for the user's
     # next paste), so the guard must clear it BEFORE the content lands, not after.
     "write_clipboard": Rollback.UNSAFE,
+    "generate_to_clipboard": Rollback.UNSAFE,
 
     # ── NOT ROLLBACK-SAFE ────────────────────────────────────────────────
     # Every entry below is forced serial by parallel_ok(), even though several
@@ -295,7 +296,7 @@ ROLLBACK: dict[str, Rollback] = {
 # inferred from ROLLBACK. Latency handling is identical to Tier A — the split
 # exists for logging, policy review, and Prompt 4's per-tier toggles.
 A_ADJACENT: frozenset[str] = frozenset({
-    "create_file", "download_image", "set_wallpaper", "write_clipboard",
+    "create_file", "download_image", "set_wallpaper", "write_clipboard", "generate_to_clipboard",
     "copy_files", "compress_files", "extract_files",
     "adjust_volume", "adjust_brightness",
     "open_application", "open_settings", "open_system_tool",

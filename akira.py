@@ -1487,10 +1487,8 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
 
 if __name__ == "__main__":
     _init_avatar()
-    try:
-        executor.warmup_browser()
-    except Exception as _w_err:
-        print(f"[BROWSER] Warmup warning: {_w_err}")
+    # Note: Browser is NOT pre-warmed on startup to keep cold-start lightweight and instant.
+    # Browser launches/attaches lazily on the first browser action.
     try:
         import file_index
         file_index.init_file_index(background=True)

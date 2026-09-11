@@ -12,29 +12,24 @@ import gemini_head
 from scratch.chain_utils import append_row, get_last_hash
 
 TASKS = [
-    (1, "Open notepad, write a short paragraph about climate change, then open spotify and play lo-fi music", "chain"),
-    (2, "Search reddit for r/programming, then open notepad and write down 3 things I should look into there", "chain"),
-    (3, "Write a note in obsidian about today's meeting, then send an email to sarah summarizing it", "chain"),
-    (4, "Open word, write a one-paragraph report on renewable energy, then copy the report to the clipboard as well", "chain"),
-    (5, "Close spotify, open chrome, search netflix for stranger things, then pause", "chain"),
+    # --- BROWSER-HEAVY TASKS ---
+    (1, "Search github for langchain repository", "browser"),
+    (2, "Open https://news.ycombinator.com", "browser"),
+    (3, "Switch to YouTube tab", "browser"),
+    (4, "Look up how async await works in python", "browser"),
+    (5, "Open spotify web player in browser", "browser"),
+    (6, "Go back to the previous page", "browser"),
+    (7, "Close the reddit tab", "browser"),
 
-    (6, "Write an email to marcus about the budget meeting, mention it's moved to Thursday", "workspace"),
-    (7, "Draft an email to the whole team announcing the product launch date", "workspace"),
-    (8, "Create a calendar event for a dentist appointment next Tuesday at 3pm", "workspace"),
-    (9, "Write an email to hr requesting time off next week, keep it professional", "workspace"),
-    (10, "Reply to sarah's email agreeing to the proposal, add one clarifying question", "workspace"),
-
+    # --- NON-BROWSER / GUARDED / GENERATIVE / OBSIDIAN TASKS ---
+    (8, "Delete the temporary test files in C:/temp/scratch", "file"),
+    (9, "Create a file named notes.txt with table: Column A | Column B | Column C", "file"),
+    (10, "Write a three-bullet summary of quantum computing to clipboard", "generative"),
     (11, "Create a note in obsidian titled 'Project Ideas' and write three bullet points of ideas about a mobile app", "obsidian"),
-    (12, "Add a new section to my existing obsidian daily note summarizing what I did today", "obsidian"),
+    (12, "Search my obsidian vault for notes about 'budget' and summarize what you find", "obsidian"),
     (13, "Create an obsidian note that links to my 'Project Ideas' note and explains why I'm revisiting it", "obsidian"),
-    (14, "Search my obsidian vault for notes about 'budget' and summarize what you find", "obsidian"),
-    (15, "Create a note in obsidian with a markdown table comparing three phone models", "obsidian"),
-
-    (16, "search netflix for the office", "ambiguous"),
-    (17, "look up python tutorials on youtube", "ambiguous"),
-    (18, "write me a note on stoicism", "ambiguous"),
-    (19, "open word and write a report about quantum computing", "ambiguous"),
-    (20, "stop, open spotify instead", "ambiguous"),
+    (14, "Open calculator", "system"),
+    (15, "Create a calendar event for a dentist appointment next Tuesday at 3pm", "workspace"),
 ]
 
 RESULTS_PATH = r"d:\Coding\Projects\Sensei\scratch\results_chain.jsonl"

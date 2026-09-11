@@ -901,7 +901,10 @@ def _navigate(url: str) -> None:
     """Navigate Akira's dedicated tab to a URL. Never touches user's other tabs."""
     browser = get_browser(_last_browser_name)
     browser.switch_to.window(browser._akira_tab)
-    browser.get(url)
+    try:
+        browser.execute_cdp_cmd("Page.navigate", {"url": url})
+    except Exception:
+        browser.get(url)
 
 
 _NAV_ALIASES = {
@@ -986,28 +989,21 @@ def get_foreground_app() -> str | None:
 
 
 def get_pc_context() -> dict:
+    """Lightweight inventory of open windows and running applications.
+    
+    Zero browser action, zero CDP port polling. Browser tab inspection happens
+    lazily right before a browser action executes.
+    """
     windows = []
     try:
         windows = [w.title for w in gw.getAllWindows() if w.title.strip()][:10]
     except Exception:
         pass
 
-    # PASSIVE read via the CDP HTTP endpoint — must NEVER call get_browser()
-    # here: that attaches selenium + creates the Akira tab, which opened a
-    # blank tab at every session start even for file/Spotify/app tasks.
-    current_url, current_title = None, None
-    try:
-        for t in get_all_tabs():
-            if t.get("url") and not t["url"].startswith("about:"):
-                current_url, current_title = t["url"], t.get("title")
-                break
-    except Exception:
-        pass
-
     return {
         "open_windows": windows,
-        "current_url": current_url,
-        "current_page_title": current_title,
+        "current_url": None,
+        "current_page_title": None,
         "foreground_app": get_foreground_app(),
     }
 
@@ -1760,9 +1756,9 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     if action == "search":
         if not parameter:
             return {"success": False, "message": "Search needs a query."}
-        browser.get("https://www.netflix.com/search?q=" + urllib.parse.quote(parameter))
+        _navigate("https://www.netflix.com/search?q=" + urllib.parse.quote(parameter))
         try:
-            WebDriverWait(browser, 10).until(
+            WebDriverWait(browser, 2.5).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".title-card, [data-uia*='title-card']")))
         except Exception:
             pass
@@ -5774,10 +5770,10 @@ _ACTION_MAP = {
     "click":             _handle_click,
     "browser_control":   browser_control,
     "youtube_control":   youtube_control,
-    "netflix_control":   lambda p: netflix_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
+    "netflix_control":   lambda p: netflix_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "meet_control":      lambda p: meet_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
-    "amazon_control":    lambda p: amazon_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
-    "flipkart_control":  lambda p: flipkart_control(p.split("|")[0], p.split("|")[1] if "|" in p else None),
+    "amazon_control":    lambda p: amazon_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
+    "flipkart_control":  lambda p: flipkart_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "github_control":    lambda p: github_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "vscode_control":    lambda p: vscode_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),
     "spotify_control":   lambda p: spotify_control(p.split("|")[0], p.split("|", 1)[1] if "|" in p else None),

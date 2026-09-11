@@ -144,7 +144,9 @@ SUB_ARGS = Rule(1, 3)                # "app|sub|args"
 SUB_MULTI = Rule(1, 6)               # multi-field commands (e.g. gmail_compose generate|to|subject|body)
 SUB_MULTI_UNSCREENED = Rule(1, 6, screen=False, split_pipe=True)  # multi-field unscreened (office_control generate/insert briefs)
 SUB_VAULT = Rule(1, 999)             # vault free text and markdown notes (arbitrary pipes in tables/content)
-FILL = Rule(1, 3)                    # "field|text" or "field|text|submit" (Mech Servant fill+enter)
+SUB_FREE_TEXT = Rule(1, 999, screen=True, split_pipe=True)       # free-text content / markdown / email bodies (screened)
+SUB_FREE_TEXT_UNSCREENED = Rule(1, 999, screen=False, split_pipe=True) # free-text search queries / media / office (unscreened)
+FILL = Rule(1, 999, screen=True, split_pipe=True)               # "field|text" or "field|text|submit" (text may contain '|')
 
 # ACTION_RULES — every key in executor._ACTION_MAP must appear here.
 # verify_guard_coverage.py enforces that statically; if you add an executor
@@ -159,65 +161,65 @@ ACTION_RULES: dict[str, Rule] = {
     "minimize_window": OPT_OPAQUE_TEXT,
     # ── browser & web ─────────────────────────────────────────────────────
     "open_url": OPAQUE_TEXT,
-    "web_search": SUB_UNSCREENED,
-    "site_search": SUB_UNSCREENED,
+    "web_search": SUB_FREE_TEXT_UNSCREENED,
+    "site_search": SUB_FREE_TEXT_UNSCREENED,
     "fill": FILL,
     "scroll": OPT_TEXT,
-    "new_tab": SUB,
+    "new_tab": SUB_FREE_TEXT,
     "open_site_tab": OPAQUE_TEXT,
     "list_tabs": IGNORED,
     "switch_tab": OPAQUE_TEXT,
     "close_tab": OPT_OPAQUE_TEXT,
-    "click": TEXT,
+    "click": OPAQUE_TEXT,
     "browser_control": SUB,
     "bookmark_page": IGNORED,
     # ── site-specific controllers ─────────────────────────────────────────
-    "youtube_control": SUB_UNSCREENED,
-    "netflix_control": SUB_UNSCREENED,
-    "meet_control": SUB,
-    "amazon_control": SUB,
-    "flipkart_control": SUB,
-    "github_control": SUB,
-    "vscode_control": SUB,
-    "spotify_control": SUB_UNSCREENED,
+    "youtube_control": SUB_FREE_TEXT_UNSCREENED,
+    "netflix_control": SUB_FREE_TEXT_UNSCREENED,
+    "meet_control": SUB_FREE_TEXT,
+    "amazon_control": SUB_FREE_TEXT,
+    "flipkart_control": SUB_FREE_TEXT,
+    "github_control": SUB_FREE_TEXT,
+    "vscode_control": SUB_FREE_TEXT,
+    "spotify_control": SUB_FREE_TEXT_UNSCREENED,
     # ── Google Workspace (MCP) ────────────────────────────────────────────
-    "calendar_control": SUB_MULTI,
-    "docs_control": SUB_MULTI,
-    "sheets_control": SUB_MULTI,
-    "slides_control": SUB_MULTI,
-    "gmail_control": SUB_MULTI,
-    "gmail_compose": SUB_MULTI,
+    "calendar_control": SUB_FREE_TEXT,
+    "docs_control": SUB_FREE_TEXT,
+    "sheets_control": SUB_FREE_TEXT,
+    "slides_control": SUB_FREE_TEXT,
+    "gmail_control": SUB_FREE_TEXT,
+    "gmail_compose": SUB_FREE_TEXT,
     # ── Microsoft Office (COM) ────────────────────────────────────────────
-    "office_control": SUB_MULTI_UNSCREENED,
+    "office_control": SUB_FREE_TEXT_UNSCREENED,
     # ── Obsidian ──────────────────────────────────────────────────────────
     "obsidian_control": SUB_VAULT,
     # ── files ─────────────────────────────────────────────────────────────
-    "create_file": SUB_MULTI,
+    "create_file": SUB_FREE_TEXT,
     "read_file": OPAQUE_TEXT,
     "read_more": SUB,
     "stop_reading": IGNORED,
-    "write_file": SUB,
-    "edit_file": SUB_MULTI,
+    "write_file": SUB_FREE_TEXT,
+    "edit_file": SUB_FREE_TEXT,
     "search_file": OPAQUE_TEXT,
     "manage_index_scope": SUB,
     "index_stats": IGNORED,
     "open_file": OPAQUE_TEXT,
     "open_folder": OPAQUE_TEXT,
     "list_folder": OPT_OPAQUE_TEXT,
-    "copy_files": SUB,
-    "move_files": SUB,
-    "organize_files": OPT_TEXT,
-    "delete_files": TEXT,
-    "organize_folder": OPT_TEXT,
-    "bulk_rename_files": SUB,
-    "compress_files": SUB,
-    "extract_files": SUB,
+    "copy_files": SUB_FREE_TEXT,
+    "move_files": SUB_FREE_TEXT,
+    "organize_files": SUB_FREE_TEXT,
+    "delete_files": SUB_FREE_TEXT,
+    "organize_folder": SUB_FREE_TEXT,
+    "bulk_rename_files": SUB_FREE_TEXT,
+    "compress_files": SUB_FREE_TEXT,
+    "extract_files": SUB_FREE_TEXT,
     "summarize_file": OPAQUE_TEXT,
-    "file_to_doc": SUB,
+    "file_to_doc": SUB_FREE_TEXT,
     # ── media & clipboard ─────────────────────────────────────────────────
-    "search_image": SUB_UNSCREENED,
-    "download_image": TEXT,
-    "set_wallpaper": TEXT,
+    "search_image": SUB_FREE_TEXT_UNSCREENED,
+    "download_image": SUB_FREE_TEXT,
+    "set_wallpaper": SUB_FREE_TEXT,
     "read_clipboard": IGNORED,
     "write_clipboard": OPAQUE_TEXT,
     "generate_to_clipboard": OPAQUE_TEXT,  # compose content → clipboard (Bug A fix)
@@ -261,8 +263,8 @@ ACTION_RULES: dict[str, Rule] = {
     "write_text": OPAQUE_TEXT,       # → write_clipboard (intercepted in pre-router)
     "type_text": OPAQUE_TEXT,        # → write_clipboard
     "insert_text": OPAQUE_TEXT,      # → write_clipboard
-    "fill_input": SUB_MULTI,         # → fill
-    "click_element": TEXT,           # → click
+    "fill_input": SUB_FREE_TEXT,     # → fill
+    "click_element": OPAQUE_TEXT,    # → click
     "file_search": OPAQUE_TEXT,      # → search_file
     "folder_search": OPAQUE_TEXT,    # → search_file
 }
