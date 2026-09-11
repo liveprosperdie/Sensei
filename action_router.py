@@ -158,6 +158,12 @@ ROLLBACK: dict[str, Rollback] = {
     # only justification that survives scrutiny, and it does not generalise.
     "adjust_volume": Rollback.SAFE,
     "adjust_brightness": Rollback.SAFE,
+    # system_control is the voice-shortcut dispatcher (bluetooth_on, volume:N,
+    # screenshot, wifi_on...). All sub-commands are reversible at the OS level.
+    "system_control": Rollback.SAFE,
+    # type_in_app pastes text via clipboard — typing is undoable in every native
+    # app and leaves no trace outside the target application.
+    "type_in_app": Rollback.SAFE,
 
     # ── destroy-on-write: prior value is NOT captured, VERIFIED in executor ──
     # Both of these were initially marked SAFE on the assumption that the prior
@@ -294,6 +300,7 @@ A_ADJACENT: frozenset[str] = frozenset({
     "adjust_volume", "adjust_brightness",
     "open_application", "open_settings", "open_system_tool",
     "toggle_wifi", "toggle_bluetooth",
+    "type_in_app", "system_control",
     # Navigation reaches a third party on load, so the guard's opinion matters
     # here for the same reason it does for click/fill.
     "open_url", "open_site_tab", "web_search",

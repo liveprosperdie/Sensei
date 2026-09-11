@@ -127,7 +127,7 @@ GUARD_MAX_TOKENS = 400
 # Shorter than the servant default: this sits in front of a user-visible action,
 # and a guard that takes 90s to approve "open notepad" will be removed by the
 # user long before it ever blocks anything.
-GUARD_TIMEOUT = 20.0
+GUARD_TIMEOUT = 6.0
 
 GUARD_SYSTEM = """You are a safety guard for a voice assistant that controls a \
 Windows PC. You are given ONE planned action and its parameter. Decide whether \

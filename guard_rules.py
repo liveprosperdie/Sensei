@@ -149,6 +149,10 @@ ACTION_RULES: dict[str, Rule] = {
     "switch_window": TEXT,
     "maximize_window": OPT_TEXT,
     "minimize_window": OPT_TEXT,
+    # ── native app typing (added for voice-driven text input) ─────────────
+    "type_in_app": SUB,   # "app name|text to type"
+    # ── system control dispatcher (voice shortcuts: bluetooth_on, volume:N) ─
+    "system_control": TEXT,   # single token like "bluetooth_on", "volume:40"
     # ── browser & web ─────────────────────────────────────────────────────
     "open_url": TEXT,
     "web_search": TEXT,

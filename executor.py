@@ -5551,6 +5551,36 @@ def _handle_click(parameter: str) -> str | dict:
     return f"Clicked {result['element']['text'][:50]}."
 
 
+
+# system_control dispatcher — maps compact voice tokens to real handlers.
+# The LLM and fast-pattern router both emit {"action":"system_control","parameter":"bluetooth_on"}
+# rather than needing to know toggle_bluetooth, adjust_volume etc.
+def _system_control_dispatch(parameter: str) -> dict | str:
+    p = (parameter or "").strip().lower()
+    if p in ("bluetooth_on", "bluetooth on"):
+        return _system_control.toggle_bluetooth("on")
+    if p in ("bluetooth_off", "bluetooth off"):
+        return _system_control.toggle_bluetooth("off")
+    if p in ("wifi_on", "wifi on", "wi-fi on"):
+        return _system_control.toggle_wifi("on")
+    if p in ("wifi_off", "wifi off", "wi-fi off"):
+        return _system_control.toggle_wifi("off")
+    if p == "screenshot":
+        return screenshot()
+    if p == "performance" or p == "performance_stats":
+        return _system_control.performance_stats("")
+    if p.startswith("volume:"):
+        return adjust_volume(p.split(":", 1)[1].strip())
+    if p.startswith("brightness:"):
+        return adjust_brightness(p.split(":", 1)[1].strip())
+    if p in ("lock", "lock_pc", "lock pc"):
+        return _system_control.lock_pc("")
+    if p in ("sleep", "sleep_pc", "sleep pc"):
+        return _system_control.sleep_pc("")
+    # Fallback: try opening as a settings page
+    return _system_control.open_settings(parameter)
+
+
 # Dispatch table — replaces 150-line if/elif chain
 _ACTION_MAP = {
     "open_application":  open_application,
@@ -5635,6 +5665,11 @@ _ACTION_MAP = {
     "maximize_window":   maximize_window,
     "minimize_window":   minimize_window,
     "bookmark_page":     lambda _: _bookmark(),
+    # system_control: voice-shortcut dispatcher that maps compact tokens like
+    # "bluetooth_on", "wifi_off", "volume:40", "brightness:80", "screenshot"
+    # to their native handlers. Lets the LLM emit one clean action name instead
+    # of knowing toggle_bluetooth vs toggle_wifi vs adjust_volume etc.
+    "system_control":    _system_control_dispatch,
     # Windows system/settings control. Imported as one dict so adding an
     # action there needs no edit here. Tier 2 entries are confirmation-gated
     # by sensei's existing safety net, not by anything in this map.
