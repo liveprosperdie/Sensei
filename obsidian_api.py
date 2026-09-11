@@ -80,7 +80,7 @@ HTTP_BASE = "http://127.0.0.1:27123"
 # the Markdown Patch 2.0 heading-target behaviour we rely on settled.
 MIN_VERSION = "5.0.2"
 
-_TIMEOUT = 10.0  # localhost; anything slower than this is a hung plugin
+_TIMEOUT = 1.0  # localhost; anything slower than 1s is an unreachable plugin
 
 _session_lock = threading.Lock()
 _session: requests.Session | None = None

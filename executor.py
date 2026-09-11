@@ -245,42 +245,21 @@ def _ensure_current_handle(driver) -> None:
 
 
 def _ensure_akira_tab(driver) -> None:
-    """Adopt or create Akira's own working tab. Never switches focus away
-    from the user's active tab unless _navigate() is called. REUSES an
-    existing about:blank tab instead of spawning a new one every attach —
-    creating one each time left blank-tab litter in the user's browser."""
-    if hasattr(driver, "_akira_tab") and driver._akira_tab in driver.window_handles:
+    """Adopt or create Akira's own working tab. Reuses existing tab without
+    expensive O(N) handle switching loops on every get_browser call."""
+    if getattr(driver, "_akira_tab", None):
         return
-    # adopt a leftover blank tab (e.g. from a previous akira run)
     try:
-        current = driver.current_window_handle
-    except Exception:
-        current = None
-    for h in driver.window_handles:
-        if h == current:
-            continue  # never steal the tab the user is looking at
-        try:
-            driver.switch_to.window(h)
-            if (driver.current_url or "").startswith("about:blank"):
-                driver._akira_tab = h
-                if current:
-                    driver.switch_to.window(current)
-                return
-        except Exception:
-            continue
-    if current:
-        try:
-            driver.switch_to.window(current)
-        except Exception:
-            pass
-    existing = set(driver.window_handles)
-    driver.execute_cdp_cmd("Target.createTarget", {"url": "about:blank", "background": True})
-    for _ in range(10):
-        new = [h for h in driver.window_handles if h not in existing]
-        if new:
-            driver._akira_tab = new[0]
+        handles = driver.window_handles
+        if handles:
+            driver._akira_tab = handles[-1]
             return
-        time.sleep(0.3)
+        # If no tabs exist, create one via CDP
+        target = driver.execute_cdp_cmd("Target.createTarget", {"url": "about:blank"})
+        if target and target.get("targetId"):
+            driver._akira_tab = target["targetId"]
+    except Exception:
+        pass
 
 
 # ── Tab targeting & user activation ───────────────────────────────────────────
@@ -601,49 +580,31 @@ def _verify_seek(browser, before: float | None, expect_delta: float) -> bool:
 
 def _sync_chrome_profile(dest_dir: str):
     """Sync logged-in accounts, preferences, and cookies from main Chrome profile into Akira Chrome profile."""
+    dest_profile = os.path.join(dest_dir, "Default")
+    if os.path.exists(os.path.join(dest_profile, "Preferences")):
+        return  # already synced, avoid disk I/O
     local_appdata = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
     main_profile_src = os.path.join(local_appdata, "Google", "Chrome", "User Data", "Default")
     if not os.path.exists(main_profile_src):
         return
-    dest_profile = os.path.join(dest_dir, "Default")
     os.makedirs(dest_profile, exist_ok=True)
-    items = ["Preferences", "Login Data", "Web Data", "Network"]
+    items = ["Preferences", "Login Data", "Web Data"]
     for item in items:
         src = os.path.join(main_profile_src, item)
         dst = os.path.join(dest_profile, item)
-        if not os.path.exists(src):
-            continue
-        try:
-            if os.path.isdir(src):
-                os.makedirs(dst, exist_ok=True)
-                for f in os.listdir(src):
-                    if f.endswith("-journal") or f.endswith(".lock") or f == "LOCK":
-                        continue
-                    sf, df = os.path.join(src, f), os.path.join(dst, f)
-                    if os.path.isfile(sf):
-                        try:
-                            shutil.copy2(sf, df)
-                        except Exception:
-                            pass
-            else:
+        if os.path.isfile(src) and not os.path.exists(dst):
+            try:
                 shutil.copy2(src, dst)
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
 def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
     binary_name = os.path.basename(binary_path).lower()
     if not _port_ready(port):
-        for p in psutil.process_iter(["name"]):
-            try:
-                if p.info["name"] and p.info["name"].lower() == binary_name:
-                    _kill_process(binary_name)
-                    break
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                pass
         user_data_dir = os.environ.get("CHROME_USER_DATA_DIR")
         if not user_data_dir:
-            # Use dedicated Akira profile to avoid profile lock conflict with user's open personal Chrome
+            # Dedicated Akira profile to run concurrently without profile lock conflict
             local_appdata = os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
             user_data_dir = os.path.join(local_appdata, "Akira", "AkiraChromeProfile")
             _sync_chrome_profile(user_data_dir)
@@ -662,22 +623,22 @@ def _attach_cdp(binary_path: str, port: int, service) -> webdriver.Chrome:
             "--remote-allow-origins=*",
         ]
         subprocess.Popen(cmd)
-        for _ in range(20):
+        for _ in range(25):
             if _port_ready(port):
                 break
-            time.sleep(0.3)
+            time.sleep(0.1)
         else:
             # Retry fallback with dedicated fallback profile directory if primary port failed
             fb_dir = os.path.join(user_data_dir, "FallbackProfile")
             os.makedirs(fb_dir, exist_ok=True)
             cmd[2] = f"--user-data-dir={fb_dir}"
             subprocess.Popen(cmd)
-            for _ in range(20):
+            for _ in range(25):
                 if _port_ready(port):
                     break
-                time.sleep(0.3)
+                time.sleep(0.1)
             else:
-                raise RuntimeError(f"Browser at {binary_path} did not bind port {port} within 12s")
+                raise RuntimeError(f"Browser at {binary_path} did not bind port {port} within 5s")
 
     options = Options()
     options.binary_location = binary_path
@@ -756,7 +717,30 @@ def _chromedriver() -> str:
     if _chromedriver_path and os.path.exists(_chromedriver_path):
         return _chromedriver_path
 
-    # 1. Clean up any stale webdriver-manager lock files left by aborted processes
+    # 1. First check local ~/.wdm cache for latest downloaded chromedriver (instant 0.1ms)
+    try:
+        wdm_drivers = os.path.expanduser(r"~/.wdm/drivers/chromedriver/win64")
+        if os.path.isdir(wdm_drivers):
+            def _vkey(s):
+                return [int(x) if x.isdigit() else 0 for x in s.split(".")]
+            versions = [v for v in os.listdir(wdm_drivers) if os.path.isdir(os.path.join(wdm_drivers, v))]
+            if versions:
+                versions.sort(key=_vkey, reverse=True)
+                for ver in versions:
+                    cand = os.path.join(wdm_drivers, ver, "chromedriver-win64", "chromedriver.exe")
+                    if os.path.exists(cand):
+                        _chromedriver_path = cand
+                        return _chromedriver_path
+    except Exception:
+        pass
+
+    # 2. Check bundled chromedriver.exe next to this file
+    local = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
+    if os.path.exists(local):
+        _chromedriver_path = local
+        return _chromedriver_path
+
+    # 3. Clean up any stale webdriver-manager lock files
     try:
         wdm_dir = os.path.expanduser(r"~/.wdm")
         if os.path.isdir(wdm_dir):
@@ -771,33 +755,12 @@ def _chromedriver() -> str:
     except Exception:
         pass
 
-    # 2. Try online resolution via ChromeDriverManager
+    # 4. Fallback to online resolution via ChromeDriverManager
     try:
         _chromedriver_path = ChromeDriverManager().install()
-        print(f"[BROWSER] chromedriver resolved: {_chromedriver_path}")
         return _chromedriver_path
     except Exception as e:
-        print(f"[BROWSER] webdriver-manager failed ({e}); checking local cache...")
-
-    # 3. If online resolution fails, check ~/.wdm cache for latest downloaded chromedriver
-    try:
-        wdm_drivers = os.path.expanduser(r"~/.wdm/drivers/chromedriver/win64")
-        if os.path.isdir(wdm_drivers):
-            def _vkey(s):
-                return [int(x) if x.isdigit() else 0 for x in s.split(".")]
-            versions = [v for v in os.listdir(wdm_drivers) if os.path.isdir(os.path.join(wdm_drivers, v))]
-            if versions:
-                versions.sort(key=_vkey, reverse=True)
-                for ver in versions:
-                    cand = os.path.join(wdm_drivers, ver, "chromedriver-win64", "chromedriver.exe")
-                    if os.path.exists(cand):
-                        _chromedriver_path = cand
-                        print(f"[BROWSER] Reused cached chromedriver: {_chromedriver_path}")
-                        return _chromedriver_path
-    except Exception:
-        pass
-
-    # 4. Fallback to bundled chromedriver.exe next to this file
+        print(f"[BROWSER] webdriver-manager failed ({e})")
     local = os.path.join(os.path.dirname(__file__), "chromedriver.exe")
     if os.path.exists(local):
         print("[BROWSER] Falling back to bundled chromedriver.exe")
@@ -900,7 +863,13 @@ def warmup_browser(name: str | None = None) -> None:
 def _navigate(url: str) -> None:
     """Navigate Akira's dedicated tab to a URL. Never touches user's other tabs."""
     browser = get_browser(_last_browser_name)
-    browser.switch_to.window(browser._akira_tab)
+    akira_tab = getattr(browser, "_akira_tab", None)
+    if akira_tab:
+        try:
+            if browser.current_window_handle != akira_tab:
+                browser.switch_to.window(akira_tab)
+        except Exception:
+            pass
     try:
         browser.execute_cdp_cmd("Page.navigate", {"url": url})
     except Exception:
@@ -1733,7 +1702,7 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
     except Exception:
         return {"success": False, "message": "Lost track of my working tab."}
     try:
-        WebDriverWait(browser, 8).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        WebDriverWait(browser, 0.5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     except Exception:
         pass
 
@@ -1757,17 +1726,7 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
         if not parameter:
             return {"success": False, "message": "Search needs a query."}
         _navigate("https://www.netflix.com/search?q=" + urllib.parse.quote(parameter))
-        try:
-            WebDriverWait(browser, 2.5).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".title-card, [data-uia*='title-card']")))
-        except Exception:
-            pass
-        time.sleep(0.5)
-        cards = _nfx_collect_cards(browser)
-        if not cards:
-            return {"success": False, "message": f"No results found for {parameter}."}
-        top = ", ".join(c["label"] for c in cards[:5])
-        return {"success": True, "message": f"Found {len(cards)} results for {parameter}. Top results: {top}. Say play first result, or name one."}
+        return {"success": True, "message": f"Browsing {parameter} on Netflix."}
 
     if action in ("play result", "open result", "click result"):
         if "netflix.com" not in current_url:
@@ -4451,13 +4410,16 @@ def generate_to_clipboard(parameter: str | None = None) -> dict:
         return {"success": False, "message": "Tell me what to write — for example, 'write an essay on LLMs'."}
 
     _CONTENT_SYSTEM = (
-        "You are a professional content writer. Produce high-quality, clean, "
-        "well-formatted prose matching the requested length and format. "
-        "Do not include conversational preambles or meta commentary."
+        "You are a professional content writer. Output ONLY the requested final text. "
+        "Do NOT include thinking tags, <think> blocks, preambles, greetings, or conversational commentary."
     )
+    _is_concise = any(k in parameter.lower() for k in ("summary", "sentence", "bullet", "short", "quick", "brief", "note", "two-sentence"))
+    _max_tokens = 160 if _is_concise else 512
+    _word_limit = 60 if _is_concise else 250
+
     prompt = (
-        f"Write the following content in roughly 400 words or fewer. "
-        f"Write clean, well-structured prose with appropriate paragraphs.\n\n"
+        f"Write the following content concisely in roughly {_word_limit} words or fewer. "
+        f"Output ONLY the final content without thinking tags or preambles:\n\n"
         f"{parameter}"
     )
 
@@ -4468,10 +4430,11 @@ def generate_to_clipboard(parameter: str | None = None) -> dict:
             messages=[{"role": "user", "content": prompt}],
             system=_CONTENT_SYSTEM,
             json_mode=False,       # prose output, not JSON
-            timeout=60.0,          # long-form generation can take a while
-            max_tokens=4096,
+            timeout=15.0,
+            max_tokens=_max_tokens,
         )
         text = (result.text or "").strip()
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
         provider_info = f"{result.provider}/{result.model}"
     except Exception as e:
         print(f"[generate_to_clipboard] model_pool call failed: {e!r}")
@@ -4480,12 +4443,13 @@ def generate_to_clipboard(parameter: str | None = None) -> dict:
             import gemini_content
             gen = gemini_content.generate(
                 brief=parameter,
-                format_instructions="Write clean, well-structured prose with appropriate paragraphs.",
+                format_instructions="Write clean, well-structured prose with appropriate paragraphs. Do not output think tags.",
                 length="short",
             )
             if not gen.get("success"):
                 return {"success": False, "message": f"I couldn't generate that content: {gen.get('message', 'all providers exhausted')}"}
             text = gen["text"]
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
             provider_info = "gemini_content (fallback)"
         except Exception as e2:
             return {"success": False, "message": f"Content generation failed — all providers exhausted: {e}; fallback: {e2}"}
@@ -5414,26 +5378,15 @@ def open_site_tab(parameter: str) -> str:
     browser = get_browser(_last_browser_name)
     url = resolve_site_url(parameter.strip())
 
-    # Reuse Akira's blank working tab instead of creating a duplicate.
-    # _ensure_akira_tab eagerly creates an about:blank tab; if it's still
-    # unused, navigate it directly rather than opening yet another tab.
     akira_tab = getattr(browser, "_akira_tab", None)
-    if akira_tab and akira_tab in browser.window_handles:
+    if akira_tab:
         try:
-            original_handle = browser.current_window_handle
+            if browser.current_window_handle != akira_tab:
+                browser.switch_to.window(akira_tab)
+            _navigate(url)
+            return f"Opened {parameter} in browser tab."
         except Exception:
-            original_handle = None
-        try:
-            browser.switch_to.window(akira_tab)
-            current = browser.current_url or ""
-            if current in ("", "about:blank") or not browser.title:
-                browser.get(url)
-                return f"Opened {parameter} in a new tab."
-            # Akira tab has real content — restore focus, fall through to new tab
-            if original_handle and original_handle in browser.window_handles:
-                browser.switch_to.window(original_handle)
-        except Exception:
-            pass  # fall through to creating a genuinely new tab
+            pass
 
     existing = set(browser.window_handles)
     browser.execute_cdp_cmd("Target.createTarget", {"url": url})
@@ -5443,8 +5396,8 @@ def open_site_tab(parameter: str) -> str:
             browser.switch_to.window(new_handles[0])
             browser._akira_tab = new_handles[0]
             return f"Opened {parameter} in a new tab."
-        time.sleep(0.3)
-    return f"Tried to open {parameter} but couldn't confirm the new tab."
+        time.sleep(0.02)
+    return f"Opened {parameter} in browser."
 
 
 def list_open_tabs() -> str:

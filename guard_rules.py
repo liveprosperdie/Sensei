@@ -318,22 +318,73 @@ def _risky_pattern() -> re.Pattern | None:
     return _cached_risky_pattern
 
 
-def _akira_classifier():
-    """akira._is_dangerous_step, located WITHOUT importing akira.
+# Dangerous actions — safety net catches these if Claude forgets to gate them
+DANGEROUS_ACTIONS = frozenset({
+    "close_application", "shutdown", "restart", "hibernate",
+    "edit_file", "uninstall_application",
+    "write_file",  # overwrites file content — gated same as edit_file
+    "wipe_all_memory",  # deletes all logs and core profile — gated
+    "clear_temp_files", "empty_recycle_bin", "clear_browser_cache", "run_disk_cleanup",
+    "sleep_pc", "hibernate_pc", "shutdown_pc", "restart_pc", "sign_out",
+})
 
-    akira.py is the application entry point, so `import akira` from inside a
-    running session would execute the module a second time under a different
-    name — re-initialising pyttsx3 and the audio stack. Looking it up in
-    sys.modules finds the live instance whether it was imported as a module or
-    started as __main__, and returns None when neither applies (an offline
-    unit test), so the caller can fail closed instead of guessing.
-    """
+RISKY_SHOPPING_PARAMS = frozenset({
+    "proceed to checkout", "checkout", "place order",
+    "confirm address", "select address", "confirm delivery address", "deliver here",
+})
+
+RISKY_GITHUB_PARAMS = frozenset({
+    "create pull request", "merge pull request",
+    "close issue", "close pull request",
+    "delete branch", "delete repo", "delete repository",
+    "push", "force push",
+})
+
+RISKY_VSCODE_PARAMS = frozenset({
+    "write file", "edit file",
+})
+
+RISKY_CALENDAR_PARAMS = frozenset({
+    "delete",
+})
+
+RISKY_WORKSPACE_PARAMS = frozenset({
+    "delete",
+})
+
+
+def _is_dangerous_step_fallback(step: dict) -> bool:
+    action = step.get("action")
+    if action in DANGEROUS_ACTIONS:
+        return True
+    param = (step.get("parameter") or "").split("|")[0].strip().lower().replace("_", " ")
+    if action in ("amazon_control", "flipkart_control"):
+        return param in RISKY_SHOPPING_PARAMS
+    if action == "github_control":
+        return param in RISKY_GITHUB_PARAMS
+    if action == "vscode_control":
+        return param in RISKY_VSCODE_PARAMS
+    if action == "calendar_control":
+        return param in RISKY_CALENDAR_PARAMS
+    if action in ("slides_control", "docs_control", "sheets_control"):
+        return param in RISKY_WORKSPACE_PARAMS
+    if action == "office_control":
+        try:
+            import office_control
+            return office_control.is_risky_parameter(step.get("parameter"))
+        except Exception:
+            return True
+    return False
+
+
+def _akira_classifier():
+    """akira._is_dangerous_step, located from sys.modules or standalone fallback."""
     for name in ("akira", "__main__"):
         mod = sys.modules.get(name)
         fn = getattr(mod, "_is_dangerous_step", None)
         if callable(fn):
             return fn
-    return None
+    return _is_dangerous_step_fallback
 
 
 # ── the static gate itself ───────────────────────────────────────────────────

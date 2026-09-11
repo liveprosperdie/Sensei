@@ -1082,6 +1082,9 @@ def handle_response(response: dict, user_text: str = "") -> bool:
         # An empty plan is a valid outcome (it asked a question or declined):
         # nothing runs, and the summary/question falls through to the single
         # speak_and_wait at the end of this function.
+        if not actions_to_run and not response.get("response"):
+            response["response"] = "I didn't catch an action to run for that request. Could you rephrase?"
+
         response["actions"] = actions_to_run
         response.pop("action", None)
         response.pop("parameter", None)
@@ -1366,6 +1369,13 @@ def get_akira_response(text: str, session_id: str | None = None) -> dict | None:
             pending_action = pending_parameter = pending_execute = None
             pending_origin = None
             # fall through to normal LLM call (user said something else)
+
+    # Non-blocking async browser pre-warm during LLM routing if browser intent detected
+    if any(k in cleaned_input for k in ("search", "google", "reddit", "youtube", "netflix", "site", "tab", "browse", "url", "http", "look up", "chrome", "brave", "edge", "spotify")):
+        try:
+            executor.warmup_browser()
+        except Exception:
+            pass
 
     try:
         raw = claude_handler.ask_akira(text, session_id=session_id)

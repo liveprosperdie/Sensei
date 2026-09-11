@@ -204,16 +204,27 @@ FAST_PATH_ALLOWED_ACTIONS: frozenset[str] = frozenset({
     "maximize_window",
     "minimize_window",
     "new_tab",
+    "browser_control",
+    "bookmark_page",
 
     # ── Safe Media & Settings ──────────────────────────────────────────────
     "spotify_control",
+    "youtube_control",
+    "netflix_control",
     "open_settings",
 
     # ── Safe Navigation & Search ───────────────────────────────────────────
+    "open_application",
     "web_search",
+    "site_search",
     "open_site_tab",
     "open_url",
     "search_image",
+
+    # ── Safe Clipboard & Content Operations ────────────────────────────────
+    "read_clipboard",
+    "write_clipboard",
+    "generate_to_clipboard",
 
     # ── Read-Only File Exploration ─────────────────────────────────────────
     "list_folder",
