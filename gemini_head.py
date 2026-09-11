@@ -690,8 +690,31 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list[dic
     """Route via Groq Cloud API using OpenAI-compatible chat completion."""
     if not groq_key:
         return None
-    model = (os.environ.get("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
+    model = (os.environ.get("GROQ_MODEL") or "qwen/qwen3.6-27b").strip()
     sys_text = "\n\n".join(b["text"] for b in system_blocks if isinstance(b, dict) and b.get("text"))
+    
+    # Calibrate prompt for Groq/Qwen token limits if bloated (>2500 chars)
+    if len(sys_text) > 2500:
+        sys_text = (
+            "You are Akira, an AI voice assistant routing user commands to system actions.\n"
+            "Return ONLY valid JSON matching this schema:\n\n"
+            "Modes:\n"
+            "1. Command (run system actions):\n"
+            '{"mode": "command", "actions": [{"action": "<name>", "parameter": "<value>"}]}\n\n'
+            "Available Actions:\n"
+            '- open_application (param: app name e.g. "google chrome", "notepad", "calculator", "spotify", "vscode", "discord", "terminal")\n'
+            '- open_site_tab (param: website name e.g. "youtube", "github", "google", "gmail", "netflix", or URL)\n'
+            '- system_control (param: "bluetooth_on", "bluetooth_off", "wifi_on", "wifi_off", "volume:N", "brightness:N", "screenshot")\n'
+            '- new_tab, close_tab, list_tabs, scroll (param: "up" or "down")\n'
+            '- fill (param: "field description|text to type")\n'
+            '- type_in_app (param: "app name|text to type")\n'
+            '- web_search (param: "query")\n'
+            '- site_search (param: "site|query")\n'
+            '- deliberate (param: "user intent requiring multi-step navigation")\n\n'
+            "2. Conversation (answering questions, casual chat):\n"
+            '{"mode": "conversation", "response": "<natural spoken answer>", "end_session": false}\n'
+        )
+
     api_msgs = [{"role": "system", "content": sys_text}]
     for m in messages:
         role = "assistant" if m.get("role") == "assistant" else "user"
@@ -700,6 +723,7 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list[dic
             content = "".join(b.get("text", "") for b in content if isinstance(b, dict))
         if content:
             api_msgs.append({"role": role, "content": content})
+
 
     body = {
         "model": model,
