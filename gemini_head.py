@@ -607,21 +607,33 @@ def _try_fast_pattern_route(messages: list[dict]) -> HeadReply | None:
     Returns a Claude-shaped HeadReply or None if LLM routing is needed."""
     if not messages:
         return None
-    last_msg = messages[-1]
-    if last_msg.get("role") != "user":
+    # Search backwards for the last user message that contains real voice text (skipping session context)
+    raw_text = None
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            c = m.get("content") or ""
+            if isinstance(c, list):
+                c = "".join(b.get("text", "") for b in c if isinstance(b, dict))
+            c = c.strip()
+            if c and not c.startswith("["):
+                raw_text = c
+                break
+    if not raw_text:
         return None
-    raw_text = (last_msg.get("content") or "").strip()
-    if not raw_text or raw_text.startswith("[ACTION RESULT"):
-        return None
+
     text = raw_text.lower().rstrip(".!?,")
 
     # App launches
     m_open = re.match(r"^(?:open|launch|start|go to|visit)\s+(.+)$", text)
     if m_open:
         target = m_open.group(1).strip()
-        if target in ("chrome", "google chrome", "browser", "brave", "edge"):
-            return _reply({"mode": "command", "actions": [{"action": "open_application", "parameter": target}]})
-        if target in ("notepad", "calculator", "task manager", "cmd", "terminal", "powershell", "spotify", "discord", "vscode", "vs code", "code"):
+        # Phonetic & mis-transcription aliases for Notepad (e.g. "open note part", "open note pad", "open node pad")
+        if target in ("notepad", "note part", "note pad", "node pad", "notes", "notepads"):
+            return _reply({"mode": "command", "actions": [{"action": "open_application", "parameter": "notepad"}]})
+        # Chrome aliases
+        if target in ("chrome", "google chrome", "browser", "brave", "edge", "chroma"):
+            return _reply({"mode": "command", "actions": [{"action": "open_application", "parameter": "google chrome"}]})
+        if target in ("calculator", "task manager", "cmd", "terminal", "powershell", "spotify", "discord", "vscode", "vs code", "code"):
             return _reply({"mode": "command", "actions": [{"action": "open_application", "parameter": target}]})
         if target in ("youtube", "github", "google", "gmail", "netflix", "amazon", "flipkart", "instagram", "reddit", "twitter", "x"):
             return _reply({"mode": "command", "actions": [{"action": "open_site_tab", "parameter": target}]})
@@ -678,7 +690,7 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list[dic
     """Route via Groq Cloud API using OpenAI-compatible chat completion."""
     if not groq_key:
         return None
-    model = (os.environ.get("GROQ_MODEL") or "qwen/qwen3.6-27b").strip()
+    model = (os.environ.get("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
     sys_text = "\n\n".join(b["text"] for b in system_blocks if isinstance(b, dict) and b.get("text"))
     api_msgs = [{"role": "system", "content": sys_text}]
     for m in messages:
@@ -704,8 +716,15 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list[dic
         r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=body, timeout=12)
         if r.status_code == 200:
             data = r.json()
-            choice = data["choices"][0]
-            content = choice["message"]["content"]
+            choices = data.get("choices") or []
+            if not choices:
+                return None
+            choice = choices[0]
+            msg = choice.get("message") or {}
+            content = (msg.get("content") or "").strip()
+            if not content:
+                print(f"[gemini_head] Groq returned empty content for model={model}")
+                return None
             finish = choice.get("finish_reason", "stop")
             stop_reason = "max_tokens" if finish == "length" else "end_turn"
             print(f"[gemini_head] routed via Groq model={model}")
@@ -747,8 +766,15 @@ def _route_via_openrouter(openrouter_key: str, messages: list[dict], system_bloc
         r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=12)
         if r.status_code == 200:
             data = r.json()
-            choice = data["choices"][0]
-            content = choice["message"]["content"]
+            choices = data.get("choices") or []
+            if not choices:
+                return None
+            choice = choices[0]
+            msg = choice.get("message") or {}
+            content = (msg.get("content") or "").strip()
+            if not content:
+                print(f"[gemini_head] OpenRouter returned empty content for model={model}")
+                return None
             finish = choice.get("finish_reason", "stop")
             stop_reason = "max_tokens" if finish == "length" else "end_turn"
             print(f"[gemini_head] routed via OpenRouter model={model}")
@@ -757,4 +783,4 @@ def _route_via_openrouter(openrouter_key: str, messages: list[dict], system_bloc
             print(f"[gemini_head] OpenRouter API returned HTTP {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"[gemini_head] OpenRouter API request failed: {e}")
-    return None
+    return None
