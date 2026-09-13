@@ -33,6 +33,7 @@ DESIGN NOTES
   drop a line in a queue and the main loop speaks it at the earliest safe point.
 """
 
+import os
 import time
 import itertools
 import threading
@@ -45,7 +46,7 @@ _TASKS: dict[int, dict] = {}
 _ANNOUNCE: list[str] = []      # completed-task lines waiting to be spoken
 _ids = itertools.count(1)
 
-RUNNING, DONE, FAILED = "running", "done", "failed"
+QUEUED, RUNNING, DONE, FAILED = "queued", "running", "done", "failed"
 
 # Finished records are kept so "did that work?" can still be answered after the
 # completion line was spoken. Bounded so a long uptime can't grow forever.
@@ -110,7 +111,7 @@ def should_background(action: str, parameter) -> str | None:
 # ── Running tasks ────────────────────────────────────────────────────────────
 
 def _prune_finished() -> None:
-    finished = [(tid, t) for tid, t in _TASKS.items() if t["state"] != RUNNING]
+    finished = [(tid, t) for tid, t in _TASKS.items() if t["state"] not in (QUEUED, RUNNING)]
     if len(finished) <= _MAX_FINISHED:
         return
     finished.sort(key=lambda kv: kv[1].get("finished") or 0.0)
@@ -120,13 +121,13 @@ def _prune_finished() -> None:
 
 def is_running(label: str) -> bool:
     with _LOCK:
-        return any(t["state"] == RUNNING and t["label"] == label
+        return any(t["state"] in (QUEUED, RUNNING) and t["label"] == label
                    for t in _TASKS.values())
 
 
 def running_count() -> int:
     with _LOCK:
-        return sum(1 for t in _TASKS.values() if t["state"] == RUNNING)
+        return sum(1 for t in _TASKS.values() if t["state"] in (QUEUED, RUNNING))
 
 
 def start(label: str, fn, *, ack: str | None = None) -> dict:
@@ -144,12 +145,15 @@ def start(label: str, fn, *, ack: str | None = None) -> dict:
 
     with _LOCK:
         tid = next(_ids)
-        _TASKS[tid] = {"id": tid, "label": label, "state": RUNNING,
+        _TASKS[tid] = {"id": tid, "label": label, "state": QUEUED,
                        "started": time.time(), "finished": None,
-                       "message": ""}
+                       "message": "", "path": None}
         _prune_finished()
 
     def _run() -> None:
+        with _LOCK:
+            if tid in _TASKS:
+                _TASKS[tid]["state"] = RUNNING
         try:
             result = fn()
         except Exception as e:
@@ -159,11 +163,19 @@ def start(label: str, fn, *, ack: str | None = None) -> dict:
         if isinstance(result, dict):
             ok = result.get("success") is not False
             msg = (result.get("message") or result.get("reason") or "").strip()
+            path = result.get("path")
+            # If the task returned a file path, verify the file exists on disk
+            if ok and path:
+                import os
+                if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+                    ok = False
+                    msg = f"Generated file at {path} could not be verified on disk."
         else:
             ok = True
             msg = str(result or "").strip()
+            path = None
         print(f"[background] task {tid} ({label}) -> {ok} {msg[:80]!r}")
-        _finish(tid, ok, msg)
+        _finish(tid, ok, msg, path=path)
 
     threading.Thread(target=_run, daemon=True,
                      name=f"bg-{tid}").start()
@@ -173,7 +185,7 @@ def start(label: str, fn, *, ack: str | None = None) -> dict:
                                f"and let you know when it's done.")}
 
 
-def _finish(tid: int, ok: bool, message: str) -> None:
+def _finish(tid: int, ok: bool, message: str, path: str | None = None) -> None:
     """Record the outcome and queue the line the main loop will speak."""
     with _LOCK:
         task = _TASKS.get(tid)
@@ -182,6 +194,8 @@ def _finish(tid: int, ok: bool, message: str) -> None:
         task["state"] = DONE if ok else FAILED
         task["finished"] = time.time()
         task["message"] = message
+        if path:
+            task["path"] = path
         label = task["label"]
         # Self-describing on purpose: this may be spoken minutes later, possibly
         # in a different session, long after the user forgot what they asked for.
@@ -222,20 +236,22 @@ def status_line() -> str:
     """An honest current-state answer. Never silently ignores the question."""
     now = time.time()
     with _LOCK:
-        running = [t for t in _TASKS.values() if t["state"] == RUNNING]
-        finished = sorted((t for t in _TASKS.values() if t["state"] != RUNNING),
+        active = [t for t in _TASKS.values() if t["state"] in (QUEUED, RUNNING)]
+        finished = sorted((t for t in _TASKS.values() if t["state"] not in (QUEUED, RUNNING)),
                           key=lambda t: t.get("finished") or 0.0)
 
-        if running:
+        if active:
             # Below ~15s, an elapsed number is both useless and faintly absurd
             # ("going 0 seconds now"), so it just says it only just began.
             def _progress(t: dict) -> str:
+                if t["state"] == QUEUED:
+                    return f"{t['label']}, queued"
                 elapsed = now - t["started"]
                 if elapsed < 15:
                     return f"{t['label']}, only just started"
                 return f"{t['label']}, going {_ago(elapsed)} now"
 
-            parts = [_progress(t) for t in running]
+            parts = [_progress(t) for t in active]
             if len(parts) == 1:
                 line = f"Still working on it: {parts[0]}."
             else:

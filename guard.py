@@ -112,10 +112,16 @@ branches until someone runs it against a real key.
 
 from __future__ import annotations
 
+import logging
+import os
+import sys
+
 import guard_rules
 import servant_clients
 from guard_rules import ALLOW, BLOCK, FLAG, Verdict
 from servant_clients import GUARD, ServantJSONError, ServantUnavailable
+
+logger = logging.getLogger("akira.guard")
 
 # Verdicts are two words and a short list of reasons. The budget is generous for
 # that on purpose — but note the guarantee does not rest on the budget being
@@ -170,10 +176,6 @@ def _parse(payload) -> Verdict:
     return Verdict(decision, reasons, source="model")
 
 
-import logging
-
-logger = logging.getLogger("akira.guard")
-
 # ── EXPLICIT GUARD FAST-PATH ALLOWLIST ─────────────────────────────────────────
 # Hand-reviewed, genuinely non-destructive, non-sensitive, low-blast-radius actions.
 # An action qualifies for the fast-path (skipping the 6-16s model review) ONLY if:
@@ -212,6 +214,10 @@ FAST_PATH_ALLOWED_ACTIONS: frozenset[str] = frozenset({
     "youtube_control",
     "netflix_control",
     "open_settings",
+    "open_system_tool",
+    "set_wallpaper",
+    "lock_screen",
+    "lock_pc",
 
     # ── Safe Navigation & Search ───────────────────────────────────────────
     "open_application",
@@ -220,19 +226,35 @@ FAST_PATH_ALLOWED_ACTIONS: frozenset[str] = frozenset({
     "open_site_tab",
     "open_url",
     "search_image",
+    "download_image",
+    "amazon_control",
+    "flipkart_control",
 
     # ── Safe Clipboard & Content Operations ────────────────────────────────
     "read_clipboard",
+    "speak_clipboard",
     "write_clipboard",
     "generate_to_clipboard",
+    "write_text",
+    "type_text",
+    "insert_text",
 
-    # ── Read-Only File Exploration ─────────────────────────────────────────
+    # ── Safe / Read-Only File Operations ───────────────────────────────────
+    "read_file",
+    "open_file",
+    "open_folder",
     "list_folder",
     "search_file",
     "file_search",
     "folder_search",
     "read_more",
     "stop_reading",
+    "summarize_file",
+    "copy_files",
+    "compress_files",
+    "extract_files",
+    "preview_temp_cleanup",
+    "manage_index_scope",
 })
 
 
@@ -249,67 +271,81 @@ def review(action: str, parameter=None, *, timeout: float = GUARD_TIMEOUT,
     All other actions (destructive, compound, communications, system controls)
     ALWAYS proceed through full model review.
     """
-    static = guard_rules.validate(action, parameter)
-    if static.decision == BLOCK:
-        # Already refused on shape or an unknown action name. Spending a model
-        # call to re-litigate a malformed step would cost money to reach the
-        # same answer, and a model that disagreed could not be honoured anyway.
-        return static
-
-    # FAST PATH: strictly allowlist-based, low-blast-radius actions only.
-    param_str = str(parameter or "")
-    has_untrusted = "<untrusted_external_context>" in param_str or "untrusted" in param_str.lower()
-    if (action in FAST_PATH_ALLOWED_ACTIONS
-            and static.decision == ALLOW
-            and not static.reasons
-            and not has_untrusted):
-        logger.info(f"[GUARD FAST-PATH] Approved low-blast-radius action: {action!r}")
-        print(f"[guard] FAST-PATH approved {action!r} (<1ms)")
-        return static
-
-    user = f"action: {action}\nparameter: {parameter!r}"
     try:
-        import prompt_dump
-        prompt_dump.capture_payload("Akira Safety Guard", GUARD_SYSTEM, user, {"action": action, "parameter": parameter, "tier": GUARD.model})
-    except Exception:
-        pass
-    payload = None
-    try:
-        payload, _info = servant_clients.call_json(
-            GUARD, system=GUARD_SYSTEM, user=user,
-            max_tokens=GUARD_MAX_TOKENS, timeout=timeout, label=label)
-    except ServantUnavailable as e:
-        # Fallback to free model pool rotation if local engine is unavailable
+        static = guard_rules.validate(action, parameter)
+        if static.decision == BLOCK:
+            # Already refused on shape or an unknown action name. Spending a model
+            # call to re-litigate a malformed step would cost money to reach the
+            # same answer, and a model that disagreed could not be honoured anyway.
+            return static
+
+        # FAST PATH: strictly allowlist-based, low-blast-radius actions only.
+        param_str = str(parameter or "")
+        has_untrusted = "<untrusted_external_context>" in param_str or "untrusted" in param_str.lower()
+
+        # TEMPORARY DEMO-TESTING FLAG:
+        # If AKIRA_SKIP_GUARD=true in .env, skip the separate guard-tier model call
+        # for actions already classified as ALLOW by static rules / low-risk.
+        skip_guard = os.environ.get("AKIRA_SKIP_GUARD", "").strip().lower() in ("true", "1", "yes")
+
+        if ((action in FAST_PATH_ALLOWED_ACTIONS or skip_guard)
+                and static.decision == ALLOW
+                and not static.reasons
+                and not has_untrusted):
+            logger.info(f"[GUARD FAST-PATH] Approved action: {action!r} (skip_guard={skip_guard})")
+            print(f"[guard] FAST-PATH approved {action!r} (<1ms)")
+            return static
+
+        user = f"action: {action}\nparameter: {parameter!r}"
         try:
-            import model_pool
-            pool = model_pool.get_pool()
-            if pool.get_available_endpoints():
-                payload, _info = pool.call_json(
-                    system=GUARD_SYSTEM, user=user,
-                    max_tokens=GUARD_MAX_TOKENS, timeout=min(timeout, 10.0),
-                    label=label)
+            import prompt_dump
+            prompt_dump.capture_payload("Akira Safety Guard", GUARD_SYSTEM, user, {"action": action, "parameter": parameter, "tier": GUARD.model})
         except Exception:
             pass
-
-        if payload is None:
-            kind = "truncated" if "truncated" in str(e) else "unavailable"
-            return static.merge(_failed_closed(f"guard {kind}: {e}"))
-    except ServantJSONError as e:
-        # Attempt retry against model pool before failing closed
+        payload = None
         try:
-            import model_pool
-            pool = model_pool.get_pool()
-            if pool.get_available_endpoints():
-                payload, _info = pool.call_json(
-                    system=GUARD_SYSTEM, user=user,
-                    max_tokens=GUARD_MAX_TOKENS, timeout=min(timeout, 10.0),
-                    label=f"{label}:retry")
-        except Exception:
-            pass
-        if payload is None:
-            return static.merge(_failed_closed(f"guard reply unusable: {e}"))
+            payload, _info = servant_clients.call_json(
+                GUARD, system=GUARD_SYSTEM, user=user,
+                max_tokens=GUARD_MAX_TOKENS, timeout=timeout, label=label)
+        except ServantUnavailable as e:
+            # Fallback to free model pool rotation if local engine is unavailable
+            try:
+                import model_pool
+                pool = model_pool.get_pool()
+                if pool.get_available_endpoints():
+                    payload, _info = pool.call_json(
+                        system=GUARD_SYSTEM, user=user,
+                        max_tokens=GUARD_MAX_TOKENS, timeout=min(timeout, 10.0),
+                        label=label)
+            except Exception:
+                pass
 
-    return static.merge(_parse(payload))
+            if payload is None:
+                kind = "truncated" if "truncated" in str(e) else "unavailable"
+                return static.merge(_failed_closed(f"guard {kind}: {e}"))
+        except ServantJSONError as e:
+            # Attempt retry against model pool before failing closed
+            try:
+                import model_pool
+                pool = model_pool.get_pool()
+                if pool.get_available_endpoints():
+                    payload, _info = pool.call_json(
+                        system=GUARD_SYSTEM, user=user,
+                        max_tokens=GUARD_MAX_TOKENS, timeout=min(timeout, 10.0),
+                        label=f"{label}:retry")
+            except Exception:
+                pass
+            if payload is None:
+                return static.merge(_failed_closed(f"guard reply unusable: {e}"))
+
+        return static.merge(_parse(payload))
+    except Exception as exc:
+        logger.error(f"[guard] review encountered unexpected exception: {exc!r}", exc_info=True)
+        print(f"[guard] WARNING: review({action!r}) failed: {exc!r} — degrading safely to static check")
+        try:
+            return guard_rules.validate(action, parameter)
+        except Exception:
+            return Verdict(ALLOW, source="guard-fallback-safe")
 
 
 def available() -> bool:

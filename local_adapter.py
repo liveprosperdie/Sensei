@@ -188,3 +188,46 @@ def _make_action_envelope(action: str, parameter: str, response_text: str) -> di
         "confirmation_required": False,
         "end_session": False,
     }
+
+
+def synthesize_multi_command_envelope(sub_envelopes: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Combine multiple single-command action envelopes into an ordered sequential action envelope.
+    
+    Preserves original order and combines spoken responses naturally.
+    """
+    if not sub_envelopes:
+        return None
+
+    combined_actions: list[dict[str, Any]] = []
+    responses: list[str] = []
+
+    for env in sub_envelopes:
+        if not env:
+            continue
+        acts = env.get("actions") or []
+        for a in acts:
+            combined_actions.append(a)
+        resp = env.get("response")
+        if resp:
+            responses.append(resp.rstrip("."))
+
+    if not combined_actions:
+        return None
+
+    # Natural spoken sentence combining
+    if len(responses) == 1:
+        spoken = f"{responses[0]}."
+    elif len(responses) == 2:
+        spoken = f"{responses[0]}, and {responses[1].lower()}."
+    else:
+        spoken = f"{', '.join(responses[:-1])}, and {responses[-1].lower()}."
+
+    return {
+        "mode": "action",
+        "action": combined_actions[0].get("action", ""),
+        "parameter": combined_actions[0].get("parameter", ""),
+        "actions": combined_actions,
+        "response": spoken,
+        "confirmation_required": False,
+        "end_session": False,
+    }

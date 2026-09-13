@@ -76,12 +76,14 @@ def _get(instance: str) -> MCPServer:
         # hard-strip gmail: it must never ride on the write-mode token
         services = ",".join(s for s in services.split(",")
                             if s.strip() and s.strip() != "gmail")
+        profile = os.environ.get("GOOGLE_WORKSPACE_MCP_PROFILE", "sensei-workspace")
         env = {"GOOGLE_WORKSPACE_SERVICES": services,
-               "GOOGLE_WORKSPACE_MCP_PROFILE": "akira-workspace"}
+               "GOOGLE_WORKSPACE_MCP_PROFILE": profile}
     elif instance == "gmail":
+        profile = os.environ.get("GOOGLE_GMAIL_MCP_PROFILE", "sensei-gmail-ro")
         env = {"GOOGLE_WORKSPACE_SERVICES": "gmail",
                "GOOGLE_WORKSPACE_READ_ONLY": "true",
-               "GOOGLE_WORKSPACE_MCP_PROFILE": "akira-gmail-ro"}
+               "GOOGLE_WORKSPACE_MCP_PROFILE": profile}
     else:
         raise ValueError(f"unknown instance: {instance}")
     for var in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"):

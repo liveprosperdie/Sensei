@@ -1532,7 +1532,10 @@ def get_akira_response(text: str, session_id: str | None = None,
                     if reply:
                         print(f"[tiered_routing] Free speech head answered: {reply[:60]!r}...")
                         return {"mode": "conversation", "response": reply, "end_session": False}
-                    print("[tiered_routing] Speech head generation returned None — escalating to Claude")
+                    print("[tiered_routing] Escalated to Claude (trigger=speech_head_failure): speech head generation returned None")
+                else:
+                    trigger = f"complex_{decision.mode}" if decision.complexity == "complex" else f"uncertain_{decision.mode}"
+                    print(f"[tiered_routing] Escalated to Claude (trigger={trigger}): complexity='{decision.complexity}'")
 
             # 2. DOCUMENT GENERATION MODE
             elif decision.mode == "document_generation":
@@ -1543,21 +1546,94 @@ def get_akira_response(text: str, session_id: str | None = None,
                     if content_str:
                         print(f"[tiered_routing] Free speech head drafted doc ({len(content_str)} chars) -> adapter sink")
                         return local_adapter.create_document_envelope(doc_title, content_str)
-                    print("[tiered_routing] Free speech head doc drafting returned None — escalating to Claude")
+                    print("[tiered_routing] Escalated to Claude (trigger=speech_head_failure): doc drafting returned None")
+                else:
+                    trigger = f"complex_{decision.mode}" if decision.complexity == "complex" else f"uncertain_{decision.mode}"
+                    print(f"[tiered_routing] Escalated to Claude (trigger={trigger}): complexity='{decision.complexity}'")
 
             # 3. COMMAND MODE
             elif decision.mode == "command":
-                if not decision.escalate and local_adapter.is_intent_allowed(decision.intent):
-                    cache = session_context_cache.get_cache()
-                    delta = None
-                    if cache and cache._cached_state:
-                        curr_state = cache.capture_state(get_pc_context, get_all_tabs)
-                        delta = cache.compute_delta(cache._cached_state, curr_state)
-                    envelope = local_adapter.synthesize_command_envelope(decision.intent, decision.parameters, delta)
-                    if envelope:
-                        print(f"[tiered_routing] Local adapter synthesized: {envelope.get('action')}")
-                        return envelope
-                    print(f"[tiered_routing] Local adapter synthesis returned None — escalating to Claude")
+                import tiered_config
+
+                # ── Multi-Step Command Chain Dispatch ──
+                if decision.is_chain:
+                    if decision.escalate:
+                        # Interdependent chain -> escalate full original utterance to Claude
+                        print(f"[tiered_routing] Escalated to Claude (trigger={decision.escalate_trigger}): "
+                              f"interdependent chain ({len(decision.sub_tasks)} steps): {decision.sub_tasks}")
+                    else:
+                        # Independent chain -> build ordered list of sub-task dispatches
+                        print(f"[tiered_routing] Independent command chain verified ({len(decision.sub_tasks)} steps): "
+                              f"{decision.sub_tasks}")
+                        cache = session_context_cache.get_cache()
+                        delta = None
+                        if cache and cache._cached_state:
+                            curr_state = cache.capture_state(get_pc_context, get_all_tabs)
+                            delta = cache.compute_delta(cache._cached_state, curr_state)
+
+                        sub_envelopes = []
+                        chain_failed = False
+                        for sub_idx, sub_dec in enumerate(decision.sub_decisions):
+                            sub_env = local_adapter.synthesize_command_envelope(sub_dec.intent, sub_dec.parameters, delta)
+                            if not sub_env:
+                                print(f"[tiered_routing] Sub-task {sub_idx} synthesis returned None — escalating chain")
+                                chain_failed = True
+                                break
+
+                            # Guard each sub-task individually before execution — no exceptions
+                            guarded_sub, _ = guard_action_envelope(sub_env)
+                            if guarded_sub.get("confirmation_required"):
+                                print(f"[tiered_routing] Sub-task {sub_idx} required confirmation: {guarded_sub.get('action')}")
+                                return guarded_sub
+
+                            sub_envelopes.append(guarded_sub)
+
+                        if not chain_failed and sub_envelopes:
+                            multi_env = local_adapter.synthesize_multi_command_envelope(sub_envelopes)
+                            if multi_env:
+                                print(f"[tiered_routing] Local adapter synthesized chain ({len(multi_env['actions'])} actions): "
+                                      f"{[a.get('action') for a in multi_env['actions']]}")
+                                return multi_env
+
+                        print(f"[tiered_routing] Escalated to Claude (trigger=chain_synthesis_failed): failed to synthesize all sub-tasks")
+
+                # ── Single-Step Command Dispatch ──
+                else:
+                    escalate_cmd = False
+
+                    # Check 1: Known-ambiguous pattern registry match
+                    ambig_match = tiered_config.check_ambiguous_pattern(decision.intent, raw_text or text)
+                    if ambig_match:
+                        escalate_cmd = True
+                        print(f"[tiered_routing] Escalated to Claude (trigger=ambiguous_flag): pattern='{ambig_match.tag}' reason='{ambig_match.reason}'")
+
+                    # Check 2: Unrecognized command (NO_MATCH)
+                    if not escalate_cmd and decision.intent == "NO_MATCH":
+                        escalate_cmd = True
+                        print(f"[tiered_routing] Escalated to Claude (trigger=no_match): unrecognized command intent")
+
+                    # Check 3: Low confidence
+                    if not escalate_cmd and decision.confidence < tiered_config.get_min_confidence():
+                        escalate_cmd = True
+                        print(f"[tiered_routing] Escalated to Claude (trigger=low_confidence): confidence={decision.confidence:.2f} < {tiered_config.get_min_confidence():.2f}")
+
+                    # Check 4: Allowlist reject
+                    if not escalate_cmd and not local_adapter.is_intent_allowed(decision.intent):
+                        escalate_cmd = True
+                        print(f"[tiered_routing] Escalated to Claude (trigger=allowlist_reject): intent='{decision.intent}' not in ADAPTER_ALLOWED_INTENTS")
+
+                    # If NOT escalated, dispatch to local adapter
+                    if not escalate_cmd:
+                        cache = session_context_cache.get_cache()
+                        delta = None
+                        if cache and cache._cached_state:
+                            curr_state = cache.capture_state(get_pc_context, get_all_tabs)
+                            delta = cache.compute_delta(cache._cached_state, curr_state)
+                        envelope = local_adapter.synthesize_command_envelope(decision.intent, decision.parameters, delta)
+                        if envelope:
+                            print(f"[tiered_routing] Local adapter synthesized: {envelope.get('action')}")
+                            return envelope
+                        print(f"[tiered_routing] Escalated to Claude (trigger=adapter_synthesis_failed): returned None")
 
         except Exception as _tier_err:
             print(f"[tiered_routing] Tiered routing exception: {_tier_err!r} — falling back to Claude")
@@ -1694,6 +1770,13 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
                                   raw_text=raw_text)
     print("[v0] LLM returned")
     if response is None:
+        try:
+            import session_context_cache
+            cache = session_context_cache.get_cache()
+            note_fn = obsidian_context.session_line if "obsidian_context" in globals() else None
+            cache.update_after_turn(cache.capture_state(get_pc_context, get_all_tabs, note_fn))
+        except Exception as _cache_upd_err:
+            pass
         return True  # confirmation was handled inline, stay alive
 
     print(response)

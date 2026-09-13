@@ -129,9 +129,13 @@ TOP_SITES_MAP = {
 }
 
 def resolve_site_url(name: str) -> str:
-    """Map a spoken site name to a URL. Falls back to guessing the domain, 
-    then Google search if the guess looks wrong."""
-    key = name.lower().strip()
+    """Map a spoken site name to a URL. Handles full URLs, site names, and delimiters."""
+    clean = (name or "").strip()
+    if "|" in clean:
+        clean = clean.split("|")[0].strip()
+    if clean.startswith(("http://", "https://")):
+        return clean
+    key = clean.lower()
     if key in TOP_SITES_MAP:
         return TOP_SITES_MAP[key]
     guess = f"https://{key.replace(' ', '')}.com"
@@ -229,6 +233,10 @@ def _port_ready(port: int) -> bool:
 
 
 def _kill_process(name: str) -> None:
+    import security_guard
+    if security_guard.is_system_critical_process(name):
+        print(f"[_kill_process] Refusing to kill system-critical process: {name}")
+        return
     subprocess.run(["taskkill", "/F", "/T", "/IM", name], capture_output=True)
     time.sleep(1.0)
 
@@ -1137,43 +1145,97 @@ def click_element(driver, index: int, expected_text: str | None = None,
 
 # ── YouTube control ───────────────────────────────────────────────────────────
 
-def youtube_control(parameter: str) -> str:
-    browser = get_browser(_last_browser_name)
-    param = parameter.lower().strip()
+_last_youtube_tab_handle = None
 
-    # If the current tab is not youtube.com, check if an existing open tab is on youtube.com:
-    if "youtube.com" not in (browser.current_url or ""):
-        for handle in browser.window_handles:
-            try:
-                browser.switch_to.window(handle)
-                if "youtube.com" in (browser.current_url or ""):
-                    browser._akira_tab = handle
-                    break
-            except Exception:
-                pass
+def youtube_control(parameter: str) -> str:
+    global _last_youtube_tab_handle
+    browser = get_browser(_last_browser_name)
+    param_raw = parameter.strip()
+    param = param_raw.lower()
+
+    # Support optional explicit tab handle in parameter e.g. "like|CDwindow-..."
+    tab_override = None
+    if "|" in param_raw:
+        parts = param_raw.split("|", 1)
+        param = parts[0].strip().lower()
+        tab_override = parts[1].strip()
+
+    target_handle = tab_override or getattr(browser, "_youtube_target_tab", None) or _last_youtube_tab_handle
+
+    is_open_or_play = ((param.startswith("play ") and param not in ("play", "playing", "play video"))
+                       or param.startswith("search ")
+                       or param.startswith("search and play ")
+                       or param.startswith("search and pick "))
+
+    if not is_open_or_play:
+        # Follow-up actions (like, subscribe, pause, etc.) MUST target the exact same tab/window handle
+        if target_handle:
+            if target_handle not in browser.window_handles:
+                print(f"[youtube_control] guard fired: target handle {target_handle!r} not in {browser.window_handles}")
+                return "Target tab lost."
+            browser.switch_to.window(target_handle)
+            browser._akira_tab = target_handle
+        else:
+            if "youtube.com" not in (browser.current_url or ""):
+                print("[youtube_control] guard fired: no target tab and current window not on youtube")
+                return "Target tab lost."
+
+        if "youtube.com" not in (browser.current_url or ""):
+            print("[youtube_control] guard fired: targeted tab is not on youtube.com")
+            return "Target tab lost."
+    else:
+        if target_handle and target_handle in browser.window_handles:
+            browser.switch_to.window(target_handle)
+            browser._akira_tab = target_handle
+        elif "youtube.com" not in (browser.current_url or ""):
+            for handle in browser.window_handles:
+                try:
+                    browser.switch_to.window(handle)
+                    if "youtube.com" in (browser.current_url or ""):
+                        browser._akira_tab = handle
+                        break
+                except Exception:
+                    pass
 
     try:
-        browser.switch_to.window(browser._akira_tab)
+        if getattr(browser, "_akira_tab", None):
+            browser.switch_to.window(browser._akira_tab)
         WebDriverWait(browser, 8).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     except Exception:
         pass
 
     # ── Group 0: Direct Video Search & Auto-Play ───────────────────────────
-    if (param.startswith("play ") and param not in ("play", "playing")) or param.startswith("search "):
-        query_str = param.replace("play ", "", 1).replace("search ", "", 1).strip()
+    if is_open_or_play:
+        query_str = re.sub(r"^(?:play|search(?:\s+and\s+(?:play|pick))?)\s+", "", param).strip()
         query = urllib.parse.quote(query_str)
         url = f"https://www.youtube.com/results?search_query={query}"
         browser.get(url)
+        _last_youtube_tab_handle = browser.current_window_handle
+        browser._youtube_target_tab = _last_youtube_tab_handle
         try:
             WebDriverWait(browser, 6).until(EC.element_to_be_clickable((By.CSS_SELECTOR, "ytd-video-renderer a#video-title, a#video-title")))
             first_video = browser.find_element(By.CSS_SELECTOR, "ytd-video-renderer a#video-title, a#video-title")
             first_video.click()
+            _last_youtube_tab_handle = browser.current_window_handle
+            browser._youtube_target_tab = _last_youtube_tab_handle
             return f"Playing '{query_str}' on YouTube."
         except Exception:
             return f"Opened YouTube search results for '{query_str}'."
 
     if "youtube.com" not in (browser.current_url or ""):
-        return "This isn't a YouTube tab right now. Switch to YouTube first."
+        return "Target tab lost."
+
+    # ── Aliases: Map skip forward / back / rewind to seek ──────────────────
+    if param in ("skip forward", "skip ahead", "fast forward"):
+        param = "seek 10"
+    elif param in ("skip back", "skip backward", "rewind", "go back 10"):
+        param = "seek -10"
+    elif re.match(r"^(?:skip forward|fast forward)\s+(\d+)", param):
+        m_skip = re.match(r"^(?:skip forward|fast forward)\s+(\d+)", param)
+        param = f"seek {m_skip.group(1)}"
+    elif re.match(r"^(?:skip back|rewind)\s+(\d+)", param):
+        m_skip = re.match(r"^(?:skip back|rewind)\s+(\d+)", param)
+        param = f"seek -{m_skip.group(1)}"
 
     # ── Group A: JS media controls — zero API cost ────────────────────
 
@@ -1238,9 +1300,18 @@ def youtube_control(parameter: str) -> str:
         """)
         return "Ad skipped."
 
-    if param.startswith("volume "):
+    if param.startswith("volume") or param in ("volume up", "volume down"):
+        if "up" in param:
+            browser.execute_script("var v=document.querySelector('video'); if(v) v.volume = Math.min(1, v.volume + 0.1);")
+            return "Volume increased."
+        if "down" in param:
+            browser.execute_script("var v=document.querySelector('video'); if(v) v.volume = Math.max(0, v.volume - 0.1);")
+            return "Volume decreased."
         try:
-            val = max(0, min(100, int(param.replace("volume", "").replace("%", "").strip())))
+            cleaned = re.sub(r"[^\d]", "", param)
+            if not cleaned:
+                return "Give me a volume number from 0 to 100."
+            val = max(0, min(100, int(cleaned)))
             browser.execute_script(f"var v=document.querySelector('video'); if(v) v.volume={val/100};")
             return f"Video volume {val}%."
         except ValueError:
@@ -1746,21 +1817,94 @@ def netflix_control(action: str, parameter: str | None = None) -> dict:
             pass
         return {"success": True, "message": f"Playing {pick['label']}."}
 
-    if action in ("play title", "open title") or (action == "play" and parameter):
+    if action in ("direct play", "play direct", "quick play", "play title", "open title") or (action == "play" and parameter):
         name = parameter
         if not name:
             return {"success": False, "message": "Tell me what title to play."}
-        browser.get("https://www.netflix.com/search?q=" + urllib.parse.quote(name))
-        try:
-            WebDriverWait(browser, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, ".title-card, [data-uia*='title-card']")))
-        except Exception:
-            pass
-        time.sleep(0.5)
-        cards = _nfx_collect_cards(browser)
-        if not cards:
-            return {"success": False, "message": f"Couldn't find {name} on Netflix."}
-        pick = _pick_card(cards, name)
+
+        req_clean = name.strip().lower()
+
+        # Fast path 1: Direct Netflix URL or numeric ID pattern
+        id_m = re.search(r"(?:netflix\.com/(?:watch|title)/)?(\d{6,})", name.strip())
+        if id_m:
+            direct_id = id_m.group(1)
+            browser.get(f"https://www.netflix.com/watch/{direct_id}")
+            try:
+                WebDriverWait(browser, 12).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "video")))
+            except Exception:
+                pass
+            return {"success": True, "message": f"Playing {direct_id} directly on Netflix."}
+
+        # Fast path 2: If already on a Netflix page, check visible cards for unambiguous match
+        pick = None
+        if "netflix.com" in current_url:
+            cards = _nfx_collect_cards(browser)
+            if cards:
+                top_label = (cards[0].get("label") or "").strip().lower()
+                if top_label == req_clean:
+                    pick = cards[0]
+                    print(f"[netflix_control] Direct play: '{cards[0]['label']}' exact match on screen, skipping search detour.")
+                else:
+                    import difflib
+                    scored = []
+                    for idx, card in enumerate(cards):
+                        card_label = (card.get("label") or "").strip().lower()
+                        sim = difflib.SequenceMatcher(None, req_clean, card_label).ratio()
+                        if req_clean in card_label or card_label in req_clean:
+                            sim = max(sim, min(0.95, len(req_clean) / max(len(card_label), 1)))
+                        scored.append((sim, -idx, card, idx))
+                    scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+                    if scored and scored[0][0] >= 0.95:
+                        pick = scored[0][2]
+                        print(f"[netflix_control] Direct play: '{pick['label']}' high match ({scored[0][0]:.3f}) on screen, skipping search detour.")
+
+        if not pick:
+            browser.get("https://www.netflix.com/search?q=" + urllib.parse.quote(name))
+            try:
+                WebDriverWait(browser, 10).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, ".title-card, [data-uia*='title-card']")))
+            except Exception:
+                pass
+            time.sleep(0.5)
+            cards = _nfx_collect_cards(browser)
+            if not cards:
+                return {"success": False, "message": f"Couldn't find {name} on Netflix."}
+
+        req_clean = name.strip().lower()
+        pick = None
+
+        # 2. If top result is exact case-insensitive match, pick immediately
+        top_label = (cards[0].get("label") or "").strip().lower()
+        if top_label == req_clean:
+            pick = cards[0]
+            print(f"[netflix_control] Top result {cards[0]['label']!r} is an exact match for requested title {name!r}")
+        else:
+            # 3. Otherwise, pick highest string-similarity score with result position as tiebreaker
+            import difflib
+            scored_candidates = []
+            for idx, card in enumerate(cards):
+                card_label = (card.get("label") or "").strip().lower()
+                sim = difflib.SequenceMatcher(None, req_clean, card_label).ratio()
+                if req_clean in card_label or card_label in req_clean:
+                    sub_ratio = len(req_clean) / max(len(card_label), 1)
+                    sim = max(sim, min(0.95, sub_ratio))
+                scored_candidates.append((sim, -idx, card, idx))
+
+            scored_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            best_score, _, best_card, best_pos = scored_candidates[0]
+
+            # 4. Log which candidate was picked and why
+            print(f"[netflix_control] Evaluated {len(cards)} candidates for {name!r}: best is {best_card['label']!r} (similarity={best_score:.3f}, position={best_pos})")
+
+            # 5. If nothing clears similarity threshold (0.6), fail loudly
+            if best_score < 0.6:
+                print(f"[netflix_control] Match failure: no candidate cleared threshold 0.6 for {name!r} (best score {best_score:.3f})")
+                return {"success": False, "message": f"Couldn't find a matching title for '{name}' on Netflix."}
+
+            pick = best_card
+            print(f"[netflix_control] Picked {pick['label']!r} (score={best_score:.3f}, position={best_pos}) for query {name!r}")
+
         if action == "open title":
             browser.get(f"https://www.netflix.com/title/{pick['id']}")
             return {"success": True, "message": f"Opened {pick['label']}."}
@@ -2434,13 +2578,12 @@ def amazon_control(action: str, parameter: str | None = None) -> dict:
     if action == "search":
         if not parameter:
             return {"success": False, "message": "Search needs a query."}
-        browser.get("https://www.amazon.in/s?k=" + urllib.parse.quote(parameter))
+        _navigate("https://www.amazon.in/s?k=" + urllib.parse.quote(parameter))
         try:
-            WebDriverWait(browser, 10).until(EC.presence_of_element_located(
+            WebDriverWait(browser, 4).until(EC.presence_of_element_located(
                 (By.CSS_SELECTOR, 'div[data-component-type="s-search-result"]')))
         except Exception:
             pass
-        time.sleep(0.5)
         cards = _amz_collect_cards()
         if not cards:
             return {"success": False, "message": f"No Amazon results found for {parameter}."}
@@ -2796,6 +2939,20 @@ def _gh_api(path: str, method: str = "GET", body: dict | None = None):
         if resp.status_code in (200, 201, 204):
             return True, (resp.json() if resp.content else {})
         if resp.status_code == 401:
+            if tok and method == "GET":
+                # Fallback to unauthenticated read for public repos if token is invalid
+                h_no_tok = {k: v for k, v in headers.items() if k != "Authorization"}
+                try:
+                    resp_retry = requests.request(method, "https://api.github.com" + path,
+                                                  headers=h_no_tok, json=body, timeout=10)
+                    if resp_retry.status_code in (200, 201, 204):
+                        return True, (resp_retry.json() if resp_retry.content else {})
+                    if resp_retry.status_code == 404:
+                        return False, "Not found — repo may be private or the name is wrong."
+                    if resp_retry.status_code == 403:
+                        return False, "GitHub API rate limit hit — try again in a minute."
+                except Exception:
+                    pass
             return False, "GitHub API auth failed — GITHUB_TOKEN is invalid."
         if resp.status_code == 403:
             return False, "GitHub API rate limit hit — try again in a minute."
@@ -2816,6 +2973,71 @@ def _gh_repo_from_url(url: str) -> str | None:
                  "marketplace", "explore", "login", "features"):
         return None
     return f"{owner}/{repo}"
+
+
+def _get_user_github_owner() -> str:
+    """Resolve the current user's GitHub username / owner without hardcoding."""
+    tok = _gh_token()
+    if tok:
+        ok, udata = _gh_api("/user")
+        if ok and isinstance(udata, dict) and udata.get("login"):
+            return udata["login"]
+    # Check git config for github.user
+    try:
+        proc = subprocess.run(["git", "config", "--get", "github.user"],
+                              capture_output=True, text=True, timeout=2)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except Exception:
+        pass
+    # Check remote origin url e.g. https://github.com/liveprosperdie/Sensei.git
+    try:
+        proc = subprocess.run(["git", "config", "--get", "remote.origin.url"],
+                              capture_output=True, text=True, timeout=2)
+        if proc.returncode == 0 and proc.stdout.strip():
+            m = re.search(r"github\.com[:/]([\w.-]+)/", proc.stdout.strip())
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return os.environ.get("GITHUB_USER") or os.environ.get("GITHUB_USERNAME") or "liveprosperdie"
+
+
+def _resolve_repo_target(parameter: str | None, current_repo: str | None) -> tuple[str | None, str | None]:
+    """
+    Resolve a user-specified repo name into full 'owner/repo'.
+    Returns (resolved_full_name, error_message).
+    If error_message is not None, resolution failed and the caller MUST fail loudly
+    instead of silently guessing or substituting another repo.
+    """
+    p = (parameter or "").strip().strip("/")
+    if p:
+        if "/" in p:
+            # Explicit owner/repo provided
+            ok, info = _gh_api(f"/repos/{p}")
+            if ok and isinstance(info, dict) and "full_name" in info:
+                return info["full_name"], None
+            return None, f"Couldn't find a repo named '{p}' on GitHub."
+        else:
+            # Bare repo name e.g. 'filesense' -> resolve against user's GitHub account
+            owner = _get_user_github_owner()
+            ok, info = _gh_api(f"/repos/{owner}/{p}")
+            if ok and isinstance(info, dict) and "full_name" in info:
+                return info["full_name"], None
+            # Also check user's repo list for case-insensitive matches
+            ok2, repos = _gh_api(f"/users/{owner}/repos?per_page=100")
+            if ok2 and isinstance(repos, list):
+                for r in repos:
+                    if r.get("name", "").lower() == p.lower():
+                        return r.get("full_name"), None
+            return None, f"Couldn't find a repo named '{p}' on your GitHub ({owner})."
+
+    # No repo named: check open browser tab or last search
+    if current_repo:
+        return current_repo, None
+    if _gh_last_repos:
+        return _gh_last_repos[0]["label"], None
+    return None, "Open a repo first, or tell me which repo you want."
 
 
 def _gh_click_text_button(browser, phrases: list):
@@ -2862,31 +3084,61 @@ def github_control(action: str, parameter: str | None = None) -> dict:
     def _current_repo() -> str | None:
         return _gh_repo_from_url(current_url)
 
-    # ── Tier A: reads via unauthenticated REST API ───────────────────────────
+    # ── Tier A: reads via REST API with user repo resolution ────────────────
     if action in ("search repos", "search repo", "search"):
         if not parameter:
             return {"success": False, "message": "Search needs a query."}
+
+        # Resolve against user's own GitHub account first
+        owner = _get_user_github_owner()
+        resolved, _ = _resolve_repo_target(parameter, None)
+        if resolved:
+            ok, data = _gh_api(f"/repos/{resolved}")
+            if ok and isinstance(data, dict):
+                url = data.get("html_url", f"https://github.com/{resolved}")
+                _gh_last_repos = [{"label": data.get("full_name", resolved), "href": url,
+                                   "desc": (data.get("description") or "")[:80],
+                                   "stars": data.get("stargazers_count", 0)}]
+                browser.get(url)
+                return {"success": True, "message": f"Found {data.get('full_name', resolved)} in your repos ({owner}). Say open repository or repo notes."}
+
+        # Fallback to global public search if no match on user's account
         ok, data = _gh_api("/search/repositories?per_page=10&q=" + urllib.parse.quote(parameter))
         if not ok:
             return {"success": False, "message": data}
         items = data.get("items", [])
         if not items:
-            return {"success": False, "message": f"No repos found for {parameter}."}
+            return {"success": False, "message": f"Couldn't find {parameter} in your repos ({owner}) or anywhere on GitHub."}
         _gh_last_repos = [{"label": it["full_name"], "href": it["html_url"],
                            "desc": (it.get("description") or "")[:80],
                            "stars": it.get("stargazers_count", 0)} for it in items]
         browser.get("https://github.com/search?type=repositories&q=" + urllib.parse.quote(parameter))
         top = "; ".join(f"{c['label']} ({c['stars']} stars)" for c in _gh_last_repos[:4])
-        return {"success": True, "message": f"Found {len(_gh_last_repos)} repos. Top: {top}. Say open first repo, or name one."}
+        return {"success": True, "message": f"Couldn't find {parameter} in your repos ({owner}), but found {len(_gh_last_repos)} public repos on GitHub. Top: {top}."}
 
     if action in ("open repo", "open repository", "open result"):
-        if parameter and "/" in parameter and " " not in parameter.strip():
-            full = parameter.strip().strip("/")
-            ok, data = _gh_api(f"/repos/{full}")
-            if not ok:
-                return {"success": False, "message": data}
-            browser.get(data["html_url"])
-            return {"success": True, "message": f"Opened {data['full_name']}."}
+        if parameter:
+            # Call _resolve_repo_target FIRST against user's own GitHub account
+            resolved, err = _resolve_repo_target(parameter, None)
+            if resolved:
+                ok, data = _gh_api(f"/repos/{resolved}")
+                url = data.get("html_url") if (ok and isinstance(data, dict)) else f"https://github.com/{resolved}"
+                name = data.get("full_name", resolved) if (ok and isinstance(data, dict)) else resolved
+                browser.get(url)
+                return {"success": True, "message": f"Opened {name}."}
+
+            # Fallback to global public search if no match on user's account
+            owner = _get_user_github_owner()
+            ok, data = _gh_api("/search/repositories?per_page=5&q=" + urllib.parse.quote(parameter))
+            if ok and isinstance(data, dict) and data.get("items"):
+                first = data["items"][0]
+                _gh_last_repos = [{"label": it["full_name"], "href": it["html_url"],
+                                   "desc": (it.get("description") or "")[:80],
+                                   "stars": it.get("stargazers_count", 0)} for it in data["items"]]
+                browser.get(first["html_url"])
+                return {"success": True, "message": f"Couldn't find {parameter} in your repos ({owner}), but found public repo {first['full_name']} — opened that instead."}
+            return {"success": False, "message": err or f"Couldn't find a repo named {parameter} in your repos or on GitHub."}
+
         if not _gh_last_repos:
             return {"success": False, "message": "No repo results yet — search repos first, or say the owner/name."}
         pick = _pick_card(_gh_last_repos, parameter)
@@ -2946,14 +3198,9 @@ def github_control(action: str, parameter: str | None = None) -> dict:
         # resolved right here on the main thread, because resolving it needs the
         # browser's current URL and Selenium is not thread-safe. Only the slow,
         # browser-free remainder is handed off.
-        target = repo
-        if parameter and "/" in parameter and " " not in parameter.strip():
-            target = parameter.strip().strip("/")
-        if not target and _gh_last_repos:
-            target = _gh_last_repos[0]["label"]
-        if not target:
-            return {"success": False,
-                    "message": "Open a repo first, or tell me the owner and name."}
+        target, err = _resolve_repo_target(parameter, repo)
+        if err or not target:
+            return {"success": False, "message": err or "Open a repo first, or tell me which repo you want."}
         import background_tasks
         import repo_notes
         return background_tasks.start(
@@ -2978,6 +3225,9 @@ def github_control(action: str, parameter: str | None = None) -> dict:
         base_dir = (parameter.strip() if parameter and parameter.strip()
                     else os.path.join(os.path.expanduser("~"), "Documents", "GitHub Clones"))
         dest = os.path.join(base_dir, repo.split("/")[1])
+        import security_guard
+        if security_guard.is_codebase_path(dest) or security_guard.is_codebase_path(base_dir):
+            return {"success": False, "message": "Cloning into Akira's source code tree is strictly not permitted."}
         if os.path.isdir(dest) and os.listdir(dest):
             return {"success": False, "message": f"{repo.split('/')[1]} already exists in {base_dir} — it looks like you've cloned it before."}
         try:
@@ -3403,6 +3653,9 @@ def create_file(parameter: str | None = None) -> dict:
     fpath, err = _resolve_path(parts[0] if parts and parts[0] else None)
     if err:
         return {"success": False, "message": err}
+    import security_guard
+    if security_guard.is_codebase_path(fpath):
+        return {"success": False, "message": "Self-modification of Akira's source code is strictly not permitted."}
     if os.path.exists(fpath):
         return {"success": False, "message": f"{os.path.basename(fpath)} already exists — say write file if you want to overwrite it."}
     content = "|".join(parts[1:]) if len(parts) > 1 else ""
@@ -3547,6 +3800,9 @@ def write_file(parameter: str | None = None) -> dict:
     fpath, err = _resolve_path(parts[0] if parts and parts[0] else None)
     if err:
         return {"success": False, "message": err}
+    import security_guard
+    if security_guard.is_codebase_path(fpath):
+        return {"success": False, "message": "Self-modification of Akira's source code is strictly not permitted."}
     if len(parts) < 2:
         return {"success": False, "message": "Tell me what to write, like write file|notes.txt|the content."}
     content = "|".join(parts[1:])  # content may legitimately contain |
@@ -3571,6 +3827,9 @@ def edit_file(parameter: str | None = None) -> dict:
     fpath, err = _resolve_path(parts[0] if parts[0] else None)
     if err:
         return {"success": False, "message": err}
+    import security_guard
+    if security_guard.is_codebase_path(fpath):
+        return {"success": False, "message": "Self-modification of Akira's source code is strictly not permitted."}
     if not os.path.isfile(fpath):
         return {"success": False, "message": f"That file doesn't exist: {fpath}"}
     find_text, replace_text = parts[1], parts[2]
@@ -3937,6 +4196,9 @@ def copy_files(parameter: str | None = None) -> dict:
     dest, derr = _resolve_dest(parts[1])
     if derr:
         return {"success": False, "message": derr}
+    import security_guard
+    if security_guard.is_codebase_path(dest):
+        return {"success": False, "message": "Copying files into Akira's source code directory is strictly prohibited."}
     try:
         os.makedirs(dest, exist_ok=True)
         for t in targets:
@@ -3960,6 +4222,9 @@ def move_files(parameter: str | None = None) -> dict:
     targets, _, err = _resolve_targets(parts[0], include_dirs=True)
     if err:
         return {"success": False, "message": err}
+    import security_guard
+    if any(security_guard.is_codebase_path(t) for t in targets):
+        return {"success": False, "message": "Moving Akira's source code files is strictly not permitted."}
     dest, derr = _resolve_dest(parts[1])
     if derr:
         return {"success": False, "message": derr}
@@ -3987,6 +4252,9 @@ def delete_files(parameter: str | None = None) -> dict:
                                        include_dirs=True)
     if err:
         return {"success": False, "message": err}   # vague/ambiguous → ask, never guess
+    import security_guard
+    if any(security_guard.is_codebase_path(t) for t in targets):
+        return {"success": False, "message": "Self-modification or deletion of Akira's source code is strictly not permitted."}
     if len(targets) > 15:
         return {"success": False, "message": f"That would delete {len(targets)} items — too many to do safely in one go. Narrow it down and I'll enumerate them."}
     n_dirs = sum(1 for t in targets if os.path.isdir(t))
@@ -4029,6 +4297,9 @@ def organize_folder(parameter: str | None = None) -> dict:
     folder, err = _resolve_path(parameter, want_dir=True)
     if err:
         return {"success": False, "message": err}
+    import security_guard
+    if security_guard.is_codebase_path(folder):
+        return {"success": False, "message": "Organizing Akira's source code directory is strictly prohibited."}
     if not os.path.isdir(folder):
         return {"success": False, "message": f"That folder doesn't exist: {folder}"}
     pairs, counts = [], {}
@@ -4252,6 +4523,10 @@ def file_to_doc(parameter: str | None = None) -> dict:
     result = google_mcp.call("workspace", "create_google_doc",
                              {"name": title, "content": gen["text"]})
     if result.get("success"):
+        import re
+        has_id = bool(re.search(r"([-\w]{25,}|https?://docs\.google\.com/[^\s]+)", str(result)))
+        if not has_id:
+            return {"success": False, "message": f"Created {title} from {name}, but no file ID or link was returned."}
         result["message"] = f"Created {title} from {name}. {result.get('message', '')}".strip()
     return result
 
@@ -5102,12 +5377,38 @@ def _find_exe(name: str) -> str | None:
     return shutil.which(name)
 
 
+def _activate_launched_window(name: str) -> None:
+    """Best-effort bring-to-foreground for a freshly launched application.
+    Waits up to 2s for the window to appear, then activates it."""
+    title_hint = WINDOW_TITLE_MAP.get(name.lower(), name.title())
+    for _ in range(10):
+        time.sleep(0.2)
+        try:
+            wins = gw.getWindowsWithTitle(title_hint)
+            if not wins:
+                # Also try partial match on the raw name
+                for w in gw.getAllWindows():
+                    if name.lower() in (w.title or "").lower():
+                        wins = [w]
+                        break
+            if wins:
+                hwnd = wins[0]._hWnd
+                win32gui.ShowWindow(hwnd, 5)          # SW_SHOW
+                win32gui.SetForegroundWindow(hwnd)
+                print(f"[open_application] activated window hwnd={hwnd} title={wins[0].title!r}")
+                return
+        except Exception as e:
+            print(f"[open_application] SetForegroundWindow attempt: {e}")
+    print(f"[open_application] could not find window for {name!r} after 2s")
+
+
 def _open_single_app(name: str) -> str:
     param = APP_ALIASES.get(name.lower().strip(), name.lower().strip())
 
     if param in URI_MAP:
         try:
             os.startfile(URI_MAP[param])
+            _activate_launched_window(name)
             return f"Opening {name}."
         except Exception:
             return f"Couldn't open {name}."
@@ -5130,6 +5431,7 @@ def _open_single_app(name: str) -> str:
     if exe:
         try:
             subprocess.Popen(exe)
+            _activate_launched_window(name)
             return f"Opening {name}."
         except Exception as e:
             return f"Couldn't open {name}: {e}"
@@ -5137,12 +5439,14 @@ def _open_single_app(name: str) -> str:
     # Try Windows App Paths or direct shell association
     try:
         os.startfile(param)
+        _activate_launched_window(name)
         return f"Opening {name}."
     except Exception:
         pass
 
     try:
         os.startfile(name)
+        _activate_launched_window(name)
         return f"Opening {name}."
     except Exception:
         pass
@@ -5183,6 +5487,9 @@ def open_application(parameter: str, is_indirect: bool = False) -> str:
 
 def _close_single_app(name: str) -> str:
     param = name.lower().strip()
+    import security_guard
+    if security_guard.is_system_critical_process(param):
+        return f"Closing system-critical process '{name}' is blocked by security policy."
     try:
         title = WINDOW_TITLE_MAP.get(param, param.title())
         wins = gw.getWindowsWithTitle(title)
@@ -5373,20 +5680,12 @@ def new_tab(parameter: str | None = None) -> str:
 
 
 def open_site_tab(parameter: str) -> str:
-    """Opens the requested site in Akira's tab if it's still blank/unused,
-    otherwise in a NEW tab, separate from the user's existing tabs."""
+    """Opens the requested site in a NEW tab — never reuses the pre-warmed
+    Akira tab.  Named-site opens ("open youtube") should always produce a
+    fresh tab; the _akira_tab handle is updated so subsequent control
+    operations (click, scroll, fill) target the new page."""
     browser = get_browser(_last_browser_name)
     url = resolve_site_url(parameter.strip())
-
-    akira_tab = getattr(browser, "_akira_tab", None)
-    if akira_tab:
-        try:
-            if browser.current_window_handle != akira_tab:
-                browser.switch_to.window(akira_tab)
-            _navigate(url)
-            return f"Opened {parameter} in browser tab."
-        except Exception:
-            pass
 
     existing = set(browser.window_handles)
     browser.execute_cdp_cmd("Target.createTarget", {"url": url})
@@ -5395,6 +5694,10 @@ def open_site_tab(parameter: str) -> str:
         if new_handles:
             browser.switch_to.window(new_handles[0])
             browser._akira_tab = new_handles[0]
+            if "youtube" in parameter.lower():
+                browser._youtube_target_tab = new_handles[0]
+                global _last_youtube_tab_handle
+                _last_youtube_tab_handle = new_handles[0]
             return f"Opened {parameter} in a new tab."
         time.sleep(0.02)
     return f"Opened {parameter} in browser."
@@ -5502,8 +5805,16 @@ def _handle_web_search(parameter: str) -> str:
         parameter, browser_name = parameter.split("|browser:", 1)
         parameter, browser_name = parameter.strip(), browser_name.strip()
 
-    explicit_web = any(w in parameter.lower() for w in ["on the web", "on google", "google it", "on web"])
-    query_clean = re.sub(r"\b(on the web|on google|google it|on web)\b", "", parameter, flags=re.I).strip()
+    has_explicit_prefix = False
+    search_query = parameter or ""
+    if "|" in search_query:
+        prefix, rest = search_query.split("|", 1)
+        if prefix.lower() in ("google", "web", "search", "bing", "yahoo"):
+            has_explicit_prefix = True
+            search_query = rest.strip()
+
+    explicit_web = has_explicit_prefix or any(w in search_query.lower() for w in ["on the web", "on google", "google it", "on web"])
+    query_clean = re.sub(r"\b(on the web|on google|google it|on web)\b", "", search_query, flags=re.I).strip()
 
     browser = get_browser(name=browser_name)
     browser.switch_to.window(browser._akira_tab)
@@ -5512,19 +5823,18 @@ def _handle_web_search(parameter: str) -> str:
     if current_site and current_site in SEARCH_URL_MAP:
         return _handle_site_search(f"{current_site}|{query_clean}")
 
-    _navigate(f"https://www.google.com/search?q={urllib.parse.quote(query_clean if explicit_web else parameter)}")
+    target_query = query_clean if explicit_web else search_query
+    _navigate(f"https://www.google.com/search?q={urllib.parse.quote(target_query)}")
 
     try:
-        for selector in [
-            "button[id*='reject']", "button[aria-label*='Reject']",
-            "button[aria-label*='Accept all']", "form[action*='consent'] button",
-        ]:
-            try:
-                btn = WebDriverWait(browser, 2).until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-                btn.click()
-                break
-            except Exception:
-                continue
+        browser.execute_script("""
+            var sels = ["button[id*='reject']", "button[aria-label*='Reject']",
+                        "button[aria-label*='Accept all']", "form[action*='consent'] button"];
+            for (var i = 0; i < sels.length; i++) {
+                var btn = document.querySelector(sels[i]);
+                if (btn && btn.offsetParent !== null) { btn.click(); break; }
+            }
+        """)
     except Exception:
         pass
 

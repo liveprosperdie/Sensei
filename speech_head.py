@@ -16,29 +16,65 @@ import time
 logger = logging.getLogger("akira.speech_head")
 
 
+def _get_speech_client(timeout: float):
+    """Resolve and instantiate the LLM client based on AKIRA_SPEECH_HEAD_PROVIDER.
+    
+    Supports 'groq' (default), 'cerebras', and 'openrouter' / 'openai_compatible'.
+    Returns (client, model_name) or (None, None) if key is missing/unsupported.
+    """
+    from tiered_config import get_speech_head_provider, get_speech_head_model
+    provider = get_speech_head_provider()
+    model = get_speech_head_model()
+
+    if provider == "groq":
+        groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+        if not groq_key:
+            logger.warning("[speech_head] GROQ_API_KEY not set — failing open to Claude")
+            return None, None
+        from groq import Groq
+        return Groq(api_key=groq_key, timeout=timeout), model
+
+    elif provider == "cerebras":
+        cerebras_key = (os.environ.get("CEREBRAS_API_KEY") or "").strip()
+        if not cerebras_key:
+            logger.warning("[speech_head] CEREBRAS_API_KEY not set — failing open to Claude")
+            return None, None
+        from cerebras.cloud.sdk import Cerebras
+        return Cerebras(api_key=cerebras_key, timeout=timeout), model
+
+    elif provider in ("openrouter", "openai_compatible"):
+        key = (os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY") or "").strip()
+        if not key:
+            logger.warning("[speech_head] API key for %s not set — failing open to Claude", provider)
+            return None, None
+        from openai import OpenAI
+        base_url = os.environ.get("AKIRA_SPEECH_HEAD_BASE_URL") or "https://openrouter.ai/api/v1"
+        return OpenAI(api_key=key, base_url=base_url, timeout=timeout), model
+
+    else:
+        # Default fallback to Groq
+        groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+        if not groq_key:
+            return None, None
+        from groq import Groq
+        return Groq(api_key=groq_key, timeout=timeout), model
+
+
 def generate_conversation_reply(user_text: str, timeout: float = 4.0) -> str | None:
-    """Generate a quick conversational reply via the free speech head (Groq).
+    """Generate a quick conversational reply via the configured speech head.
     
     Returns plain spoken prose string, or None if generation failed/timed out.
     """
-    groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
-    if not groq_key:
-        logger.warning("[speech_head] GROQ_API_KEY not set — failing open to Claude")
+    client, model = _get_speech_client(timeout=timeout)
+    if client is None or not model:
         return None
 
     try:
-        from groq import Groq
-        client = Groq(api_key=groq_key, timeout=timeout)
-
-        model = (
-            os.environ.get("AKIRA_SPEECH_HEAD_MODEL")
-            or "openai/gpt-oss-120b"
-        )
-
         system_prompt = (
             "You are Akira, a fast and friendly desktop voice assistant. "
             "Respond to the user in 1 to 3 short, natural spoken sentences. "
             "Plain conversational English only — no markdown, no asterisks, no bullet points, no code. "
+            "If sincerely and directly asked if you are an AI, answer honestly and directly that yes, you are an AI assistant, without scripted persuasion or insisting on friendship. "
             "Never output <think> tags or internal thoughts; speak directly to the user."
         )
 
@@ -75,21 +111,16 @@ def generate_conversation_reply(user_text: str, timeout: float = 4.0) -> str | N
 
 
 def generate_document_content(brief: str, length: str = "short", timeout: float = 8.0) -> str | None:
-    """Generate drafted document content directly via the free speech head (Groq).
+    """Generate drafted document content directly via the configured speech head.
     
     Zero dependency on Claude Sonnet 5 or repo-notes 900-word length enforcement.
     Returns raw drafted text string, or None if generation failed/timed out.
     """
-    groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
-    if not groq_key:
-        logger.warning("[speech_head] GROQ_API_KEY not set — failing open to Claude")
+    client, model = _get_speech_client(timeout=timeout)
+    if client is None or not model:
         return None
 
     try:
-        from groq import Groq
-        client = Groq(api_key=groq_key, timeout=timeout)
-        model = os.environ.get("AKIRA_SPEECH_HEAD_MODEL") or "openai/gpt-oss-120b"
-
         system_prompt = (
             "You are Akira, a fast and helpful document writer. "
             "Draft the requested document content clearly, cleanly, and concisely based strictly on the user brief. "

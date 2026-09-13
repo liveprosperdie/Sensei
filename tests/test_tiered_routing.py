@@ -195,6 +195,109 @@ class TestTieredRoutingIntegration(unittest.TestCase):
         finally:
             os.environ["AKIRA_DISABLE_CLAUDE"] = "false"
 
+    def test_fan_out_estimation(self):
+        """estimate_command_fan_out structurally estimates distinct apps and sequential steps."""
+        self.assertEqual(tiered_classifier.estimate_command_fan_out("turn volume up"), 1)
+        self.assertEqual(tiered_classifier.estimate_command_fan_out("open spotify"), 1)
+        self.assertGreaterEqual(
+            tiered_classifier.estimate_command_fan_out("open notepad, then open chrome, then open spotify"), 3
+        )
+        self.assertGreaterEqual(
+            tiered_classifier.estimate_command_fan_out("open notepad and open calculator and open chrome"), 3
+        )
+        self.assertGreaterEqual(
+            tiered_classifier.estimate_command_fan_out("pause music, increase volume, and open chrome"), 3
+        )
+
+    def test_independent_command_chain_executes_locally(self):
+        """Independent command chains decompose and execute locally via local adapter."""
+        multi_cmd = "open notepad, then open chrome, then open spotify"
+        res = tiered_classifier.classify(multi_cmd)
+        self.assertTrue(res.is_chain)
+        self.assertEqual(res.fan_out, 3)
+        self.assertFalse(res.escalate)
+        self.assertEqual(len(res.sub_tasks), 3)
+
+        envelope = akira.get_akira_response(multi_cmd, raw_text=multi_cmd)
+        self.assertEqual(envelope.get("mode"), "action")
+        actions = envelope.get("actions", [])
+        self.assertEqual(len(actions), 3)
+        self.assertEqual(actions[0]["parameter"], "notepad")
+        self.assertEqual(actions[1]["parameter"], "chrome")
+        self.assertEqual(actions[2]["parameter"], "spotify")
+
+    def test_backward_reference_forces_escalation(self):
+        """Chains with anaphoric pronouns referencing prior steps escalate to Claude."""
+        cmd = "pause spotify then open the doc it mentions"
+        res = tiered_classifier.classify(cmd)
+        self.assertTrue(res.is_chain)
+        self.assertTrue(res.escalate)
+        self.assertEqual(res.escalate_trigger, "backward_reference")
+
+    def test_mixed_mode_chain_forces_escalation(self):
+        """Chains spanning command and conversation modes escalate to Claude."""
+        cmd = "turn volume up and what is the weather like"
+        res = tiered_classifier.classify(cmd)
+        self.assertTrue(res.is_chain)
+        self.assertTrue(res.escalate)
+        self.assertEqual(res.escalate_trigger, "mixed_mode")
+
+    def test_weak_link_chain_forces_escalation(self):
+        """A chain with one ambiguous or unallowed step escalates entirely."""
+        cmd = "turn volume up and play stranger things on netflix"
+        res = tiered_classifier.classify(cmd)
+        self.assertTrue(res.is_chain)
+        self.assertTrue(res.escalate)
+        self.assertEqual(res.escalate_trigger, "weak_link")
+
+    def test_chain_sanity_ceiling_forces_escalation(self):
+        """Chains exceeding sanity ceiling escalate regardless of independence."""
+        long_chain = "open notepad, then open chrome, then open spotify, then open calculator, then turn volume up, then mute"
+        res = tiered_classifier.classify(long_chain)
+        self.assertTrue(res.is_chain)
+        self.assertTrue(res.escalate)
+        self.assertEqual(res.escalate_trigger, "chain_ceiling")
+
+    def test_ambiguous_registry_netflix_escalates(self):
+        """Netflix requests match ambiguous-pattern registry and force escalation despite high confidence."""
+        netflix_cmd = "play stranger things on netflix"
+        res = tiered_classifier.classify(netflix_cmd)
+        self.assertTrue(res.escalate)
+        self.assertEqual(res.escalate_trigger, "ambiguous_flag")
+
+    def test_ambiguous_registry_relative_tab_escalates(self):
+        """Vague tab references match ambiguous registry and force escalation."""
+        tab_cmd = "switch to that tab"
+        from tiered_config import check_ambiguous_pattern
+        match = check_ambiguous_pattern("switch_tab", tab_cmd)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.tag, "ambiguous_tab_reference")
+
+    def test_normal_single_app_command_routes_to_adapter(self):
+        """Single-step routine command routes to local adapter without escalation."""
+        cmd = "turn volume up"
+        res = tiered_classifier.classify(cmd)
+        self.assertEqual(res.fan_out, 1)
+        self.assertFalse(res.escalate)
+        self.assertEqual(res.intent, "adjust_volume")
+
+        envelope = akira.get_akira_response(cmd, raw_text=cmd)
+        self.assertEqual(envelope.get("action"), "adjust_volume")
+
+    def test_speech_head_provider_and_model_config(self):
+        """AKIRA_SPEECH_HEAD_PROVIDER and AKIRA_SPEECH_HEAD_MODEL configure speech head dynamically."""
+        from tiered_config import get_speech_head_provider, get_speech_head_model
+        try:
+            os.environ["AKIRA_SPEECH_HEAD_PROVIDER"] = "cerebras"
+            os.environ["AKIRA_SPEECH_HEAD_MODEL"] = "llama-3.3-70b"
+            self.assertEqual(get_speech_head_provider(), "cerebras")
+            self.assertEqual(get_speech_head_model(), "llama-3.3-70b")
+        finally:
+            os.environ.pop("AKIRA_SPEECH_HEAD_PROVIDER", None)
+            os.environ.pop("AKIRA_SPEECH_HEAD_MODEL", None)
+        self.assertEqual(get_speech_head_provider(), "groq")
+        self.assertEqual(get_speech_head_model(), "openai/gpt-oss-120b")
+
 
 if __name__ == "__main__":
     unittest.main()

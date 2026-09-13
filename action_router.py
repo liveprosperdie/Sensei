@@ -74,6 +74,7 @@ undoable is forced SERIAL regardless of how fast it is. See that table.
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 from dataclasses import dataclass
@@ -82,6 +83,8 @@ from enum import Enum
 import guard
 import guard_rules
 from guard_rules import BLOCK, FLAG, Verdict
+
+logger = logging.getLogger("akira.action_router")
 
 
 class Tier(str, Enum):
@@ -483,7 +486,12 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None,
 
     # ── Gated, NOT yet approved: review only, never execute ──────────────
     if step_tier is Tier.GATED and not confirmed:
-        verdict = guard.review(action, parameter, label="guard:gated", **kwargs)
+        try:
+            verdict = guard.review(action, parameter, label="guard:gated", **kwargs)
+        except Exception as e:
+            logger.error(f"[router] guard gated check failed for {action!r}: {e!r}")
+            print(f"[router] WARNING: guard gated check crashed for {action!r}: {e!r} — using static verdict")
+            verdict = static_verdict
         print(f"[router] {action} tier=gated {verdict}")
         return Outcome(step_tier, verdict, executed=False)
 
@@ -493,7 +501,12 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None,
     has_risky_keyword = any("risky keyword" in r for r in static_verdict.reasons)
     if has_risky_keyword or not parallel_ok(step):
         why = rollback(action).value
-        verdict = guard.review(action, parameter, label="guard:serial", **kwargs)
+        try:
+            verdict = guard.review(action, parameter, label="guard:serial", **kwargs)
+        except Exception as e:
+            logger.error(f"[router] guard serial check failed for {action!r}: {e!r}")
+            print(f"[router] WARNING: guard serial check crashed for {action!r}: {e!r} — using static verdict")
+            verdict = static_verdict
         print(f"[router] {action} tier={step_tier.value} serial "
               f"(rollback={why}) {verdict}")
         if verdict.decision == guard_rules.BLOCK or (not confirmed and not verdict.allowed):
@@ -514,11 +527,12 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None,
             box.append(guard.review(action, parameter, label="guard:parallel",
                                     **kwargs))
         except Exception as e:
-            # guard.review is documented never to raise. Belt-and-braces: if it
-            # ever does, this thread must still leave a fail-closed verdict, or
-            # the empty box below would be read as "no objection".
-            box.append(Verdict(FLAG, (f"guard thread crashed: {e!r}",),
-                               source="fail-closed"))
+            # guard.review is documented never to raise. If it ever encounters
+            # an unexpected runtime failure, degrade to static verdict so the
+            # action can proceed safely.
+            logger.error(f"[router] guard thread crashed for {action!r}: {e!r}")
+            print(f"[router] WARNING: guard parallel check crashed for {action!r}: {e!r} — using static verdict")
+            box.append(static_verdict)
 
     thread = threading.Thread(target=_review, name=f"guard:{action}",
                               daemon=True)

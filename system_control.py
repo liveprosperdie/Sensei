@@ -426,7 +426,7 @@ def _temp_targets() -> list[str]:
     return [p for p in cands if p and os.path.isdir(p)]
 
 
-def _dir_size(path: str, cap: int = 20000) -> tuple[int, int]:
+def _dir_size(path: str, cap: int = 500) -> tuple[int, int]:
     """(bytes, file_count), scanning at most `cap` files so a huge temp tree
     can't stall the voice loop."""
     total = files = 0
@@ -454,32 +454,20 @@ def preview_temp_cleanup(parameter: str = "") -> dict:
     total = files = 0
     lines = []
     for t in targets:
-        b, f = _dir_size(t)
+        b, f = _dir_size(t, cap=300)
         total += b
         files += f
         lines.append(f"{t} ({_gb(b)} GB, {f} files)")
     print(f"[SYS] temp preview: {lines}")
     return {"success": True, "speak": True, "targets": targets,
             "bytes": total, "files": files,
-            "message": (f"I'd clear {files} files, about {_gb(total)} gigabytes, "
-                        f"from {len(targets)} temp folders: "
-                        + "; ".join(os.path.basename(t.rstrip('\\/')) or t
-                                    for t in targets) + ".")}
+            "message": (f"I'd clear about {files} files ({_gb(total)} GB) "
+                        f"from {len(targets)} temp folders.")}
 
 
-def clear_temp_files(parameter: str = "") -> dict:
-    """Delete contents of OS temp folders only. Locked/in-use files are
-    skipped rather than fought over — that is normal, not a failure."""
-    targets = _temp_targets()
-    if not targets:
-        return {"success": False, "message": "I couldn't find any temp folders."}
-
-    removed = freed = skipped = 0
-    unreadable = 0
+def _do_clear_temp_worker(targets: list[str]) -> None:
+    removed = freed = skipped = unreadable = 0
     for t in targets:
-        # listdir itself raises PermissionError on a protected folder (Prefetch
-        # needs admin). That must NOT abort the whole cleanup or escape as a raw
-        # exception into the spoken response — skip the folder and keep going.
         try:
             names = os.listdir(t)
         except Exception as e:
@@ -492,10 +480,6 @@ def clear_temp_files(parameter: str = "") -> dict:
             try:
                 size = os.path.getsize(path) if os.path.isfile(path) else 0
                 if os.path.isdir(path) and not os.path.islink(path):
-                    size, _ = _dir_size(path)
-                    # ignore_errors=False would raise on the first locked file
-                    # inside the tree and lose the whole rest of the run; the
-                    # onerror hook counts them and lets the walk continue.
                     failures = []
                     shutil.rmtree(path, onerror=lambda *a: failures.append(a))
                     if failures or os.path.exists(path):
@@ -506,38 +490,39 @@ def clear_temp_files(parameter: str = "") -> dict:
                 removed += 1
                 freed += size
             except Exception:
-                # Locked/in-use files are normal in temp — expected, not a fault.
                 skipped += 1
+    print(f"[SYS] async temp cleanup finished: removed={removed} skipped={skipped} freed={freed}")
 
-    total = removed + skipped
-    msg = f"Cleared {removed} of {total} items, freeing about {_gb(freed)} gigabytes."
-    if skipped:
-        msg += (f" {skipped} {'was' if skipped == 1 else 'were'} in use "
-                f"and got skipped.")
-    if unreadable:
-        msg += (f" {unreadable} folder{'s' if unreadable > 1 else ''} needed admin "
-                f"rights, so I left {'them' if unreadable > 1 else 'it'} alone.")
-    print(f"[SYS] temp cleanup removed={removed} skipped={skipped} "
-          f"unreadable={unreadable} freed={freed}")
-    # Succeeds as long as the operation ran: skipping locked files is a normal
-    # partial result, not a failure worth an error voice line.
-    return {"success": True, "speak": True, "message": msg}
+
+def clear_temp_files(parameter: str = "") -> dict:
+    """Delete contents of OS temp folders asynchronously in background.
+    Locked/in-use files are skipped normally."""
+    targets = _temp_targets()
+    if not targets:
+        return {"success": False, "message": "I couldn't find any temp folders."}
+
+    import threading
+    t = threading.Thread(target=_do_clear_temp_worker, args=(targets,), daemon=True, name="TempCleanupWorker")
+    t.start()
+
+    return {"success": True, "speak": True, "message": "Cleaning temporary files in the background."}
+
+
+def _do_empty_recycle_bin_worker() -> None:
+    try:
+        flags = 0x1 | 0x2 | 0x4
+        ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, flags)
+        print("[SYS] async empty recycle bin finished.")
+    except Exception as e:
+        print(f"[SYS] async empty recycle bin error: {e}")
 
 
 def empty_recycle_bin(parameter: str = "") -> dict:
-    """SHEmptyRecycleBin with NOCONFIRMATION|NOPROGRESSUI|NOSOUND, since the
-    spoken confirmation already happened upstream."""
-    try:
-        flags = 0x1 | 0x2 | 0x4
-        res = ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, flags)
-        # 0 = emptied, 0x80070091 = already empty (not an error worth reporting)
-        if res == 0:
-            return {"success": True, "message": "Recycle Bin emptied."}
-        if res in (0x80070091, -2147024751):
-            return {"success": True, "message": "The Recycle Bin was already empty."}
-        return {"success": False, "message": f"I couldn't empty the Recycle Bin (code {res})."}
-    except Exception as e:
-        return {"success": False, "message": f"I couldn't empty the Recycle Bin: {e}"}
+    """SHEmptyRecycleBin executed asynchronously in background."""
+    import threading
+    t = threading.Thread(target=_do_empty_recycle_bin_worker, daemon=True, name="RecycleBinWorker")
+    t.start()
+    return {"success": True, "speak": True, "message": "Emptying the Recycle Bin in the background."}
 
 
 def run_disk_cleanup(parameter: str = "") -> dict:

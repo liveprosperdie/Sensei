@@ -22,7 +22,7 @@ from .db import (
     get_index_size_bytes,
     _db_lock
 )
-from .scanner import initial_scan, scan_directory_tree
+from .scanner import initial_scan, scan_directory_tree, export_directory_map
 from .watcher import IndexWatcher
 from .content_extractor import ContentExtractionWorker
 from .search import search_files as _search_files
@@ -87,6 +87,12 @@ def init_file_index(
             if not has_completed:
                 print("[file_index] Performing one-time initial disk scan...")
                 initial_scan(resolved_path)
+            else:
+                # Ensure directory map exists and is up to date on boot
+                try:
+                    export_directory_map(resolved_path)
+                except Exception as _map_err:
+                    print(f"[file_index] warning exporting directory map: {_map_err}")
 
             # Start real-time filesystem watcher
             global _active_watcher

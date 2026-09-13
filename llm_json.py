@@ -227,3 +227,52 @@ def parse(raw: str) -> tuple[dict | None, dict]:
 
     print(f"[llm_json] unrepairable: {text[:300]!r}")
     return None, info
+
+
+def extract_spoken_text(raw: str) -> str:
+    """Extract natural spoken text from any string that may accidentally contain a JSON envelope,
+    raw dict formatting, or code fences.
+
+    If raw is a JSON object or contains keys like 'spoken_response', 'response', 'summary', 'message',
+    this extracts only that spoken message. If it's already plain text, returns it cleanly.
+    Ensures raw JSON syntax, quotes, and 'thought' fields are never read aloud by TTS.
+    """
+    if not raw or not isinstance(raw, str):
+        return ""
+    text = raw.strip()
+    if not text:
+        return ""
+
+    # Check if text looks like JSON or contains JSON-like braces
+    if ("{" in text and "}" in text) or text.startswith("{"):
+        try:
+            obj, _ = parse(text)
+            if isinstance(obj, dict):
+                # Search for known spoken keys in priority order
+                for key in ("spoken_response", "response", "summary", "message", "content", "reply", "text"):
+                    val = obj.get(key)
+                    if isinstance(val, str) and val.strip():
+                        res = val.strip()
+                        if ("{" in res and "}" in res) and res != text:
+                            return extract_spoken_text(res)
+                        return res
+                # If it's a dict without standard spoken keys, use first non-thought string value
+                for k, v in obj.items():
+                    if k not in ("thought", "actions", "mode", "tone", "confirmation_required", "end_session") and isinstance(v, str) and v.strip():
+                        return v.strip()
+        except Exception:
+            pass
+
+        # Regex fallback for {"response": "..."} or {"spoken_response": "..."} even if JSON is malformed
+        m = re.search(r'"(?:spoken_response|response|summary|message|reply)"\s*:\s*"((?:[^"\\]|\\.)*)"', text, re.IGNORECASE)
+        if m:
+            val = m.group(1).encode("utf-8").decode("unicode_escape", errors="replace")
+            if val.strip():
+                return val.strip()
+
+    # If it starts and ends with stray quotes, strip them
+    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+        if len(text) >= 2:
+            text = text[1:-1].strip()
+
+    return text

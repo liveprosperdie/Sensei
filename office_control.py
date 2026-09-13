@@ -932,16 +932,7 @@ def _word_generate(app, doc, parameter: str | None) -> dict:
     written = (f"Wrote {title} into the document with {len(headings)} "
                f"{'section' if len(headings) == 1 else 'sections'}.")
 
-    # MANDATORY, NOT OPTIONAL: every generated document gets an image pass over
-    # its sections once ALL the text exists. Batched at the end deliberately —
-    # interleaving picks between sections broke the flow of the writing.
-    # `brief` (what the USER asked for) anchors the image queries — the
-    # generated headings are written for prose and search terribly on their own.
-    if doc_image_plan.begin("word", title, headings, brief):
-        prompt = _image_pass_prompt(False)
-        if prompt:
-            return _ok(f"{written} Now the images. {prompt}", speak=True)
-    return _ok(written)
+    return _ok(written, speak=True)
 
 
 # ── Excel ──────────────────────────────────────────────���─────────────��────────

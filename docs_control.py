@@ -7,6 +7,7 @@ Action format:
   append|<documentId>|text...
 """
 
+import re
 import google_mcp
 
 
@@ -73,8 +74,15 @@ def docs_control(action: str, parameter: str | None = None) -> dict:
             length)
         if not gen["success"]:
             return gen
-        return google_mcp.call("workspace", "create_google_doc", {
+        res = google_mcp.call("workspace", "create_google_doc", {
             "name": sub[0].strip(), "content": gen["text"]})
+        if not res.get("success"):
+            return res
+        import re
+        has_id = bool(re.search(r"([-\w]{25,}|https?://docs\.google\.com/[^\s]+)", str(res)))
+        if not has_id:
+            return {"success": False, "message": f"Document created, but no document ID or link was returned: {res.get('message', '')}"}
+        return res
 
     if action == "read":
         if not parts or not parts[0].strip():

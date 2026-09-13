@@ -616,11 +616,56 @@ def _route_via_groq(groq_key: str, messages: list[dict], system_blocks: list,
 
 
     except model_pool.PoolExhaustedError as e:
-        print(f"[gemini_head] Model pool exhausted: {e}")
-        return _refuse(
-            f"All free routing models are temporarily rate-limited. "
-            f"Please wait {int(e.retry_after)} seconds."
-        )
+        # Bug-5 fix: for short waits (≤5s), sleep and retry once instead
+        # of surfacing "rate-limited" as a raw refusal mid-session.  A
+        # live demo with rapid back-to-back voice commands can exhaust
+        # all 4 pool slots simultaneously for 1-3 seconds.
+        if e.retry_after <= 5.0:
+            print(f"[gemini_head] Pool exhausted, waiting {e.retry_after:.1f}s and retrying once…")
+            time.sleep(e.retry_after)
+            try:
+                result = pool.call_model(
+                    messages=route_messages,
+                    system=groq_sys,
+                    json_mode=True,
+                    timeout=10.0,
+                    session_id=session_id,
+                )
+                raw_text = result.text
+                import llm_json
+                obj = result.parsed
+                if not obj:
+                    obj, _ = llm_json.parse(raw_text)
+                if not obj and raw_text:
+                    m_json = re.search(r'(\{[\s\S]*\})', raw_text)
+                    if m_json:
+                        obj, _ = llm_json.parse(m_json.group(1))
+                if obj and isinstance(obj, dict) and "mode" in obj:
+                    if obj.get("mode") == "conversation" and isinstance(obj.get("response"), str):
+                        m_inner = re.search(r'(\{\s*"mode"\s*:\s*"command"[\s\S]*?\})', obj["response"])
+                        if m_inner:
+                            inner_obj, _ = llm_json.parse(m_inner.group(1))
+                            if inner_obj and isinstance(inner_obj, dict) and inner_obj.get("mode") == "command":
+                                obj = inner_obj
+                    obj = _normalize_payload(obj)
+                    raw_text = json.dumps(obj)
+                elif raw_text:
+                    raw_text = json.dumps({"mode": "conversation", "response": raw_text, "tone": "neutral", "end_session": False})
+                else:
+                    raw_text = json.dumps({"mode": "conversation", "response": "How can I help with that?", "tone": "neutral", "end_session": False})
+                print(f"[gemini_head] retry succeeded via {result.provider} ({result.model}) in {result.elapsed_ms:.1f}ms")
+                return HeadReply([_TextBlock(raw_text)], "end_turn", provider="groq", model=result.model)
+            except Exception as retry_err:
+                print(f"[gemini_head] retry after wait also failed: {retry_err!r}")
+                return _refuse(
+                    "Voice routing is momentarily busy. Try again in a few seconds."
+                )
+        else:
+            print(f"[gemini_head] Model pool exhausted (wait={e.retry_after:.1f}s too long to block): {e}")
+            return _refuse(
+                f"All free routing models are temporarily rate-limited. "
+                f"Please wait {int(e.retry_after)} seconds."
+            )
     except Exception as e:
         print(f"[gemini_head] Multi-model route failed: {e!r}")
         return None

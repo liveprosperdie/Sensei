@@ -63,7 +63,61 @@ def generate(brief: str, format_instructions: str = "",
     prompt = (f"Write the following content in roughly {words} words or fewer. "
               f"{format_instructions}\n\n{brief}")
 
-    # Primary: route through model_pool across verified endpoints with automatic rotation
+    # Task 2 & Task 6: Primary route through Claude Sonnet 5
+    try:
+        import claude_handler
+        if getattr(claude_handler, "client", None) is not None:
+            anthropic_client = claude_handler.client
+            sonnet_sys = (
+                "You are a professional technical and analytical writer. Produce clean, "
+                "well-structured, detailed prose matching the requested format. "
+                "Do not include conversational preambles, meta-commentary, markdown tags, or filler."
+            )
+            # Minimum length target of at least 900 words (approx 2 full pages)
+            init_prompt = (
+                f"{prompt}\n\n"
+                f"Please ensure the document is comprehensive, detailed, and substantive, "
+                f"aiming for at least 900 words (~2 full pages)."
+            )
+            long_client = anthropic_client.with_options(timeout=120.0, max_retries=1) if hasattr(anthropic_client, "with_options") else anthropic_client
+            resp = long_client.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=4096,
+                system=sonnet_sys,
+                messages=[{"role": "user", "content": init_prompt}],
+            )
+            text = claude_handler.response_text(resp).strip()
+            word_count = len(text.split())
+            print(f"[content_generator] initial Sonnet 5 draft: {word_count} words")
+
+            # Length enforcement: check if >= 900 words; if short, re-prompt for deeper per-section detail
+            if word_count < 900:
+                print(f"[content_generator] word count ({word_count}) < 900 words (~2 pages). Re-prompting for deeper detail...")
+                deep_prompt = (
+                    f"{init_prompt}\n\n"
+                    f"CRITICAL REQUIREMENT: The previous output was only {word_count} words. "
+                    f"The final document MUST clear at least 900 words (~2 full pages). "
+                    f"Please expand every section with deeper per-section explanations, concrete operational examples, "
+                    f"substantive technical background, and thorough analysis. Do not add repetitive filler."
+                )
+                resp2 = long_client.messages.create(
+                    model="claude-sonnet-5",
+                    max_tokens=4096,
+                    system=sonnet_sys,
+                    messages=[{"role": "user", "content": deep_prompt}],
+                )
+                text2 = claude_handler.response_text(resp2).strip()
+                if len(text2.split()) > word_count:
+                    text = text2
+                    word_count = len(text.split())
+                print(f"[content_generator] final Sonnet 5 draft length: {word_count} words")
+
+            if text:
+                return {"success": True, "text": text}
+    except Exception as e:
+        print(f"[content_generator] Claude Sonnet 5 generation failed ({e!r}), attempting fallback")
+
+    # Fallback: route through model_pool across verified endpoints with automatic rotation
     try:
         import model_pool
         pool = model_pool.get_pool()

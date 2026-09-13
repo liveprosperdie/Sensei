@@ -60,6 +60,13 @@ def get_scope_config_file() -> str:
     return os.path.join(get_config_dir(), "index_scope.json")
 
 
+def get_directory_map_file(target_dir: Optional[str] = None) -> str:
+    """Return path to directory_map.txt inside target_dir or config directory."""
+    if target_dir and os.path.isdir(target_dir):
+        return os.path.join(target_dir, "directory_map.txt")
+    return os.path.join(get_config_dir(), "directory_map.txt")
+
+
 def get_volume_serial(path: str) -> str:
     """Retrieve 8-character hex volume serial number for a Windows drive."""
     if not sys.platform.startswith("win"):

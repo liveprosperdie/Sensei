@@ -160,7 +160,7 @@ ACTION_RULES: dict[str, Rule] = {
     "maximize_window": OPT_OPAQUE_TEXT,
     "minimize_window": OPT_OPAQUE_TEXT,
     # ── browser & web ─────────────────────────────────────────────────────
-    "open_url": OPAQUE_TEXT,
+    "open_url": Rule(1, 1, screen=True, split_pipe=False),
     "web_search": SUB_FREE_TEXT_UNSCREENED,
     "site_search": SUB_FREE_TEXT_UNSCREENED,
     "fill": FILL,
@@ -432,6 +432,22 @@ def validate(action: str, parameter=None) -> Verdict:
     if reasons:
         return Verdict(BLOCK, tuple(reasons))
 
+    # ── Structural Deny: Self-Modification & Destructive OS Commands ─────
+    import security_guard
+    is_destr, destr_reason = security_guard.check_destructive_command(name, parameter)
+    if is_destr:
+        return Verdict(BLOCK, (destr_reason or "destructive OS command forbidden",))
+
+    if name in (
+        "create_file", "write_file", "edit_file", "delete_files", "delete_file",
+        "copy_files", "move_files", "organize_files", "organize_folder",
+        "bulk_rename_files", "compress_files", "extract_files", "vscode_control",
+        "github_control", "office_control"
+    ):
+        is_self_mod, mod_reason = security_guard.check_self_modification(parameter)
+        if is_self_mod:
+            return Verdict(BLOCK, (mod_reason or "self-modification forbidden: target is inside Akira codebase",))
+
     # Shape is sound; now the risk questions, both delegated.
     classifier = _akira_classifier()
     if classifier is None:
@@ -446,13 +462,26 @@ def validate(action: str, parameter=None) -> Verdict:
         except Exception as e:
             reasons.append(f"risk classifier errored ({e!r}) — unverified")
 
+    # Explicit URL safety checks for navigation actions
+    if name in ("open_url", "new_tab", "open_site_tab") and fields:
+        url = fields[0].strip().lower()
+        if any(url.startswith(proto) for proto in ("file:", "javascript:", "data:", "ftp:", "ws:", "about:")):
+            reasons.append("unsafe or non-web URL protocol")
+        if any(url.endswith(ext) or f"{ext}?" in url for ext in (".exe", ".bat", ".cmd", ".ps1", ".msi", ".vbs", ".reg", ".sh", ".iso")):
+            reasons.append("executable or installer file download URL")
+        if any(cred in url for cred in ("password=", "passwd=", "token=", "apikey=", "secret=", "auth=")):
+            reasons.append("potential credential/token leak in URL query")
+        if re.search(r"https?://(127\.|192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.)", url):
+            reasons.append("private network/local IP address navigation")
+
     if rule.screen:
         pattern = _risky_pattern()
         if pattern is None:
             reasons.append("keyword screen unavailable — unverified")
         else:
+            text_to_screen = re.sub(r"[_/&?=\-]", " ", "|".join(fields))
             hits = sorted({m.group(1).lower()
-                           for m in pattern.finditer("|".join(fields))})
+                           for m in pattern.finditer(text_to_screen)})
             if hits:
                 reasons.append(f"risky keyword(s): {', '.join(hits)}")
 

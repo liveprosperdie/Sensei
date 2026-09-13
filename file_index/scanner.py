@@ -4,6 +4,7 @@ file_index/scanner.py — One-time initial disk scan with walk-time exclude prun
 
 import os
 import time
+import datetime
 import sqlite3
 from typing import Optional, List, Callable
 from .config import IndexScopeConfig, get_available_drives, DEFAULT_CONTENT_EXTENSIONS
@@ -134,4 +135,104 @@ def initial_scan(
                 (str(time.time()),)
             )
 
+    # Persist directory map to disk
+    try:
+        export_directory_map(conn, os.path.join(os.path.dirname(os.path.abspath(db_path)), "directory_map.txt"))
+    except Exception as _exp_err:
+        print(f"[file_index.scanner] warning exporting directory map: {_exp_err}")
+
     return total_indexed
+
+
+def export_directory_map(
+    conn_or_db_path: str | sqlite3.Connection,
+    output_path: Optional[str] = None
+) -> str:
+    """
+    Export a structured human-readable directory map file from the indexed database.
+    Writes to index directory (directory_map.txt) and mirrors to Akira config directory.
+    """
+    import datetime
+    from .config import get_directory_map_file, get_config_dir
+
+    if isinstance(conn_or_db_path, str):
+        conn = get_connection(conn_or_db_path)
+        close_on_exit = True
+        index_dir = os.path.dirname(os.path.abspath(conn_or_db_path))
+    else:
+        conn = conn_or_db_path
+        close_on_exit = False
+        index_dir = None
+
+    try:
+        with _db_lock:
+            cur = conn.cursor()
+            cur.execute("SELECT id, parent_id, name FROM folders;")
+            folders = cur.fetchall()
+            cur.execute("SELECT folder_id, name, size FROM files;")
+            files = cur.fetchall()
+
+        parent_map = {fid: (pid, name) for fid, pid, name in folders}
+        path_cache = {}
+
+        def get_p(fid):
+            if fid in path_cache:
+                return path_cache[fid]
+            pid, name = parent_map.get(fid, (None, ""))
+            if pid is None:
+                p = name
+            else:
+                p = os.path.join(get_p(pid), name)
+            path_cache[fid] = p
+            return p
+
+        folder_files = {}
+        for fid, fn, sz in files:
+            folder_files.setdefault(fid, []).append((fn, sz))
+
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            "=" * 80,
+            "AKIRA LOCAL DIRECTORY MAP & FILE LISTING",
+            f"Generated: {now_str}",
+            f"Total Folders: {len(folders):,} | Total Files: {len(files):,}",
+            "=" * 80,
+            ""
+        ]
+
+        for fid in sorted(parent_map.keys(), key=lambda f: get_p(f)):
+            p = get_p(fid)
+            lines.append(f"[DIR] {p}")
+            f_list = folder_files.get(fid, [])
+            for fn, sz in sorted(f_list):
+                sz_str = f" ({sz:,} bytes)" if sz is not None else ""
+                lines.append(f"  {fn}{sz_str}")
+            lines.append("")
+
+        text_content = "\n".join(lines)
+
+        primary_path = output_path or (
+            get_directory_map_file(index_dir) if index_dir else get_directory_map_file()
+        )
+        os.makedirs(os.path.dirname(primary_path), exist_ok=True)
+        with open(primary_path, "w", encoding="utf-8", errors="replace") as f:
+            f.write(text_content)
+
+        # Mirror target path in AppData Akira config directory
+        mirror_path = os.path.join(get_config_dir(), "directory_map.txt")
+        if os.path.abspath(mirror_path).lower() != os.path.abspath(primary_path).lower():
+            try:
+                os.makedirs(os.path.dirname(mirror_path), exist_ok=True)
+                with open(mirror_path, "w", encoding="utf-8", errors="replace") as f:
+                    f.write(text_content)
+            except Exception as e:
+                print(f"[file_index.scanner] warning mirroring directory map: {e}")
+
+        print(f"[file_index.scanner] Directory map saved to: {primary_path} ({len(lines):,} lines, {len(files):,} files)")
+        return primary_path
+    finally:
+        if close_on_exit:
+            try:
+                conn.close()
+            except Exception:
+                pass

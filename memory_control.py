@@ -2,17 +2,48 @@ import os
 import datetime
 import glob
 import re
+import json
 
 MEMORY_DIR = os.path.join(os.path.dirname(__file__), "memory")
 LOGS_DIR = os.path.join(MEMORY_DIR, "logs")
 
 def _ensure_dirs():
+    os.makedirs(MEMORY_DIR, exist_ok=True)
     os.makedirs(LOGS_DIR, exist_ok=True)
 
 def _today_log_path() -> str:
     _ensure_dirs()
     today = datetime.datetime.now().strftime("%Y-%m-%d")
     return os.path.join(LOGS_DIR, f"{today}.md")
+
+def log_turn(user_text: str, assistant_response: str, actions: list | None = None) -> None:
+    """Silently logs a full conversational turn to today's rolling log."""
+    if not (user_text or "").strip() and not (assistant_response or "").strip():
+        return
+    try:
+        path = _today_log_path()
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        lines = [f"\n### [{timestamp}] Conversational Turn"]
+        if user_text and user_text.strip():
+            lines.append(f"- **User**: {user_text.strip()}")
+        if assistant_response and assistant_response.strip():
+            lines.append(f"- **Akira**: {assistant_response.strip()}")
+        if actions:
+            action_desc = []
+            for a in actions:
+                if isinstance(a, dict):
+                    act = a.get("action", "")
+                    param = a.get("parameter")
+                    action_desc.append(f"`{act}|{param}`" if param else f"`{act}`")
+                else:
+                    action_desc.append(f"`{a}`")
+            if action_desc:
+                lines.append(f"- **Actions**: {', '.join(action_desc)}")
+        lines.append("")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception as e:
+        print(f"[memory_control] failed to log turn: {e}")
 
 def log_action(text: str) -> None:
     """Silently logs an action to today's rolling log."""
@@ -44,6 +75,7 @@ def save_memory(parameter) -> dict:
         mem_type = data.get("type", "log")
         content = data.get("content", str(data))
         
+        _ensure_dirs()
         if mem_type == "core":
             core_path = os.path.join(MEMORY_DIR, "core_profile.md")
             with open(core_path, "a", encoding="utf-8") as f:
