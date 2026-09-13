@@ -54,3 +54,4 @@ live_function_test_results.json
 live_verified_report.json
 *.db
 voice_engine_branch/
+memory/logs/

@@ -65,11 +65,20 @@ def _reset_session_action_history() -> None:
     """Clear session action history."""
     _session_action_history.clear()
 
+_session_turn_counter = 0
+
+
 def _end_session() -> None:
     """Clean up state at the end of a session."""
-    global _active_session_id, _pending_blocked_action
+    global _active_session_id, _pending_blocked_action, _session_turn_counter
     _reset_session_action_history()
     _pending_blocked_action = None
+    _session_turn_counter = 0
+    try:
+        import session_context_cache
+        session_context_cache.get_cache().reset()
+    except Exception:
+        pass
     if _active_session_id:
         try:
             import model_pool
@@ -147,7 +156,7 @@ atexit.register(_cleanup_avatar)
 
 # Score above which "Akira" counts as heard. Defined here because the startup
 # banner reports it — set AKIRA_WAKE_DEBUG=1 to print live scores and tune it.
-WAKE_THRESHOLD = float(os.getenv("AKIRA_WAKE_THRESHOLD", "0.2"))
+WAKE_THRESHOLD = float(os.getenv("AKIRA_WAKE_THRESHOLD", "0.08"))
 WAKE_DEBUG     = os.getenv("AKIRA_WAKE_DEBUG", "") not in ("", "0", "false")
 
 # Resolve the wake model next to THIS file, not against the current working
@@ -229,7 +238,7 @@ except Exception:
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
-COOLDOWN_TIME   = 3.0
+COOLDOWN_TIME   = 1.0
 SESSION_TIMEOUT = 45  # seconds — enough for natural pauses
 
 last_activation_time = 0.0
@@ -250,7 +259,10 @@ _pending_blocked_action: dict | None = None
 
 CONFIRMATION_PHRASES = frozenset({
     "do it", "yes", "confirm", "go ahead", "yeah do that", "proceed",
-    "do that", "yeah", "yep", "sure", "ok do it", "please do it"
+    "do that", "yeah", "yep", "sure", "ok do it", "please do it",
+    "yes yes", "yeah im sure", "im sure", "yup", "okay",
+    "absolutely", "definitely", "yes do it", "go for it",
+    "yes please", "please do", "thats right", "right",
 })
 
 # VAD barge-in state
@@ -582,6 +594,12 @@ def _vad_listener() -> None:
     while True:
         if akira_speaking:
             chunk = stream.read(512, exception_on_overflow=False)
+            # Demo protection: never interrupt Akira's speech via VAD barge-in
+            if os.environ.get("AKIRA_DISABLE_VAD_INTERRUPT", "true").strip().lower() in ("true", "1", "yes"):
+                consecutive_user_frames = 0
+                pending_user_chunks.clear()
+                continue
+
             audio_np = np.frombuffer(chunk, dtype=np.int16)
             audio_f  = torch.FloatTensor(audio_np.astype(np.float32) / 32768.0)
             confidence = vad_model(audio_f, 16000).item()
@@ -622,6 +640,9 @@ vad_thread.start()
 
 def speak_and_wait(text: str) -> None:
     """Speak text while VAD listens for barge-in. Blocks until done or interrupted."""
+    text = llm_json.extract_spoken_text(text)
+    if not text:
+        return
     global akira_speaking
     akira_speaking = True
     _notify_avatar("SPEAK_START")
@@ -771,7 +792,15 @@ def _guard_gated(actions: list[dict]) -> tuple[list[dict], list[str]]:
         # execute=no-op: this is a validation pass only. Nothing may run before
         # the user has confirmed, so the callable must be inert by construction
         # rather than by the router happening not to call it.
-        outcome = action_router.run_guarded(step, lambda: None)
+        try:
+            outcome = action_router.run_guarded(step, lambda: None)
+        except Exception as _gated_err:
+            print(f"[akira] WARNING: run_guarded failed during gated check for {step.get('action')}: {_gated_err!r}")
+            outcome = action_router.Outcome(
+                action_router.Tier.GATED,
+                guard_rules.Verdict(guard_rules.ALLOW, source="gated-fallback"),
+                executed=False
+            )
         if outcome.blocked:
             why = "; ".join(outcome.verdict.reasons) or "it looked malformed"
             name = str(step.get("action") or "that").replace("_", " ")
@@ -825,6 +854,49 @@ def run_actions(response: dict, step_results: dict | None = None,
         raw_param = s.get("parameter")
         if isinstance(raw_param, str):
             consumed.update(re.findall(r"\{\{(\w+)\.result\}\}", raw_param))
+
+    filler_timer = None
+    filler_thread = None
+    filler_event = threading.Event()
+
+    def _trigger_filler():
+        nonlocal filler_thread
+        if filler_event.is_set():
+            return
+        if os.getenv("AKIRA_DISABLE_EXEC_FILLER", "").lower() in ("1", "true", "yes"):
+            return
+        import random
+        first_act = steps[0].get("action", "") if steps and isinstance(steps[0], dict) else ""
+        if any(k in first_act for k in ("search", "browse", "web", "google", "weather", "url", "site")):
+            phrase = random.choice([
+                "Looking into that for you...",
+                "Checking that now...",
+                "Searching that now, one moment...",
+            ])
+        elif any(k in first_act for k in ("file", "folder", "read", "list", "notes", "doc", "disk", "find")):
+            phrase = random.choice([
+                "One moment, pulling that up...",
+                "Checking those files now...",
+                "Working on that...",
+            ])
+        else:
+            phrase = random.choice([
+                "Working on that, one moment...",
+                "Just a moment...",
+                "On it, give me a second...",
+                "One second...",
+            ])
+        print(f"[run_actions] execution taking >{filler_timeout}s, speaking filler: {phrase!r}")
+        def _speak_work():
+            speak_and_wait(phrase)
+        filler_thread = threading.Thread(target=_speak_work, daemon=True)
+        filler_thread.start()
+
+    filler_timeout = float(os.getenv("AKIRA_EXEC_FILLER_TIMEOUT", "1.5"))
+    if steps and filler_timeout > 0:
+        filler_timer = threading.Timer(filler_timeout, _trigger_filler)
+        filler_timer.daemon = True
+        filler_timer.start()
 
     import model_pool
     for idx, step in enumerate(steps):
@@ -903,9 +975,22 @@ def run_actions(response: dict, step_results: dict | None = None,
         # into pending_actions above — so this is not the gated guard seam. That
         # one lives in _guard_gated(), called before the confirmation is spoken.
         guard_step = {"action": step["action"], "parameter": parameter}
-        outcome = action_router.run_guarded(
-            guard_step, lambda a=step["action"], p=parameter: execute(a, p),
-            confirmed=confirmed)
+        try:
+            outcome = action_router.run_guarded(
+                guard_step, lambda a=step["action"], p=parameter: execute(a, p),
+                confirmed=confirmed)
+        except Exception as _guard_err:
+            print(f"[run_actions] WARNING: action_router.run_guarded crashed on {step['action']}: {_guard_err!r} — executing action directly")
+            try:
+                _direct_res = execute(step["action"], parameter)
+            except Exception as _exec_err:
+                _direct_res = f"Action failed: {_exec_err}"
+            outcome = action_router.Outcome(
+                action_router.tier_of(step["action"]),
+                action_router.guard_rules.Verdict(action_router.guard_rules.ALLOW, source="guard-bypass"),
+                executed=True,
+                result=_direct_res
+            )
         result = outcome.result
 
         if not outcome.executed:
@@ -1025,6 +1110,12 @@ def run_actions(response: dict, step_results: dict | None = None,
         except Exception as _act_err:
             print(f"[run_actions] failed to record session action: {_act_err}")
 
+
+    filler_event.set()
+    if filler_timer:
+        filler_timer.cancel()
+    if filler_thread and filler_thread.is_alive():
+        filler_thread.join(timeout=3.0)
 
     return results
 
@@ -1185,17 +1276,22 @@ def handle_response(response: dict, user_text: str = "") -> bool:
             except Exception as e:
                 print(f"[v0] record_action_results failed: {e}")
 
-            # same-turn synthesis for workspace reads (speak_summary=True):
-            # the raw API dump is now in history, so ask the LLM to answer the
-            # user's request from it NOW instead of speaking the routing call's
-            # pre-baked "let me check your inbox" and going silent. Must run
-            # AFTER record_action_results (synthesis reads it from history)
-            # and takes precedence over the "speak" override above because raw
-            # dumps are not speakable. Failure keeps the existing response.
-            if any(isinstance(r, dict) and r.get("speak_summary") for r in run_results):
+            # same-turn synthesis for multi-action chains, failures, or workspace reads:
+            # synthesize a real spoken summary reflecting actual outcomes for EVERY action
+            # in the chain (including early steps and failures) instead of speaking the
+            # pre-declared routing response. Must run AFTER record_action_results.
+            has_failures = any(
+                (isinstance(r, str) and r.startswith(FAILURE_PREFIXES)) or
+                (isinstance(r, dict) and r.get("success") is False)
+                for r in run_results
+            )
+            is_multi = len(run_results) > 1
+            has_speak_summary = any(isinstance(r, dict) and r.get("speak_summary") for r in run_results)
+
+            if is_multi or has_failures or has_speak_summary:
                 summary = claude_handler.synthesize_action_reply()
                 if summary:
-                    response["response"] = summary
+                    response["response"] = llm_json.extract_spoken_text(summary)
 
         # click confirmation discovered at runtime
         if pending_action == "click_confirmed" and run_results:
@@ -1213,6 +1309,20 @@ def handle_response(response: dict, user_text: str = "") -> bool:
     print("[v0] speaking response...")
     speak_and_wait(response.get("response", ""))
     print("[v0] done speaking")
+
+    # Persist conversational turn to long-term memory log
+    try:
+        import memory_control
+        memory_control.log_turn(
+            user_text=user_text or "",
+            assistant_response=response.get("response", ""),
+            actions=response.get("actions") or (
+                [{"action": response["action"], "parameter": response.get("parameter")}]
+                if response.get("action") else None
+            )
+        )
+    except Exception as _mem_err:
+        print(f"[akira] memory log_turn warning: {_mem_err}")
 
     # A task that finished WHILE this turn was being processed couldn't be spoken
     # then — the main thread was busy. Now is the first safe moment.
@@ -1238,19 +1348,36 @@ def handle_response(response: dict, user_text: str = "") -> bool:
 
 # ── LLM query ─────────────────────────────────────────────────────────────────
 
-def get_akira_response(text: str, session_id: str | None = None) -> dict | None:
+def get_akira_response(text: str, session_id: str | None = None,
+                       raw_text: str | None = None) -> dict | None:
     """
     Get Akira's response for user text.
     Handles pending confirmation state before calling the LLM.
     Returns parsed dict or None (when confirmation was handled inline).
+
+    raw_text: the original user utterance BEFORE session context was
+              prepended.  Confirmation checks must use this — not
+              `text` — because `text` may contain hundreds of chars of
+              tab/window state that drown out a short "yes".
     """
     global pending_action, pending_parameter, pending_execute, pending_origin, _pending_blocked_action
 
-    cleaned_input = re.sub(r"[^\w\s]", "", text.lower()).strip()
+    # Use the raw utterance for confirmation matching.  Fall back to
+    # text itself when called without the parameter (unit tests, etc.).
+    _confirm_text = raw_text if raw_text is not None else text
+    cleaned_input = re.sub(r"[^\w\s]", "", _confirm_text.lower()).strip()
     is_short_confirmation = cleaned_input in CONFIRMATION_PHRASES or any(
         cleaned_input == phrase or cleaned_input.startswith(f"{phrase} ")
-        for phrase in ("do it", "confirm", "proceed", "go ahead", "do that")
+        for phrase in ("do it", "confirm", "proceed", "go ahead", "do that",
+                       "yes", "yeah", "sure", "yep", "yup", "im sure")
     )
+    # Fallback: for short utterances (<=6 words) that contain an obvious
+    # affirmative word, treat as confirmation.  This catches voice
+    # transcription variants like "Yeah, I'm sure" that aren't in the
+    # exact-match set.
+    if not is_short_confirmation and len(cleaned_input.split()) <= 6:
+        is_short_confirmation = bool(claude_handler._YES_WORDS.search(_confirm_text))
+    print(f"[get_akira_response] raw_text={_confirm_text!r:.80} | cleaned={cleaned_input!r:.60} | is_confirm={is_short_confirmation}")
 
     # 1. Handle confirmation of a previously blocked action (Bug 2)
     if _pending_blocked_action is not None and is_short_confirmation:
@@ -1292,7 +1419,7 @@ def get_akira_response(text: str, session_id: str | None = None) -> dict | None:
         else:
             pending_desc = f"{pending_action} {pending_parameter or ''}".strip()
 
-        confirmed = claude_handler.ask_confirmation(text, pending_desc)
+        confirmed = claude_handler.ask_confirmation(_confirm_text, pending_desc)
         if confirmed:
             if pending_action == "click_confirmed" and pending_execute is not None:
                 origin = pending_origin or "click_confirmed"
@@ -1364,6 +1491,15 @@ def get_akira_response(text: str, session_id: str | None = None) -> dict | None:
             pending_action = pending_parameter = pending_execute = None
             pending_origin = None
             speak_and_wait(speak_text)
+            try:
+                import memory_control
+                memory_control.log_turn(
+                    user_text=text,
+                    assistant_response=speak_text,
+                    actions=actions if "actions" in locals() else None
+                )
+            except Exception as _mem_err:
+                print(f"[akira] memory log_turn warning: {_mem_err}")
             return None
         else:
             pending_action = pending_parameter = pending_execute = None
@@ -1378,7 +1514,7 @@ def get_akira_response(text: str, session_id: str | None = None) -> dict | None:
             pass
 
     try:
-        raw = claude_handler.ask_akira(text, session_id=session_id)
+        raw = claude_handler.ask_akira(text, skip_context=True, session_id=session_id)
         if not (raw or "").strip():
             return {"mode": "conversation",
                     "response": "Having trouble connecting right now.", "end_session": False}
@@ -1409,17 +1545,14 @@ def get_akira_response(text: str, session_id: str | None = None) -> dict | None:
                 "response": "Something went wrong. Try again.", "end_session": False}
 
 
-def _build_session_context() -> str:
-    """Build a concise context string injected into every turn of an active session."""
-    try:
-        tabs = get_all_tabs()
-        ctx  = get_pc_context()
-        tabs_str    = ", ".join(f"{t['title']}" for t in tabs[:8] if t.get("title")) or "none"
-        windows_str = ", ".join(ctx.get("open_windows", [])[:5]) or "none"
-        url_str     = ctx.get("current_url") or "none"
-        note_str = obsidian_context.session_line() if "obsidian_context" in globals() else ""
+def _build_session_context(turn_index: int = 1) -> str:
+    """Build a concise context string: full on turn 1, minimal delta on turns 2+.
 
-        # Concise action history of recent actions this session
+    Wraps browser and window titles in <untrusted_external_context> and </untrusted_external_context>.
+    """
+    try:
+        import session_context_cache
+
         action_lines = []
         hist = globals().get("_session_action_history")
         if hist:
@@ -1428,31 +1561,36 @@ def _build_session_context() -> str:
                 res_part = f" -> {act['result']}" if act.get('result') else ""
                 action_lines.append(f"{i}. {act.get('action', '')}{param_part}{res_part}")
 
-        actions_block = ""
-        if action_lines:
-            actions_block = "[RECENT ACTIONS THIS SESSION]\n" + "\n".join(action_lines) + "\n\n"
+        note_fn = obsidian_context.session_line if "obsidian_context" in globals() else None
 
-        tabs_block = f"[CURRENT BROWSER TABS]\n{tabs_str}\n\n"
-
-        raw_ctx = (
-            f"Focused app: {ctx.get('foreground_app', 'unknown')} | "
-            f"Current page: {url_str} | "
-            f"Windows: {windows_str}"
-            + (f" | {note_str}" if note_str else "")
-        )
-
-        return (
-            "[SESSION START]\n"
-            f"{actions_block}"
-            "<untrusted_external_context>\n"
-            f"{tabs_block}"
-            "[PC STATE]\n"
-            f"{raw_ctx}\n"
-            "</untrusted_external_context>\n\n"
+        cache = session_context_cache.get_cache()
+        sess_id = globals().get("_active_session_id") or "default_session"
+        return cache.get_context_for_turn(
+            session_id=sess_id,
+            turn_index=turn_index,
+            get_pc_context_fn=get_pc_context,
+            get_all_tabs_fn=get_all_tabs,
+            get_note_fn=note_fn,
+            action_lines=action_lines,
         )
     except Exception as e:
         print(f"[v0] session context error: {e}")
-        return ""
+        try:
+            tabs = get_all_tabs()
+            ctx  = get_pc_context()
+            tabs_str    = ", ".join(f"{t['title']}" for t in tabs[:8] if t.get("title")) or "none"
+            windows_str = ", ".join(ctx.get("open_windows", [])[:5]) or "none"
+            url_str     = ctx.get("current_url") or "none"
+            raw_ctx = f"Focused app: {ctx.get('foreground_app', 'unknown')} | Current page: {url_str} | Windows: {windows_str}"
+            return (
+                "[SESSION START]\n"
+                "<untrusted_external_context>\n"
+                f"[CURRENT BROWSER TABS]\n{tabs_str}\n\n"
+                f"[PC STATE]\n{raw_ctx}\n"
+                "</untrusted_external_context>\n\n"
+            )
+        except Exception:
+            return ""
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -1463,7 +1601,7 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
     Returns True to keep session alive, False to end it.
     inject_context: True on the first command of a new session.
     """
-    global _active_session_id
+    global _active_session_id, _session_turn_counter
     if not text:
         print("[v0] empty transcription, staying alive")
         return True
@@ -1471,10 +1609,18 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
     if inject_context or not _active_session_id:
         _end_session()
         _active_session_id = f"session_{int(time.time())}"
+        _session_turn_counter = 1
         obsidian_context.reset()
+    else:
+        _session_turn_counter += 1
 
-    print("[v0] building session context (browser)...")
-    context_prefix = _build_session_context()
+    # Keep the raw utterance for confirmation checks BEFORE prepending
+    # session context.  Bug-1 fix: context-prefixed text drowns out short
+    # confirmations like "yes" or "yeah I'm sure".
+    raw_text = text
+
+    print(f"[v0] building session context (turn {_session_turn_counter})...")
+    context_prefix = _build_session_context(turn_index=_session_turn_counter)
     if context_prefix:
         text = context_prefix + text
     print("[v0] session context done")
@@ -1483,14 +1629,25 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
     import memory_observer
     memory_observer.observe_turn_async(text)
 
-    response = get_akira_response(text, session_id=_active_session_id)
+    response = get_akira_response(text, session_id=_active_session_id,
+                                  raw_text=raw_text)
     print("[v0] LLM returned")
     if response is None:
         return True  # confirmation was handled inline, stay alive
 
     print(response)
     alive = handle_response(response, user_text=text)
-    if not alive:
+
+    if alive:
+        # Update cache after turn execution so post-action desktop changes are captured
+        try:
+            import session_context_cache
+            cache = session_context_cache.get_cache()
+            note_fn = obsidian_context.session_line if "obsidian_context" in globals() else None
+            cache.update_after_turn(cache.capture_state(get_pc_context, get_all_tabs, note_fn))
+        except Exception as _cache_upd_err:
+            pass
+    else:
         _end_session()
     return alive
 
@@ -1602,7 +1759,7 @@ if __name__ == "__main__":
                 # Look the score up by the model's real key. Positional access
                 # returned whichever model the dict happened to order first.
                 scores   = oww_model.predict(audio_np) if oww_model else {}
-                score    = scores.get(_WAKE_KEY, 0.0) if _WAKE_KEY else 0.0
+                score    = max(scores.values()) if scores else 0.0
 
                 if WAKE_DEBUG:
                     # Peak amplitude proves the mic is actually delivering audio —
