@@ -141,6 +141,26 @@ class TestSafetyBoundaries(unittest.TestCase):
             res = executor.delete_files(root)
             self.assertFalse(res.get("success", False))
 
+    def test_system_control_power_action_guards(self):
+        """Verify shutdown_pc, restart_pc, sleep_pc, hibernate_pc, sign_out and legacy aliases are gated as dangerous actions."""
+        import akira
+        power_actions = (
+            "shutdown_pc", "restart_pc", "sleep_pc", "hibernate_pc", "sign_out",
+            "shutdown", "restart", "hibernate"
+        )
+        for act in power_actions:
+            step = {"action": act, "parameter": ""}
+            self.assertTrue(
+                akira._is_dangerous_step(step),
+                f"Power action {act} was not classified as a dangerous/gated step in akira._is_dangerous_step!"
+            )
+            v = guard_rules.validate(act, "")
+            self.assertNotEqual(
+                v.decision, BLOCK,
+                f"Power action {act} should be valid in guard_rules.validate (gated by confirmation layer, not blocked statically) but got BLOCK: {v.reasons}"
+            )
+
+
     # ──────────────────────────────────────────────────────────────────────────
     # 3. Honest AI Disclosure
     # ──────────────────────────────────────────────────────────────────────────

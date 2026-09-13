@@ -490,8 +490,7 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None,
             verdict = guard.review(action, parameter, label="guard:gated", **kwargs)
         except Exception as e:
             logger.error(f"[router] guard gated check failed for {action!r}: {e!r}")
-            print(f"[router] WARNING: guard gated check crashed for {action!r}: {e!r} — using static verdict")
-            verdict = static_verdict
+            verdict = Verdict(FLAG, (f"guard gated check failed ({e})",), source="fail-closed")
         print(f"[router] {action} tier=gated {verdict}")
         return Outcome(step_tier, verdict, executed=False)
 
@@ -505,8 +504,7 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None,
             verdict = guard.review(action, parameter, label="guard:serial", **kwargs)
         except Exception as e:
             logger.error(f"[router] guard serial check failed for {action!r}: {e!r}")
-            print(f"[router] WARNING: guard serial check crashed for {action!r}: {e!r} — using static verdict")
-            verdict = static_verdict
+            verdict = Verdict(FLAG, (f"guard serial check failed ({e})",), source="fail-closed")
         print(f"[router] {action} tier={step_tier.value} serial "
               f"(rollback={why}) {verdict}")
         if verdict.decision == guard_rules.BLOCK or (not confirmed and not verdict.allowed):
@@ -528,11 +526,10 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None,
                                     **kwargs))
         except Exception as e:
             # guard.review is documented never to raise. If it ever encounters
-            # an unexpected runtime failure, degrade to static verdict so the
-            # action can proceed safely.
+            # an unexpected runtime failure, fail-closed so the action does not
+            # silently bypass safety review.
             logger.error(f"[router] guard thread crashed for {action!r}: {e!r}")
-            print(f"[router] WARNING: guard parallel check crashed for {action!r}: {e!r} — using static verdict")
-            box.append(static_verdict)
+            box.append(Verdict(FLAG, (f"guard thread crashed ({e})",), source="fail-closed"))
 
     thread = threading.Thread(target=_review, name=f"guard:{action}",
                               daemon=True)
