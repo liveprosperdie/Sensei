@@ -358,6 +358,7 @@ Rules:
 - "depends_on" makes a step wait for another step's result. If the dependency fails, the dependent step is skipped automatically.
 - Use "{{stepX.result}}" in a parameter to inject the output of step with id "stepX" into the next step.
 - Only use chaining when the second action genuinely needs the first one's output.
+- MULTI-ACTION COMMANDS: When the user requests multiple actions in a single utterance (e.g. "open YouTube, play Blinding Lights, and while that's playing check my calendar for today"), include ALL requested actions in order in the "actions" array (e.g. step 1: youtube_control|play Blinding Lights, step 2: calendar_control|list|today). Do not drop any steps or defer them to follow-up turns. Media/browser and background/read actions can execute together in the same actions array.
 
 WHEN YOU ARE NOT SURE WHICH ACTION FITS — escalate instead of guessing:
 Everything below this line is a fixed list of actions, and picking from a list makes it very easy to answer a request you don't fully understand with whichever entry looks closest. That is the one failure mode you must refuse. A wrong-but-plausible action SUCCEEDS, and then you narrate that success confidently, so the user is told something got done that didn't. Never let "closest match" stand in for understanding.
@@ -510,7 +511,7 @@ ACTION PARAMETER FORMATS:
   Browse: "search repos|tetris python" (reports top repos with stars), "open repo|first" or "open repo|owner/name" (by ordinal, name, or exact owner/name), "view file|src/main.py", "view issues", "view pull requests", "read readme" (spoken summary of the current repo).
   Actions: "star repo", "unstar repo", "fork repo", "clone repo" (runs a REAL git clone into Documents\\GitHub Clones by default — always tell the user where it went; "clone repo|D:\\code" clones into a custom folder instead), "create issue|title|body".
   State changes (these ALWAYS pause for user confirmation first): "create pull request|branch|title", "merge pull request|7", "close issue|12", "close pull request|7", "delete branch|old-feature", "delete repo" (needs a GITHUB_TOKEN; treat as seriously as deleting files).
-  Notes from a repo: "repo notes" (optionally "repo notes|owner/name") — reads the repository and writes a set of linked Obsidian notes about how it is built. Use this for anything like "read this repo and write notes on the architecture", "document this codebase", "explain how this project is structured, in my notes". It runs in the BACKGROUND and returns immediately with its own spoken acknowledgement, so speak that and nothing more — never say it is finished, and never invent note titles. "read readme" is the different, smaller thing: a quick spoken summary with no notes written.
+  Notes from a repo: "repo notes" (optionally "repo notes|repo_name" or "repo notes|owner/name") — reads the repository and writes a set of linked Obsidian notes about how it is built. Use this for anything like "read this repo and write notes on the architecture", "document this codebase", "explain how this project is structured, in my notes". It runs in the BACKGROUND and returns immediately with its own spoken acknowledgement, so speak that and nothing more — never say it is finished, and never invent note titles. "read readme" is the different, smaller thing: a quick spoken summary with no notes written.
   OUT OF SCOPE: pushing code, force push, or any local git operation — tell the user to use their terminal.
   NEVER use click for GitHub search results, star/fork buttons, or merge buttons — github_control handles those reliably. Only use click on GitHub for things github_control cannot do.
 VS CODE: vscode_control
@@ -518,7 +519,7 @@ VS CODE: vscode_control
   OUT OF SCOPE: running code, managing extensions, or typing keystrokes into the editor — say those aren't available yet if asked.
 
 GOOGLE WORKSPACE (connected Google account):
-CALENDAR: calendar_control|action|params. Actions: list|days ("what's on my calendar" -> list|7), create|Title|YYYY-MM-DD HH:MM|YYYY-MM-DD HH:MM|optional desc (resolve relative dates like "tomorrow 3pm" to real datetimes yourself using the current date), get|eventId, update|eventId|title=X|start=YYYY-MM-DD HH:MM, delete|eventId [C], free|start|end|minutes (find open slots).
+CALENDAR: calendar_control|action|params. Actions: list|today, list|tomorrow, list|days ("what's on my calendar today" -> list|today, "what's on my calendar" -> list|7), create|Title|YYYY-MM-DD HH:MM|optional end time YYYY-MM-DD HH:MM|optional desc (resolve relative dates like "tomorrow 3pm" to real datetimes yourself using the current date), get|eventId, update|eventId|title=X|start=YYYY-MM-DD HH:MM, delete|eventId [C], free|start|end|minutes (find open slots).
 DOCS: docs_control|action. create|Title|content (ONLY for exact content the user dictated), generate|Title|content brief|short or detailed (a separate AI writer composes the content, then the doc is created), read|name or id, append|name or id|text to add. Read/append accept the document NAME — it resolves via Drive search.
 SHEETS: sheets_control|action. create|Name|a,b;c,d (comma separates cells, semicolon separates rows), generate|Name|brief of the data wanted (an AI writer composes the rows), read|spreadsheetId|optional range, write|spreadsheetId|Sheet1!A1|value1,value2;row2val1...
 SLIDES: slides_control|action. create|Name|Title 1::content;;Title 2::content (user-dictated content only), generate|Name|topic brief|optional slide count (an AI writer composes the slides), read|presentationId|optional slide number, update|presentationId|Title::content;;..., delete|presentation name or id [C] (moves the presentation to the Drive trash).
@@ -552,15 +553,13 @@ NEVER promise to delete, rename, or overwrite a note — no action exists for th
 MICROSOFT OFFICE (installed desktop apps, driven directly — NOT the browser): office_control|app|sub-action|arguments. app is word, excel, powerpoint, or teams. These control the LOCAL Office apps, so never use click/fill on Word, Excel, PowerPoint or Teams windows — those actions only work in the browser and will click the wrong thing.
 WORD: office_control|word|open, new (blank document), open document|name or path (a spoken name like "budget report" resolves against Documents, Desktop, Downloads and OneDrive), insert|the exact text to type (appends at the cursor — use for "type this", "add a line", dictation), read (speaks the start of the document), save, save as|new name [C], close [C].
 WORD LONG CONTENT — office_control|word|generate|title|a one-line brief of what to write|brief or detailed. This is the ONLY way to put multi-paragraph content into Word. Never dictate an essay, report, letter or summary through insert: the text is written by a separate generator, so your brief stays one short line and the reply never gets cut off. It writes a real Heading 1 title plus real heading styles for each section, which is what makes the next instruction ("make the titles bigger") targetable.
-WORD GENERATE RUNS A MANDATORY IMAGE PASS — do not ask, do not offer, do not skip: office_control|word|generate writes ALL the text first, then automatically searches images for every section and opens the picker on the first one, in code. You never decide whether to look for images and you NEVER ask permission to. Its reply already reads out the numbered candidates for section one, so your response field stays one short sentence and does not repeat the list.
-While that pass is running the user answers per section: a pick ("the third one", "2") -> office_control|word|insert image|third, which places it under that section's heading and automatically opens the picker for the NEXT section. "skip", "no image", "next section" -> office_control|word|skip image, which moves to the next section. Never emit search_image yourself during the pass, and never chain a pick with anything else — one pick per response, exactly like the wallpaper flow. Off-topic results are re-searched with a broader query automatically, so never tell the user the search was bad or offer to Google it for them.
 WORD STRUCTURAL FORMATTING — office_control|word|format by style|which paragraphs|what|value. "which paragraphs" is a category the user named: titles/headings, body text, heading 1, heading 2, or a literal style name. Use this whenever the user says "all the titles", "every heading", "the body text" — it finds those paragraphs itself, so NEVER tell the user to select text first and never fall back to formatting the whole document. Example: office_control|word|format by style|titles|font|Times New Roman. If read was run first, its reply lists the document's real styles — use those names.
 WORD FORMATTING: office_control|word|bold, italic, underline (each takes an optional "off" to remove), font|Arial, font size|14, text color|red, highlight|yellow (highlight|none removes it), align|left/center/right/justify. These apply to whatever the user has SELECTED, or to the whole document when nothing is selected — the reply says which happened, so don't claim otherwise. Also: bullet list, numbered list, remove list, new paragraph, line break, undo|optional number of steps.
 EXCEL: office_control|excel|open, new, open workbook|name or path, read|B7 or read|Sheet1!B2:D5 or read|workbook name|B7 (speaks the REAL cell values — they are spoken automatically, so keep your response short and NEVER invent or restate a number yourself), write|A1|value (numbers are stored as numbers, not text), save, save as|new name [C], close [C].
 EXCEL FORMATTING/FORMULAS/CHARTS: office_control|excel|bold|A1:B5, italic|A1, font size|A1:C1|14, fill color|A1|yellow, text color|A1|red, number format|B2:B10|currency (also percent, date, time, accounting, integer, text, or a raw Excel format code). The range is optional on all of these — leave it off to use the current selection. formula|A1|=SUM(B1:B10) enters a real formula and speaks the computed result (a formula that errors is reported as a failure, not a success). chart|bar|A1:B10 inserts a chart — bar, column, horizontal bar, line, pie, doughnut, area, scatter, radar. undo reverses the last action.
 POWERPOINT: office_control|powerpoint|open, new, open presentation|name or path, next slide, previous slide, go to slide|4 (also "first"/"last"), start slideshow, end slideshow, save, save as|new name [C], close [C]. Slide navigation works both while presenting and while editing — the action figures out which.
 POWERPOINT SLIDES: office_control|powerpoint|new slide|layout (title, title and content, title only, two content, blank — defaults to title and content), set title|text, set content|text (both write into the slide currently in view), delete slide|4 or delete slide with no number for the current one [C].
-OFFICE IMAGES — REUSE THE EXISTING PICKER, never a second search: office_control|word|insert image|pick and office_control|powerpoint|insert image|pick. The pick is the SAME kind of spoken reference download_image takes ("the third one", "3", "the sunset one") and resolves against the candidates from the last search_image. A local file path or filename also works and skips the network entirely, but NEVER INVENT ONE: pass a filename or path ONLY when the user spoke it or an earlier ACTION RESULT printed it. While a picker is open the numbered/ordinal pick is the ONLY correct parameter — "images.jpg", "image.jpg", or a guessed Downloads path is always wrong there, and it is rejected. If the user is vague ("use that one", "yeah that"), pass their exact words or the number, never a filename you made up. So "find a picture of a mountain and put it in my document" is TWO turns exactly like wallpaper: search_image|mountain this turn, then insert image|their pick next turn — never both in one chain, and never a bare insert image before a search. The ONE exception is the generate image pass above: it already ran the search itself, so a bare insert image (or skip image) is correct there.
+OFFICE IMAGES — REUSE THE EXISTING PICKER, never a second search: office_control|word|insert image|pick and office_control|powerpoint|insert image|pick. The pick is the SAME kind of spoken reference download_image takes ("the third one", "3", "the sunset one") and resolves against the candidates from the last search_image. A local file path or filename also works and skips the network entirely, but NEVER INVENT ONE: pass a filename or path ONLY when the user spoke it or an earlier ACTION RESULT printed it. While a picker is open the numbered/ordinal pick is the ONLY correct parameter — "images.jpg", "image.jpg", or a guessed Downloads path is always wrong there, and it is rejected. If the user is vague ("use that one", "yeah that"), pass their exact words or the number, never a filename you made up. So "find a picture of a mountain and put it in my document" is TWO turns exactly like wallpaper: search_image|mountain this turn, then insert image|their pick next turn — never both in one chain, and never a bare insert image before a search.
 TEAMS — HONEST LIMIT: Microsoft ships no automation interface for Teams, so office_control|teams|open and office_control|teams|focus are ALL that exist. You CANNOT send Teams messages, start or join calls, mute, or change status. Never promise any of that — if asked, say plainly that you can open Teams but the user has to drive it themselves, and offer to open it.
 For office_control the [C] sub-actions are close (may lose unsaved edits), save as (may overwrite an existing file), and delete slide — set confirmation_required: true for those three only. Formatting, lists, formulas, charts, image inserts and slide adds are all ungated and reversible with undo, so never gate them.
 If an Office action reports the app isn't installed or COM is unavailable, say so plainly and do not retry.
@@ -1008,6 +1007,9 @@ def summarize_code_batch(repo: str, files: list[dict]) -> dict:
 
     if not files:
         return {}
+    print(f"[summarize_code_batch] Summarizing {len(files)} files for {repo}:")
+    for f in files:
+        print(f"  - {f['path']}: {len(f['text'])} bytes")
     blocks = []
     for f in files:
         blocks.append(f"=== FILE: {f['path']} ===\n{f['text']}")
@@ -1093,6 +1095,12 @@ You are Akira's codebase-documentation pass, planning how one repository should 
 
 You are given what is known about ONE repository: its metadata, its README if it has a useful one, its file layout, and short summaries of its significant source files. Decide the SHAPE of the documentation only. You are NOT writing the notes here — a later pass writes each body from your outline, so keep every purpose to a single line.
 
+CRITICAL GROUNDING INSTRUCTIONS:
+- You must base your outline, notes, and file_index STRICTLY AND EXCLUSIVELY on the real files provided in the file layout and FILE SUMMARIES.
+- NEVER invent, fabricate, or hallucinate files that were not provided in the input (e.g. do not guess helper files, dispatchers, or engines like 'rules_engine.py', 'classifier.py', etc. if they are not in the provided file list).
+- "files": [...] in each note must ONLY contain exact file paths from the provided file list.
+- "file_index" must list ONLY files that actually exist in the provided file list, with an accurate one-line description derived from their actual summary or layout.
+
 The breakdown is YOURS to decide. Nothing is pre-decided and there is no template:
 - How many notes, and what each covers. Let the repo's actual structure decide — a small library might warrant an overview and two notes; a large app with clearly separate subsystems warrants a note per subsystem. Do not split a small codebase to look thorough, and do not compress a large one into one wall of text. Prefer between two and eight notes.
 - What each note is called. Real, specific titles. Prefix every title with the repository name so they cannot collide with unrelated notes already in the vault, for example "next.js — Routing" rather than bare "Routing".
@@ -1101,15 +1109,15 @@ The breakdown is YOURS to decide. Nothing is pre-decided and there is no templat
 
 Exactly one note must be the overview and entry point. Mark it with "overview": true.
 
-Ground the plan in what you were given. If the evidence is thin for some part of the repo, it is better to say so in the outline than to invent a note about something you were not shown.
-
 Output STRICT JSON and nothing else, no markdown fence:
 {"notes": [{"title": "repo — Name", "purpose": "one line on what this note covers", "files": ["path/one.py"], "links": ["repo — Other Note"], "overview": false}],
  "index": true or false,
  "diagram": "mermaid source for the overview, or null",
- "summary": "one spoken sentence naming the repo and what you are producing"}
+ "summary": "one spoken sentence naming the repo and what you are producing",
+ "overview_summary": "a comprehensive 2-4 sentence executive overview explaining what the entire repository does at once, its architecture, and core workflow",
+ "file_index": {"exact/path/as/given.py": "one clear sentence on what this specific file does"}}
 
-Rules: "links" holds titles from your OWN notes list and nothing else. Set "index" true only when there are enough notes that a map of content actually helps. Include a diagram only when the repo has a flow or layering worth seeing at a glance. The summary is spoken aloud, so no markdown, no bullets, no em dashes.
+Rules: "links" holds titles from your OWN notes list and nothing else. "file_index" provides a crisp, accurate one-line description for each file in the codebase or outline. Set "index" true only when there are enough notes that a map of content actually helps. Include a diagram only when the repo has a flow or layering worth seeing at a glance. The summary is spoken aloud, so no markdown, no bullets, no em dashes.
 """
 
 
@@ -1140,6 +1148,9 @@ def plan_repo_outline(repo: str, meta: str, readme: str,
     # Titles and one-liners only. 2500 is already generous, which is the
     # entire point of separating this from the body writing.
     user_block = "\n\n".join(parts)
+    print(f"[plan_repo_outline] Input prompt for {repo} ({len(user_block)} chars):")
+    print(f"  Summary files available ({len(summaries)}): {list(summaries.keys())}")
+    print(f"  Prompt user_block snippet:\n{user_block[:600].encode('ascii', 'backslashreplace').decode('ascii')}")
     servant = servant_or_none("plan_repo_outline")
 
     if servant is not None:
@@ -1161,6 +1172,9 @@ def plan_repo_outline(repo: str, meta: str, readme: str,
             if info.get("truncated"):
                 print("[plan_repo_outline] WARNING: outline hit max_tokens")
                 return {"hit_max_tokens": True}
+            if not isinstance(parsed, dict) or not parsed.get("notes"):
+                print(f"[plan_repo_outline] servant reply missing notes ({parsed}), falling back to draft model")
+                servant = None
 
     if servant is None:
         try:
@@ -1218,13 +1232,16 @@ def plan_repo_outline(repo: str, meta: str, readme: str,
 NOTE_BODY_PROMPT = """
 You are Akira writing the actual content of codebase notes into the user's Obsidian vault.
 
-You are given a repository's metadata, short summaries of its files, the full outline of the note set, and the specific notes YOU must write in this pass. Write only the notes you are asked for.
+You are given a repository's metadata, short summaries of its REAL source files, the full outline of the note set, and the specific notes YOU must write in this pass. Write only the notes you are asked for.
+
+CRITICAL GROUNDING RULES:
+1. Ground every claim STRICTLY AND EXCLUSIVELY in the provided FILE SUMMARIES and metadata.
+2. Refer ONLY to the real files provided in the ALLOWED REAL REPOSITORY FILES and FILE SUMMARIES lists. NEVER invent, fabricate, or hallucinate file names (e.g. do not invent helper files, dispatchers, or engines that are not in the list).
+3. If a note asks about a component, describe how the ACTUAL files implement it using their real functions, classes, and logic from the summaries.
 
 For each one, write clean markdown: what the thing is responsible for, how it is put together, the important files and identifiers by their real names, how data or control flows through it, and what a newcomer needs to know first. Use headings and short lines. Aim for something genuinely useful to reread weeks later — thorough but not padded, and no filler sections.
 
 Do NOT add a Related or links section — linking is handled separately for you. Do not restate the outline. Do not wrap the body in a code fence.
-
-Ground every claim in the summaries you were given. You are working from summaries, not full source, so write at the level they actually support. Where the evidence is thin, say plainly that the area was not examined in detail rather than inventing plausible-sounding specifics.
 
 Output STRICT JSON and nothing else, no markdown fence:
 {"bodies": {"exact note title": "markdown body", "another title": "markdown body"}}
@@ -1234,7 +1251,9 @@ Use the note titles exactly as given. Escape newlines inside JSON strings as \\n
 
 
 def write_note_bodies(repo: str, meta: str, outline: list,
-                      targets: list, summaries: dict) -> dict:
+                      targets: list, summaries: dict,
+                      detail_instruction: str = "",
+                      _is_retry: bool = False) -> dict:
     """STAGE 3: write the markdown for `targets` (a batch of outline notes).
 
     Returns {title: markdown}. Returns {} on failure so the caller can keep the
@@ -1268,6 +1287,16 @@ def write_note_bodies(repo: str, meta: str, outline: list,
         parts.append("FILE SUMMARIES:\n" + listing[:40000])
     parts.append("THE FULL NOTE SET (for context — do not write these):\n" + shape)
     parts.append(f"WRITE EXACTLY THESE {len(targets)} NOTES:\n" + asked)
+
+    real_file_list = sorted(relevant.keys()) if relevant else sorted(summaries.keys())
+    if real_file_list:
+        parts.append(f"ALLOWED REAL REPOSITORY FILES (write ONLY about these files, never invent unlisted files):\n" +
+                     "\n".join(f"- {rf}" for rf in real_file_list))
+    if detail_instruction:
+        parts.append("DETAIL REQUIREMENT:\n" + detail_instruction)
+
+    print(f"[write_note_bodies] Writing {len(targets)} notes: {[t['title'] for t in targets]}")
+    print(f"  Grounding files: {real_file_list}")
 
     # ~1500 tokens of body per note. Bounded by BATCH SIZE, never by the
     # repo — this is what stops the max_tokens failure from returning.
@@ -1330,6 +1359,41 @@ def write_note_bodies(repo: str, meta: str, outline: list,
         else:
             print("[write_note_bodies] truncated on a single note — dropping")
             return {}
+
+    # ── Post-generation validation check: detect hallucinated filenames ──
+    all_known_files = {p.lower() for p in (summaries.keys() if summaries else [])}
+    if not all_known_files and meta:
+        for line in meta.splitlines():
+            line_s = line.strip()
+            if line_s and not line_s.startswith("...") and "." in line_s:
+                all_known_files.add(line_s.lower())
+
+    if all_known_files and out and not _is_retry:
+        for title, b_text in list(out.items()):
+            found_files = set(re.findall(r"\b([a-zA-Z0-9_.-]+\.(?:py|js|ts|jsx|tsx|go|rs|java|cpp|c|h|rb|php|cs))\b", b_text, re.IGNORECASE))
+            hallucinations = {f for f in found_files if f.lower() not in all_known_files and not re.match(r"^(?:python|v)?\d", f.lower())}
+            if hallucinations:
+                print(f"[write_note_bodies] HALLUCINATION WARNING in {title!r}: mentioned ungrounded files {hallucinations}!")
+                strict_reminder = (
+                    f"CRITICAL GROUNDING ERROR: Your previous draft hallucinated non-existent files {sorted(hallucinations)}. "
+                    f"The ONLY real source files in this repository are: {sorted(all_known_files)}. "
+                    f"Rewrite {title!r} referencing ONLY these real files and their actual implementation details from FILE SUMMARIES. Do not mention or invent any other files."
+                )
+                try:
+                    target_single = [t for t in targets if t.get("title") == title]
+                    if target_single:
+                        print(f"[write_note_bodies] Regenerating {title!r} with strict file grounding...")
+                        retry_got = write_note_bodies(
+                            repo, meta, outline, target_single, summaries,
+                            detail_instruction=(detail_instruction + "\n" + strict_reminder).strip(),
+                            _is_retry=True
+                        )
+                        if retry_got and title in retry_got:
+                            out[title] = retry_got[title]
+                            print(f"[write_note_bodies] Successfully replaced {title!r} with grounded regeneration.")
+                except Exception as _re_err:
+                    print(f"[write_note_bodies] Regeneration failed: {_re_err}")
+
     return out
 
 
@@ -1719,6 +1783,13 @@ def _routing_call(messages: list[dict], date_block: str, session_id: str | None 
     """The routing model call, schema-constrained where the API allows it."""
     global _structured_output_ok
 
+    try:
+        from tiered_config import is_claude_disabled, CLAUDE_DISABLED_MESSAGE
+        if is_claude_disabled():
+            return _refusal_reply(CLAUDE_DISABLED_MESSAGE)
+    except Exception:
+        pass
+
     provider, payload = _head_dispatch()
     if provider == "refuse":
         return _refusal_reply(str(payload))
@@ -1810,6 +1881,17 @@ def _routing_call(messages: list[dict], date_block: str, session_id: str | None 
 
 def ask_akira(text: str, skip_context: bool = False, session_id: str | None = None) -> str:
     """Send user text to Akira, get back a JSON string response."""
+    try:
+        from tiered_config import is_claude_disabled, CLAUDE_DISABLED_MESSAGE
+        if is_claude_disabled():
+            return json.dumps({
+                "mode": "conversation",
+                "response": CLAUDE_DISABLED_MESSAGE,
+                "end_session": False,
+            })
+    except Exception:
+        pass
+
     if skip_context:
         full_text = text
     else:
@@ -1941,12 +2023,15 @@ def record_action_results(results: list) -> None:
 
 _ACTION_REPLY_PROMPT = (
     "You are Akira, a voice assistant. The last [ACTION RESULT] message "
-    "contains the raw data an action just returned for the user's request. "
-    "Answer their request using that data, in 2 to 6 short spoken sentences. "
+    "contains the outcome of the action(s) just executed for the user's request. "
+    "Summarize the actual outcome in 1 to 4 natural spoken sentences. "
+    "Acknowledge ALL steps that were executed, including early successful steps and any failures. "
+    "Be direct and clear about what succeeded and what failed. "
     "Plain conversational language — no markdown, no bullet points, no lists, "
-    "nothing that sounds broken read aloud. For email or event lists, "
-    "summarize the senders, subjects, and anything urgent naturally; never "
-    "read raw JSON or ids aloud.")
+    "nothing that sounds broken read aloud. "
+    "CRITICAL: Output ONLY pure spoken English prose sentences to be read aloud by TTS. "
+    "Do NOT output JSON. Do NOT output keys like 'thought', 'spoken_response', or 'response'. "
+    "Do NOT output curly braces. Output ONLY plain spoken words.")
 
 # Servant budget, and the wider brain-tier budget its fallback gets. The gap is
 # deliberate: a servant reply that stops at finish_reason=length raises
@@ -2004,6 +2089,13 @@ def synthesize_action_reply() -> str | None:
             text = response_text(message).strip()
         if not text:
             return None
+
+        # Clean out any JSON envelopes, quotes, or thoughts that the LLM may have emitted
+        import llm_json
+        text = llm_json.extract_spoken_text(text)
+        if not text:
+            return None
+
         # keep history honest: what Akira actually SAID replaces the stub ack —
         # but stored AS AN ENVELOPE, not as raw prose. Storing the bare text here
         # is what put prose in the assistant role and flipped the model out of
@@ -2164,6 +2256,9 @@ def _get_kokoro_pipeline():
 
 def stop_speaking() -> None:
     """Instantly interrupt TTS playback (for genuine user barge-in)."""
+    # Demo protection: never abort playback if VAD interruption is disabled
+    if os.environ.get("AKIRA_DISABLE_VAD_INTERRUPT", "true").strip().lower() in ("true", "1", "yes"):
+        return
     _tts_stop_event.set()
     try:
         import sounddevice as sd
@@ -2244,6 +2339,11 @@ def is_speaker_echo(mic_chunk: np.ndarray) -> bool:
 def speak(text: str) -> None:
     """Fast, low-latency TTS pipeline (sub-2s responses) with pyttsx3 fallback."""
     global _current_tts_audio, _current_tts_audio_16k, _current_tts_fs, _playback_start_time
+    if not text or not text.strip():
+        return
+
+    import llm_json
+    text = llm_json.extract_spoken_text(text)
     if not text or not text.strip():
         return
 

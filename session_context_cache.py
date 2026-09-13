@@ -129,8 +129,8 @@ class SessionContextCache:
             opened = [w for w in curr_win if w not in prev_win_set]
             closed = [w for w in prev_win if w not in curr_win_set]
 
-            delta["active_window_changed"] = True
-            if curr_win:
+            if curr_win and (not prev_win or curr_win[0] != prev_win[0]):
+                delta["active_window_changed"] = True
                 delta["new_window"] = curr_win[0]
             if opened:
                 delta["opened_windows"] = opened[:5]
@@ -146,12 +146,13 @@ class SessionContextCache:
             opened_tabs = [t for t in curr_tab_titles if t not in prev_tabs_set]
             closed_tabs = [t for t in prev_tab_titles if t not in curr_tabs_set]
 
-            delta["tabs_changed"] = True
-            if opened_tabs:
-                delta["opened_tabs"] = opened_tabs[:8]
-            if closed_tabs:
-                delta["closed_tabs"] = closed_tabs[:8]
-            if curr_tab_titles:
+            if opened_tabs or closed_tabs:
+                delta["tabs_changed"] = True
+                if opened_tabs:
+                    delta["opened_tabs"] = opened_tabs[:8]
+                if closed_tabs:
+                    delta["closed_tabs"] = closed_tabs[:8]
+            if curr_tab_titles and (not prev_tab_titles or curr_tab_titles[0] != prev_tab_titles[0]):
                 delta["active_tab"] = curr_tab_titles[0]
 
         # 4. URL

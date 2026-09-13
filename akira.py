@@ -1122,6 +1122,41 @@ def run_actions(response: dict, step_results: dict | None = None,
 
 # ── Response handling ────────────────────────────────���───────────────��────────
 
+def guard_action_envelope(response: dict) -> tuple[dict, list[str]]:
+    """Unified GUARD entry point for all planned action envelopes (tiered adapter & Claude).
+
+    Checks all steps for danger/gating, runs the gated guard, and builds confirmation prompts.
+    """
+    actions_to_run = response.get("actions") or []
+    unsafe = [a for a in actions_to_run if _is_dangerous_step(a)]
+    safe   = [a for a in actions_to_run if not _is_dangerous_step(a)]
+
+    guard_notes_gated: list[str] = []
+    if unsafe:
+        unsafe, guard_notes_gated = _guard_gated(unsafe)
+        if not unsafe:
+            response.pop("confirmation_required", None)
+            response.pop("pending_actions", None)
+            response["actions"] = safe
+
+    if unsafe and not response.get("confirmation_required"):
+        print(f"[guard_action_envelope] safety net caught: {[a['action'] for a in unsafe]}")
+        response["confirmation_required"] = True
+        response["pending_actions"]       = unsafe
+        response["actions"]               = safe
+        response.pop("action", None)
+        response.pop("parameter", None)
+        response["confirmation_message"]  = _confirmation_prompt(unsafe)
+        response["response"]              = response["confirmation_message"]
+    elif unsafe:
+        response["pending_actions"] = unsafe
+        response["actions"]         = safe
+        response.pop("action", None)
+        response.pop("parameter", None)
+
+    return response, guard_notes_gated
+
+
 def handle_response(response: dict, user_text: str = "") -> bool:
     """
     Process a parsed Akira response dict.
@@ -1180,43 +1215,8 @@ def handle_response(response: dict, user_text: str = "") -> bool:
         response.pop("action", None)
         response.pop("parameter", None)
 
-        # safety net: catch dangerous actions Claude forgot to gate
-        # (includes risky shopping steps like checkout / place order / address)
-        unsafe = [a for a in actions_to_run if _is_dangerous_step(a)]
-        safe   = [a for a in actions_to_run if not _is_dangerous_step(a)]
-
-        # GATED GUARD SEAM — serial and blocking, before confirmation is built.
-        # Placed here, above BOTH confirmation branches, so it applies whether
-        # the safety net caught the step or the LLM gated it itself. The guard
-        # can only REMOVE a malformed step from the offer; it can never approve
-        # one into running, so the confirmation flow's behaviour is unchanged.
-        guard_notes_gated: list[str] = []
-        if unsafe:
-            unsafe, guard_notes_gated = _guard_gated(unsafe)
-            if not unsafe:
-                # Every gated step was refused on shape. There is nothing left to
-                # confirm, so do not ask a question with no action behind it.
-                response.pop("confirmation_required", None)
-                response.pop("pending_actions", None)
-                response["actions"] = safe
-
-        if unsafe and not response.get("confirmation_required"):
-            print(f"[handle_response] safety net caught: {[a['action'] for a in unsafe]}")
-            response["confirmation_required"] = True
-            response["pending_actions"]       = unsafe
-            response["actions"]               = safe
-            response.pop("action", None)
-            response.pop("parameter", None)
-            response["confirmation_message"]  = _confirmation_prompt(unsafe)
-            # speak the question, not the LLM's premature "doing it now" text
-            response["response"] = response["confirmation_message"]
-        elif unsafe:
-            # LLM set confirmation_required itself — make sure the unsafe steps
-            # land in pending, NOT in the executed-now list.
-            response["pending_actions"] = unsafe
-            response["actions"]         = safe
-            response.pop("action", None)
-            response.pop("parameter", None)
+        # Unified GUARD entry point — applies to all action plans
+        response, guard_notes_gated = guard_action_envelope(response)
 
         run_results = []
         if response.get("confirmation_required"):
@@ -1512,6 +1512,67 @@ def get_akira_response(text: str, session_id: str | None = None,
             executor.warmup_browser()
         except Exception:
             pass
+
+    # ── Tiered Routing Layer (Decision API -> Speech Head / Adapter -> Claude) ──
+    routing_mode = (os.environ.get("AKIRA_ROUTING_MODE") or "tiered").strip().lower()
+    if routing_mode == "tiered":
+        try:
+            import tiered_classifier
+            import speech_head
+            import local_adapter
+            import session_context_cache
+
+            decision = tiered_classifier.classify(raw_text or text)
+            print(f"[tiered_routing] Decision: mode={decision.mode!r}, complexity={decision.complexity!r}, intent={decision.intent!r}, escalate={decision.escalate!r}")
+
+            # 1. CONVERSATION MODE
+            if decision.mode == "conversation":
+                if decision.complexity == "simple" and not decision.escalate:
+                    reply = speech_head.generate_conversation_reply(raw_text or text)
+                    if reply:
+                        print(f"[tiered_routing] Free speech head answered: {reply[:60]!r}...")
+                        return {"mode": "conversation", "response": reply, "end_session": False}
+                    print("[tiered_routing] Speech head generation returned None — escalating to Claude")
+
+            # 2. DOCUMENT GENERATION MODE
+            elif decision.mode == "document_generation":
+                doc_title = decision.title or "Untitled Document"
+                doc_brief = decision.brief or (raw_text or text)
+                if decision.complexity == "simple" and not decision.escalate:
+                    content_str = speech_head.generate_document_content(doc_brief, length="short")
+                    if content_str:
+                        print(f"[tiered_routing] Free speech head drafted doc ({len(content_str)} chars) -> adapter sink")
+                        return local_adapter.create_document_envelope(doc_title, content_str)
+                    print("[tiered_routing] Free speech head doc drafting returned None — escalating to Claude")
+
+            # 3. COMMAND MODE
+            elif decision.mode == "command":
+                if not decision.escalate and local_adapter.is_intent_allowed(decision.intent):
+                    cache = session_context_cache.get_cache()
+                    delta = None
+                    if cache and cache._cached_state:
+                        curr_state = cache.capture_state(get_pc_context, get_all_tabs)
+                        delta = cache.compute_delta(cache._cached_state, curr_state)
+                    envelope = local_adapter.synthesize_command_envelope(decision.intent, decision.parameters, delta)
+                    if envelope:
+                        print(f"[tiered_routing] Local adapter synthesized: {envelope.get('action')}")
+                        return envelope
+                    print(f"[tiered_routing] Local adapter synthesis returned None — escalating to Claude")
+
+        except Exception as _tier_err:
+            print(f"[tiered_routing] Tiered routing exception: {_tier_err!r} — falling back to Claude")
+
+    try:
+        from tiered_config import is_claude_disabled, CLAUDE_DISABLED_MESSAGE
+        if is_claude_disabled():
+            print("[get_akira_response] Claude API disabled via AKIRA_DISABLE_CLAUDE")
+            return {
+                "mode": "conversation",
+                "response": CLAUDE_DISABLED_MESSAGE,
+                "end_session": False,
+            }
+    except Exception:
+        pass
 
     try:
         raw = claude_handler.ask_akira(text, skip_context=True, session_id=session_id)

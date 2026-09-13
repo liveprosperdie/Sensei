@@ -205,6 +205,52 @@ class TestSessionContextCache(unittest.TestCase):
         self.assertIsNone(self.cache._cached_state)
         self.assertEqual(self.cache.session_id, "session_2")
 
+    def test_reorder_does_not_produce_opened_or_closed_delta(self):
+        """Reordering tabs or background windows must NEVER produce opened_tabs or closed_tabs."""
+        tabs_turn1 = [
+            {"title": "Tab A", "url": "http://a.com"},
+            {"title": "Tab B", "url": "http://b.com"},
+            {"title": "Tab C", "url": "http://c.com"},
+        ]
+        # Same tabs, reordered
+        tabs_turn2 = [
+            {"title": "Tab B", "url": "http://b.com"},
+            {"title": "Tab C", "url": "http://c.com"},
+            {"title": "Tab A", "url": "http://a.com"},
+        ]
+        ctx_turn1 = {"foreground_app": "Chrome", "open_windows": ["Chrome", "Window 2", "Window 3"]}
+        # Background windows reordered, foreground stays Chrome
+        ctx_turn2 = {"foreground_app": "Chrome", "open_windows": ["Chrome", "Window 3", "Window 2"]}
+
+        _ = self.cache.get_context_for_turn(
+            session_id=self.session_id,
+            turn_index=1,
+            get_pc_context_fn=lambda: ctx_turn1,
+            get_all_tabs_fn=lambda: tabs_turn1,
+        )
+
+        turn2_str = self.cache.get_context_for_turn(
+            session_id=self.session_id,
+            turn_index=2,
+            get_pc_context_fn=lambda: ctx_turn2,
+            get_all_tabs_fn=lambda: tabs_turn2,
+        )
+
+        lines = turn2_str.splitlines()
+        delta_line = [l for l in lines if l.strip().startswith("{")][0]
+        delta_obj = json.loads(delta_line)
+
+        # Must not report tabs_changed, opened_tabs, or closed_tabs
+        self.assertNotIn("tabs_changed", delta_obj)
+        self.assertNotIn("opened_tabs", delta_obj)
+        self.assertNotIn("closed_tabs", delta_obj)
+        # Must not report opened_windows or closed_windows or active_window_changed
+        self.assertNotIn("opened_windows", delta_obj)
+        self.assertNotIn("closed_windows", delta_obj)
+        self.assertNotIn("active_window_changed", delta_obj)
+        # Active tab was Tab A, now Tab B
+        self.assertEqual(delta_obj.get("active_tab"), "Tab B")
+
 
 if __name__ == "__main__":
     unittest.main()
