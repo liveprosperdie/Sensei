@@ -22,7 +22,7 @@ def is_claude_disabled() -> bool:
 
 # ── Confidence Gate ──────────────────────────────────────────────────────────
 # Any match below this confidence threshold is treated as escalate: True -> Claude
-DEFAULT_MIN_CONFIDENCE: float = 0.85
+DEFAULT_MIN_CONFIDENCE: float = 0.90
 
 
 def get_min_confidence() -> float:
@@ -78,6 +78,25 @@ ADAPTER_ALLOWED_INTENTS = frozenset({
     # Simple info/status reads
     "get_current_time",
 })
+
+
+# ── Graduation Threshold & Gating ────────────────────────────────────────────
+GRADUATION_THRESHOLD = {
+    "min_agreement_ratio": 0.95,  # >= 19/20 consistent executions
+    "max_guard_rejections": 0,    # Zero GUARD token rejections permitted
+    "min_side_effect_ratio": 1.0, # 100% of verifiable runs must have confirmed real side effects
+}
+
+
+def validate_allowlist(graduated_intents: set[str] | frozenset[str]) -> list[str]:
+    """Validate that every intent in ADAPTER_ALLOWED_INTENTS has graduated.
+    
+    Returns a list of ungraduated intents currently present in the allowlist.
+    """
+    return [
+        intent for intent in sorted(ADAPTER_ALLOWED_INTENTS)
+        if intent not in graduated_intents
+    ]
 
 
 # ── Document Generation Complexity Signals ───────────────────────────────────

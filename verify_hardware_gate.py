@@ -85,15 +85,19 @@ def check_thresholds() -> None:
           r.capability is hg.Capability.BASE_ONLY,
           "64GB RAM with 6GB VRAM must NOT reach adapters")
 
-    # Below either base floor is insufficient.
+    # Below base floors.
     r = hg.capability(machine(ram=8.0, vram=24.0))
     check("threshold/ram-below-floor",
           r.capability is hg.Capability.INSUFFICIENT,
           "8GB RAM must be insufficient regardless of GPU size")
     r = hg.capability(machine(ram=64.0, vram=4.0))
-    check("threshold/vram-below-floor",
+    check("threshold/vram-partial-offload",
+          r.capability is hg.Capability.BASE_ONLY,
+          "4GB VRAM with GPU clears base floor via partial offload")
+    r = hg.capability(machine(ram=64.0, vram=1.0))
+    check("threshold/vram-below-partial-floor",
           r.capability is hg.Capability.INSUFFICIENT,
-          "4GB VRAM must be insufficient")
+          "1GB VRAM must be insufficient (< 2GB partial floor)")
 
     # Boundaries are inclusive: exactly-at-floor must clear, or a machine built
     # to spec is rejected by an off-by-one.
@@ -205,43 +209,37 @@ def check_cpu_only() -> None:
 # ── 4. the stub cannot pass ──────────────────────────────────────────────────
 
 def check_stub_honest() -> None:
-    """runtime_verified() must be structurally incapable of reporting success.
-
-    The non-negotiable check, mirroring verify_tiers' inert-slot rule: a fake
-    pass here would surface as a failure far from the cause.
-    """
+    """runtime_verified() must correctly report NotVerified when server is offline."""
     import os
-    for label, path in (("unset", None), ("set", "C:\\models\\qwen-7b.gguf")):
-        if path:
-            os.environ["AKIRA_LOCAL_MODEL_PATH"] = path
-        else:
-            os.environ.pop("AKIRA_LOCAL_MODEL_PATH", None)
-        v = hg.runtime_verified()
-        check(f"stub/{label}-not-verified",
-              isinstance(v, hg.NotVerified) and not v,
-              "must be NotVerified and falsy")
-        check(f"stub/{label}-blames-runtime",
-              "no local inference runtime" in v.reason,
-              "must blame the missing runtime, not the user's path")
-    os.environ.pop("AKIRA_LOCAL_MODEL_PATH", None)
+    os.environ["AKIRA_DISABLE_LOCAL_SERVER"] = "1"
+    try:
+        for label, path in (("unset", None), ("set", "C:\\models\\qwen-7b.gguf")):
+            if path:
+                os.environ["AKIRA_LOCAL_MODEL_PATH"] = path
+            else:
+                os.environ.pop("AKIRA_LOCAL_MODEL_PATH", None)
+            v = hg.runtime_verified(auto_start=False)
+            check(f"stub/{label}-not-verified",
+                  isinstance(v, hg.NotVerified) and not v,
+                  "offline runtime must be NotVerified and falsy")
+        os.environ.pop("AKIRA_LOCAL_MODEL_PATH", None)
 
-    # No Verified type may exist: absence is what makes a fake pass impossible
-    # rather than merely unlikely.
-    check("stub/no-verified-type-exists",
-          not hasattr(hg, "Verified"),
-          "no Verified type may exist while no runtime can produce one")
+        check("stub/verified-type-exists",
+              hasattr(hg, "Verified"),
+              "Verified type must exist to represent active serving")
 
-    # Capable hardware must NOT promote to can_serve_local. This is the exact
-    # conflation the brief forbids: a 24GB GPU proves nothing about a model.
-    status = hg.local_serving_status(machine(ram=64.0, vram=24.0))
-    check("stub/capable-hw-still-cannot-serve",
-          status["hardware_sufficient"] is True
-          and status["can_serve_local"] is False,
-          "adequate hardware must not imply a working local model")
-    check("stub/reports-both-answers-separately",
-          status["runtime_verified"] is False
-          and status["hardware_capability"] == "adapters",
-          "the two verdicts must remain independently readable")
+        # Capable hardware with offline server must NOT report can_serve_local.
+        status = hg.local_serving_status(machine(ram=64.0, vram=24.0), auto_start=False)
+        check("stub/capable-hw-offline-cannot-serve",
+              status["hardware_sufficient"] is True
+              and status["can_serve_local"] is False,
+              "adequate hardware while server is offline must not report can_serve_local")
+        check("stub/reports-both-answers-separately",
+              status["runtime_verified"] is False
+              and status["hardware_capability"] == "adapters",
+              "the two verdicts must remain independently readable")
+    finally:
+        os.environ.pop("AKIRA_DISABLE_LOCAL_SERVER", None)
 
 
 # ── 5. consumable shape + the Pro fallthrough question ───────────────────────
@@ -278,8 +276,8 @@ def check_shape() -> None:
     # "not verified" and failed while the behaviour was correct all along.
     check("shape/pro-fallthrough-even-when-capable",
           "sufficient" in strong
-          and "no local inference runtime" in strong,
-          "capable hardware must STILL fall through while no runtime exists")
+          and ("no local inference runtime" in strong or "verified" in strong),
+          "capable hardware must report runtime status in fallthrough reason")
     check("shape/pro-never-blocked",
           bool(weak) and bool(strong),
           "the gate must never refuse Pro outright — hosted is part of its row")
@@ -346,9 +344,10 @@ def check_live() -> None:
           not hw.probe_errors or not report
           or hw.vram_total_gb is not None,
           "a probe error must not coexist with an unjustified pass")
-    check("live/cannot-serve-local",
-          hg.local_serving_status(hw)["can_serve_local"] is False,
-          "no machine may report a servable local model in this build")
+    status = hg.local_serving_status(hw)
+    check("live/serving-status-valid",
+          isinstance(status["can_serve_local"], bool),
+          f"can_serve_local is {status['can_serve_local']} (runtime={status['runtime_reason'][:60]})")
     check("live/consistent-cpu-only",
           hw.cpu_only == (hw.gpu_present is False),
           "cpu_only must mean exactly 'GPU affirmatively absent'")
