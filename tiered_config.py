@@ -262,20 +262,20 @@ KNOWN_AMBIGUOUS_PATTERNS: list[AmbiguousPattern] = [
 
 
 def check_ambiguous_pattern(intent: str, text: str) -> AmbiguousPattern | None:
-    """Check if intent or text matches any known ambiguous pattern in the registry."""
+    """Check if intent and text match any known ambiguous pattern in the registry."""
     cleaned_text = (text or "").strip()
     cleaned_intent = (intent or "").strip()
     for pat in KNOWN_AMBIGUOUS_PATTERNS:
-        if pat.intent_regex and cleaned_intent and re.search(pat.intent_regex, cleaned_intent, re.IGNORECASE):
-            return pat
-        if pat.text_regex and cleaned_text and re.search(pat.text_regex, cleaned_text, re.IGNORECASE):
+        intent_matches = (pat.intent_regex is None) or bool(cleaned_intent and re.search(pat.intent_regex, cleaned_intent, re.IGNORECASE))
+        text_matches = (pat.text_regex is None) or bool(cleaned_text and re.search(pat.text_regex, cleaned_text, re.IGNORECASE))
+        if intent_matches and text_matches and (pat.intent_regex is not None or pat.text_regex is not None):
             return pat
     return None
 
 
 # ── Speech Head Provider & Model Config ───────────────────────────────────────
 DEFAULT_SPEECH_HEAD_PROVIDER: str = "groq"
-DEFAULT_SPEECH_HEAD_MODEL: str = "openai/gpt-oss-120b"
+DEFAULT_SPEECH_HEAD_MODEL: str = "qwen/qwen3.8-27b"
 
 
 def get_speech_head_provider() -> str:
@@ -284,6 +284,6 @@ def get_speech_head_provider() -> str:
 
 
 def get_speech_head_model() -> str:
-    """Return the configured speech head model (default: openai/gpt-oss-120b)."""
+    """Return the configured speech head model (default: qwen/qwen3.8-27b)."""
     return os.environ.get("AKIRA_SPEECH_HEAD_MODEL", DEFAULT_SPEECH_HEAD_MODEL).strip()
 

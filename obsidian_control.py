@@ -170,14 +170,20 @@ def _do_read(note: str, section: str | None) -> dict:
         res = obsidian_api.request("GET", obsidian_api.vault_path(hits[0]["path"]))
         if not res["success"]:
             return res
-    # Bounded read-aloud: speak the first chunk and ask before continuing,
-    # rather than handing the whole note to the LLM to narrate in one breath.
-    # This bounds SPEECH only — _do_organize and other internal passes still
-    # fetch notes in full through obsidian_api directly.
+    note_text = (res.get("message") or "").strip()
+    title = _note_title(note) or "That note"
     import chunked_read
-    first = chunked_read.begin(_note_title(note) or "That note",
-                               res.get("message") or "")
-    return {"success": True, "speak": True, "message": first["message"]}
+    if len(note_text) <= 200:
+        return {"success": True, "speak": True, "message": f"{title} says: {note_text}"}
+    chunked_read.prime(title, note_text)
+    lines = [ln.strip() for ln in note_text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    first_few = " ".join(lines[:2])[:120]
+    return {
+        "success": True,
+        "speak": True,
+        "message": f"{title} contains {len(note_text.split())} words covering {first_few}. Would you like me to read it in detail?",
+        "detail": note_text[:2000]
+    }
 
 
 def _do_append(note: str, section: str, text: str, *, timestamped: bool) -> dict:

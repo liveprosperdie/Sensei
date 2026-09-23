@@ -55,16 +55,30 @@ def is_codebase_path(target_path: str | None) -> bool:
         return False
 
     raw = str(target_path).strip()
-    try:
-        resolved = os.path.normcase(os.path.realpath(os.path.abspath(raw)))
-    except Exception:
-        # Suspicious or unresolvable path -> fail closed
-        return True
+    raw = os.path.expandvars(os.path.expanduser(raw))
+
+    # If raw is a relative path or bare filename (e.g. "Reinforcement Learning.docx"),
+    # check if it actually exists in the Akira repository before flagging it.
+    if not os.path.isabs(raw):
+        candidate = os.path.join(REPO_ROOT, raw)
+        if not os.path.exists(candidate):
+            # Does not exist in repo root — not a codebase file
+            return False
+        try:
+            resolved = os.path.normcase(os.path.realpath(candidate))
+        except Exception:
+            return True
+    else:
+        try:
+            resolved = os.path.normcase(os.path.realpath(os.path.abspath(raw)))
+        except Exception:
+            # Suspicious or unresolvable path -> fail closed
+            return True
 
     # Check if target is inside or identical to REPO_ROOT
     is_in_repo = (resolved == REPO_ROOT) or resolved.startswith(REPO_ROOT + os.sep)
     if not is_in_repo:
-        # Outside repo root (e.g. ~/Documents, D:\other, etc.)
+        # Outside repo root (e.g. ~/Documents, D:\other, C:\Users\...\Downloads, etc.)
         return False
 
     # Inside repo root: check if it falls within the designated output/ directory
@@ -75,7 +89,7 @@ def is_codebase_path(target_path: str | None) -> bool:
             return True  # Code or script file in output directory is blocked
         return False  # Non-code document output in output/ is allowed
 
-    # Everything else in REPO_ROOT is part of the Akira codebase
+    # Everything else existing in REPO_ROOT is part of the Akira codebase
     return True
 
 
@@ -179,6 +193,10 @@ def check_self_modification(path_str: str | None) -> tuple[bool, str | None]:
 
     # Handle piped parameters (e.g. 'path|content' or 'path|find|replace')
     target = path_str.split("|")[0].strip()
+    # Defense-in-depth: non-path tool keywords / verbs should never trigger self-mod
+    if target.lower() in ("excel", "word", "powerpoint", "teams", "open folder", "open file", "search repos", "open repo", "star repo", "repo notes"):
+        return False, None
+
     if is_codebase_path(target):
         return True, (
             f"Self-modification of Akira's source code is strictly not permitted "

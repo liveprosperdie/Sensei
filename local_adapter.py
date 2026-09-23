@@ -1,7 +1,10 @@
-"""local_adapter.py — Widened local adapter (SERVANT_MECH) and author-agnostic document sink.
+"""local_adapter.py — [DEPRECATED ROUTING ROLE - OPTION A]
+Widened local adapter (SERVANT_MECH) and author-agnostic document sink.
 
-Enforces ADAPTER_ALLOWED_INTENTS for command synthesis and packages pre-written
-content into document creation actions without triggering re-generation.
+NOTE: Runtime command routing and action envelope synthesis have been migrated
+to tiered_classifier.classify_and_synthesize() (Option A: Direct Groq Envelope Emission).
+This module is retained for offline evaluation harness (adapter_agreement_harness.py)
+and backwards compatibility with isolated unit tests. Do NOT use for active pipeline routing.
 """
 
 from __future__ import annotations
@@ -25,10 +28,12 @@ def synthesize_command_envelope(
     parameters: dict[str, Any] | None = None,
     context_delta: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """Synthesize a complete action or conversation envelope for allowed command intents.
+    """[DEPRECATED] Synthesize a complete action or conversation envelope for allowed command intents.
     
+    Active runtime routing uses tiered_classifier.classify_and_synthesize().
     Returns None if the intent is not allowed or cannot be synthesized.
     """
+    logger.debug("[local_adapter] synthesize_command_envelope called (deprecated runtime path)")
     if not is_intent_allowed(intent):
         logger.info("[local_adapter] Intent %s not in ADAPTER_ALLOWED_INTENTS — refusing", intent)
         return None
@@ -168,7 +173,7 @@ def create_document_envelope(title: str, content: str, target: str = "google_doc
     param = f"{clean_title}|{clean_content}"
 
     return {
-        "mode": "action",
+        "mode": "command",
         "action": "docs_control",
         "parameter": param,
         "actions": [{"action": "docs_control", "parameter": param}],
@@ -180,7 +185,7 @@ def create_document_envelope(title: str, content: str, target: str = "google_doc
 
 def _make_action_envelope(action: str, parameter: str, response_text: str) -> dict[str, Any]:
     return {
-        "mode": "action",
+        "mode": "command",
         "action": action,
         "parameter": parameter,
         "actions": [{"action": action, "parameter": parameter}],
@@ -223,7 +228,7 @@ def synthesize_multi_command_envelope(sub_envelopes: list[dict[str, Any]]) -> di
         spoken = f"{', '.join(responses[:-1])}, and {responses[-1].lower()}."
 
     return {
-        "mode": "action",
+        "mode": "command",
         "action": combined_actions[0].get("action", ""),
         "parameter": combined_actions[0].get("parameter", ""),
         "actions": combined_actions,

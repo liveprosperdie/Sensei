@@ -283,16 +283,11 @@ def review(action: str, parameter=None, *, timeout: float = GUARD_TIMEOUT,
         param_str = str(parameter or "")
         has_untrusted = "<untrusted_external_context>" in param_str or "untrusted" in param_str.lower()
 
-        # TEMPORARY DEMO-TESTING FLAG:
-        # If AKIRA_SKIP_GUARD=true in .env, skip the separate guard-tier model call
-        # for actions already classified as ALLOW by static rules / low-risk.
-        skip_guard = os.environ.get("AKIRA_SKIP_GUARD", "").strip().lower() in ("true", "1", "yes")
-
-        if ((action in FAST_PATH_ALLOWED_ACTIONS or skip_guard)
+        if (action in FAST_PATH_ALLOWED_ACTIONS
                 and static.decision == ALLOW
                 and not static.reasons
                 and not has_untrusted):
-            logger.info(f"[GUARD FAST-PATH] Approved action: {action!r} (skip_guard={skip_guard})")
+            logger.info(f"[GUARD FAST-PATH] Approved action: {action!r}")
             print(f"[guard] FAST-PATH approved {action!r} (<1ms)")
             return static
 
@@ -341,11 +336,10 @@ def review(action: str, parameter=None, *, timeout: float = GUARD_TIMEOUT,
         return static.merge(_parse(payload))
     except Exception as exc:
         logger.error(f"[guard] review encountered unexpected exception: {exc!r}", exc_info=True)
-        print(f"[guard] WARNING: review({action!r}) failed: {exc!r} — degrading safely to static check")
         try:
             return guard_rules.validate(action, parameter)
-        except Exception:
-            return Verdict(ALLOW, source="guard-fallback-safe")
+        except Exception as _inner_exc:
+            return Verdict(FLAG, (f"guard exception ({exc}) and static fallback failed ({_inner_exc})",), source="fail-closed")
 
 
 def available() -> bool:

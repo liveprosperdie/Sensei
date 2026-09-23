@@ -19,3 +19,17 @@
 - The fact that you think teaching is an art.
 
 - The arts and servants implemented.
+
+- You're at the bottom of the conversation.
+
+- I'm not quite sure what you mean by that, could you clarify?
+
+- I've summarized your recent actions and are waiting further instructions.
+
+- It's 1:50 AM.
+
+- Subjects are doing their thing.
+
+- Confirming before I save it to your specified location.
+
+- The security details, I'm not quite sure what to make of them, could you clarify what you'd like me to do?

@@ -82,7 +82,7 @@ from enum import Enum
 
 import guard
 import guard_rules
-from guard_rules import BLOCK, FLAG, Verdict
+from guard_rules import BLOCK, FLAG, Verdict, GuardToken
 
 logger = logging.getLogger("akira.action_router")
 
@@ -511,46 +511,50 @@ def run_guarded(step: dict, execute, *, timeout: float | None = None,
             # Nothing ran, so there is nothing to undo — which is the entire
             # point of paying the guard's latency serially for these.
             return Outcome(step_tier, verdict, executed=False)
-        return Outcome(step_tier, verdict, executed=True, result=_call(execute, action))
+        token = verdict.token or static_verdict.token
+        return Outcome(step_tier, verdict, executed=True, result=_call(execute, action, token=token))
 
-    # ── Tier A / A-adjacent and rollback-safe: genuinely concurrent ──────
-    # The guard goes to a worker thread; execute stays here. A one-element list
-    # carries the verdict back rather than a Queue: there is exactly one
-    # producer and one consumer, join() is the happens-before edge, and a Queue
-    # would add machinery without adding a guarantee.
+    # ── Tier A / A-adjacent: offload guard review, hard-wait before execution ──
+    # Execution MUST ALWAYS hard-wait on the guard review verdict and valid token.
+    # Never race or parallelize execution against the guard itself.
     box: list[Verdict] = []
 
     def _review() -> None:
         try:
-            box.append(guard.review(action, parameter, label="guard:parallel",
+            box.append(guard.review(action, parameter, label="guard:async",
                                     **kwargs))
         except Exception as e:
-            # guard.review is documented never to raise. If it ever encounters
-            # an unexpected runtime failure, fail-closed so the action does not
-            # silently bypass safety review.
             logger.error(f"[router] guard thread crashed for {action!r}: {e!r}")
             box.append(Verdict(FLAG, (f"guard thread crashed ({e})",), source="fail-closed"))
 
     thread = threading.Thread(target=_review, name=f"guard:{action}",
                               daemon=True)
     thread.start()
-    result = _call(execute, action)   # the concurrency: this overlaps _review
-    thread.join()
+    thread.join()  # HARD-WAIT: execution NEVER runs before guard review finishes
 
     verdict = box[0] if box else Verdict(
         FLAG, ("guard produced no verdict",), source="fail-closed")
-    print(f"[router] {action} tier={step_tier.value} parallel {verdict}")
-    return Outcome(step_tier, verdict, executed=True, result=result, raced=True)
+    print(f"[router] {action} tier={step_tier.value} reviewed {verdict}")
+    if verdict.decision == guard_rules.BLOCK or (not confirmed and not verdict.allowed):
+        return Outcome(step_tier, verdict, executed=False)
+
+    token = verdict.token or static_verdict.token
+    result = _call(execute, action, token=token)
+    return Outcome(step_tier, verdict, executed=True, result=result, raced=False)
 
 
-def _call(execute, action: str):
-    """Invoke the step callable, converting a crash into a spoken failure.
+def _call(execute, action: str, token: GuardToken | None = None):
+    """Invoke the step callable with GuardToken, converting a crash into a spoken failure.
 
     Mirrors executor.execute's own contract (it already returns a message
     string rather than raising) so the caller's result handling is unchanged
     whether the exception came from executor or from a bad callable.
     """
     try:
+        import inspect
+        sig = inspect.signature(execute)
+        if len(sig.parameters) > 0 or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            return execute(token)
         return execute()
     except Exception as e:
         print(f"[router] EXCEPTION executing {action}: {e!r}")

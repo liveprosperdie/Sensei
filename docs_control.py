@@ -69,8 +69,11 @@ def docs_control(action: str, parameter: str | None = None) -> dict:
         import gemini_content
         gen = gemini_content.generate(
             sub[1].strip(),
-            "Write plain text suitable for a Google Doc. No markdown syntax, "
-            "no # headers, no asterisks.",
+            "Format this as a polished, professional, executive-ready document. "
+            "Organize content into clear, distinct sections with capitalized numbered headings "
+            "(e.g., '1. EXECUTIVE OVERVIEW', '2. ARCHITECTURAL FOUNDATIONS'). "
+            "Use clean bullet points ('• ') for lists and key takeaways. "
+            "Do not use markdown hashes (no '###') or asterisks.",
             length)
         if not gen["success"]:
             return gen

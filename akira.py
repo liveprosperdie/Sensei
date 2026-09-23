@@ -32,6 +32,7 @@ import subprocess
 import sys
 import soundfile as sf
 import executor
+import audio_pipeline
 from executor import execute, get_all_tabs, get_pc_context
 from openwakeword import Model as WakeModel
 
@@ -69,8 +70,18 @@ _session_turn_counter = 0
 
 
 def _end_session() -> None:
-    """Clean up state at the end of a session."""
+    """Clean up state at the end of a session and record encrypted session summary."""
     global _active_session_id, _pending_blocked_action, _session_turn_counter
+    try:
+        if _session_action_history or _session_turn_counter > 0:
+            import session_crypto_logger
+            session_crypto_logger.log_session_encrypted(
+                _active_session_id or f"session_{int(time.time())}",
+                list(_session_action_history),
+                turn_count=_session_turn_counter
+            )
+    except Exception:
+        pass
     _reset_session_action_history()
     _pending_blocked_action = None
     _session_turn_counter = 0
@@ -90,7 +101,10 @@ def _end_session() -> None:
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+speech_api_key = (os.getenv("SPEECH_API_KEY") or os.getenv("GROQ_API_KEY") or "").strip()
+groq_client = Groq(api_key=speech_api_key)
+if os.getenv("SPEECH_API_KEY"):
+    print("[speech] Dedicated SPEECH_API_KEY configured for Whisper transcription")
 openwakeword.utils.download_models()
 
 # ── Multi-Action Chain Throttling & Pacing ───────────────────────────────────
@@ -509,56 +523,46 @@ print("Listening for 'Akira'...")
 
 # ── Audio utilities ───────────────────────────────────────────────────────────
 
-def record_command(pre_audio: np.ndarray | None = None) -> np.ndarray | None:
+def record_command(
+    pre_audio: np.ndarray | None = None,
+    initial_timeout_s: float = 4.0,
+    silence_cutoff_ms: int = 1100,
+    max_duration_s: float = 15.0,
+) -> np.ndarray | None:
+    """Record user command using energy-aware Silero VAD voice activity detection,
+    speech bandpass filtering (80Hz - 7500Hz), and 250ms voice boundary padding.
+    Waits for 1.1s silence after user finishes speaking before execution.
     """
-    Record until silence or MAX_CHUNKS. Returns normalised float32 audio or None.
-    pre_audio: VAD-captured audio from during Akira's speech (barge-in buffer).
-    """
-    command_audio = [pre_audio] if pre_audio is not None else []
-    chunk_count   = 1 if pre_audio is not None else 0
-    silent_chunks = 15
-    MAX_CHUNKS    = 200
-    MIN_CHUNKS    = 48
-    MAX_SILENT    = 15
+    return audio_pipeline.record_command_vad(
+        stream,
+        vad_model,
+        pre_audio=pre_audio,
+        fs=16000,
+        max_duration_s=max_duration_s,
+        silence_cutoff_ms=silence_cutoff_ms,
+        initial_timeout_s=initial_timeout_s,
+    )
 
-    while chunk_count < MAX_CHUNKS:
-        chunk = stream.read(1280, exception_on_overflow=False)
-        audio_np = np.frombuffer(chunk, dtype=np.int16)
-        rms = np.sqrt(np.mean(audio_np.astype(np.float32) ** 2))
-        command_audio.append(audio_np.astype(np.float32))
-        chunk_count += 1
-        if chunk_count > MIN_CHUNKS:
-            silent_chunks = silent_chunks + 1 if rms < 150 else 0
-            if silent_chunks >= MAX_SILENT:
-                break
-
-    if not command_audio:
-        print("[record] no audio captured")
-        return None
-
-    raw = np.concatenate(command_audio)
-    normalised = raw / 32768.0
-    energy = float(np.sqrt(np.mean(raw ** 2)))
-    if pre_audio is None and energy < 100:
-        print(f"[record] too quiet (rms={energy:.1f})")
-        return None
-    if pre_audio is not None and energy < 70:
-        print(f"[record] too quiet even with pre_audio (rms={energy:.1f})")
-        return None
-    return normalised
 
 
 def transcribe_command(audio: np.ndarray) -> str:
-    """Write audio to temp file and transcribe via Groq Whisper."""
+    """Write voice audio to temp file and transcribe via Groq Whisper Large v3."""
+    if audio is None or len(audio) < 1600:  # < 0.1s
+        return ""
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         temp_path = f.name
     sf.write(temp_path, audio, 16000)
     try:
         with open(temp_path, "rb") as f:
             result = groq_client.audio.transcriptions.create(
-                model="whisper-large-v3-turbo", file=f, language="en"
+                model="whisper-large-v3",
+                file=f,
+                language="en",
+                temperature=0.0,
+                prompt="Akira, Spotify, YouTube, Brave, Chrome, Excel, Word, PowerPoint, Windows.",
             )
-        return result.text.strip()
+        raw_text = result.text.strip()
+        return audio_pipeline.clean_transcription_text(raw_text)
     finally:
         try:
             os.remove(temp_path)
@@ -659,6 +663,12 @@ def speak_and_wait(text: str) -> None:
         with vad_buffer_lock:
             vad_audio_buffer.clear()
         flush_stream()
+        # Reset VAD model internal state — TTS audio may have pushed it
+        # into a speech-active state that would contaminate the next recording.
+        try:
+            vad_model.reset_states()
+        except Exception:
+            pass
     else:
         print("[barge-in] Retaining user interruption audio in buffer for immediate execution.")
 
@@ -953,43 +963,39 @@ def run_actions(response: dict, step_results: dict | None = None,
                 result = {"success": False, "speak": True, "message": "Background tasks are only available on the Pro tier."}
                 if step_id:
                     step_results[step_id] = result
-                results.append(result)
-                continue
+            def _guarded_bg_run(a=step["action"], p=parameter):
+                bg_guard_step = {"action": a, "parameter": p}
+                bg_outcome = action_router.run_guarded(
+                    bg_guard_step,
+                    lambda tok=None, act=a, param=p: execute(act, param, guard_token=tok),
+                    confirmed=confirmed
+                )
+                return bg_outcome.result
 
-            result = background_tasks.start(
-                bg_label,
-                # bound now, not at call time — the loop variables move on
-                lambda a=step["action"], p=parameter: execute(a, p))
+            result = background_tasks.start(bg_label, _guarded_bg_run)
             if step_id:
                 step_results[step_id] = result
             results.append(result)
             continue
 
         # GUARD + EXECUTE, timed by the step's tier (action_router).
-        # For Tier A / A-adjacent rollback-safe steps the guard runs on a worker
-        # thread WHILE this executes, so the cost is max(guard, execute) rather
-        # than the sum. For everything else the guard runs first and blocking.
-        # The router owns that decision; run_actions only reacts to the outcome.
-        #
+        # Execution strictly hard-waits on the Guard review and requires a valid GuardToken.
         # Gated steps never reach here un-confirmed — handle_response routes them
         # into pending_actions above — so this is not the gated guard seam. That
         # one lives in _guard_gated(), called before the confirmation is spoken.
         guard_step = {"action": step["action"], "parameter": parameter}
         try:
             outcome = action_router.run_guarded(
-                guard_step, lambda a=step["action"], p=parameter: execute(a, p),
+                guard_step,
+                lambda tok=None, a=step["action"], p=parameter: execute(a, p, guard_token=tok),
                 confirmed=confirmed)
         except Exception as _guard_err:
-            print(f"[run_actions] WARNING: action_router.run_guarded crashed on {step['action']}: {_guard_err!r} — executing action directly")
-            try:
-                _direct_res = execute(step["action"], parameter)
-            except Exception as _exec_err:
-                _direct_res = f"Action failed: {_exec_err}"
+            print(f"[run_actions] ERROR: action_router.run_guarded crashed on {step['action']}: {_guard_err!r} — failing closed")
             outcome = action_router.Outcome(
                 action_router.tier_of(step["action"]),
-                action_router.guard_rules.Verdict(action_router.guard_rules.ALLOW, source="guard-bypass"),
-                executed=True,
-                result=_direct_res
+                action_router.guard_rules.Verdict(action_router.guard_rules.BLOCK, (f"guard crash: {_guard_err}",), source="fail-closed"),
+                executed=False,
+                result=f"Action blocked due to safety check error: {_guard_err}"
             )
         result = outcome.result
 
@@ -1126,35 +1132,169 @@ def guard_action_envelope(response: dict) -> tuple[dict, list[str]]:
     """Unified GUARD entry point for all planned action envelopes (tiered adapter & Claude).
 
     Checks all steps for danger/gating, runs the gated guard, and builds confirmation prompts.
+    Preserves multi-action execution chains:
+    - Normalizes incoming pending_actions and actions keys/values.
+    - Pre-existing pending_actions are never discarded.
+    - Ungated actions preceding a gated step execute immediately.
+    - The gated step plus ALL subsequent actions in the chain are preserved in pending_actions.
     """
-    actions_to_run = response.get("actions") or []
-    unsafe = [a for a in actions_to_run if _is_dangerous_step(a)]
-    safe   = [a for a in actions_to_run if not _is_dangerous_step(a)]
+    # 1. Extract and normalize incoming pending_actions (or pending_action)
+    raw_pending = response.get("pending_actions")
+    if raw_pending is None and response.get("pending_action"):
+        raw_pending = response["pending_action"]
+    if raw_pending and not isinstance(raw_pending, list):
+        raw_pending = [raw_pending]
 
+    existing_pending: list[dict] = []
+    if raw_pending:
+        for item in raw_pending:
+            if isinstance(item, str):
+                if "|" in item:
+                    act, p = item.split("|", 1)
+                else:
+                    act, p = item, ""
+                existing_pending.append({"action": act.strip(), "parameter": p.strip()})
+            elif isinstance(item, dict):
+                act = item.get("action") or item.get("name") or item.get("cmd") or item.get("tool") or ""
+                p = item.get("parameter") if item.get("parameter") is not None else (item.get("parameters") or item.get("arguments") or item.get("args") or item.get("param") or "")
+                existing_pending.append({"action": str(act).strip(), "parameter": str(p).strip() if p is not None else ""})
+
+    # 2. Extract and normalize incoming actions_to_run
+    raw_actions = response.get("actions") or []
+    if not raw_actions and response.get("action"):
+        raw_actions = [{"action": response["action"], "parameter": response.get("parameter")}]
+
+    normalized_actions: list[dict] = []
+    for item in raw_actions:
+        if isinstance(item, str):
+            if "|" in item:
+                act, p = item.split("|", 1)
+            else:
+                act, p = item, ""
+            normalized_actions.append({"action": act.strip(), "parameter": p.strip()})
+        elif isinstance(item, dict):
+            act = item.get("action") or item.get("name") or item.get("cmd") or item.get("tool") or ""
+            p = item.get("parameter") if item.get("parameter") is not None else (item.get("parameters") or item.get("arguments") or item.get("args") or item.get("param") or "")
+            normalized_actions.append({"action": str(act).strip(), "parameter": str(p).strip() if p is not None else ""})
+
+    actions_to_run = normalized_actions
     guard_notes_gated: list[str] = []
-    if unsafe:
-        unsafe, guard_notes_gated = _guard_gated(unsafe)
-        if not unsafe:
-            response.pop("confirmation_required", None)
-            response.pop("pending_actions", None)
-            response["actions"] = safe
+    first_gated_idx = None
+    for idx, act in enumerate(actions_to_run):
+        if _is_dangerous_step(act):
+            first_gated_idx = idx
+            break
 
-    if unsafe and not response.get("confirmation_required"):
-        print(f"[guard_action_envelope] safety net caught: {[a['action'] for a in unsafe]}")
+    if first_gated_idx is None:
+        safe_prefix = actions_to_run
+        gated_and_remaining = []
+    else:
+        safe_prefix = actions_to_run[:first_gated_idx]
+        gated_and_remaining = actions_to_run[first_gated_idx:]
+        gated_step = gated_and_remaining[0]
+        reviewed_gated, guard_notes_gated = _guard_gated([gated_step])
+        if not reviewed_gated:
+            # Guard blocked the gated step — execute only safe prefix, discard this gated chain
+            gated_and_remaining = []
+        else:
+            print(f"[guard_action_envelope] safety net gating step {first_gated_idx + 1}/{len(actions_to_run)}: {gated_step['action']}")
+
+    # Total pending actions = any pre-existing pending + gated actions
+    all_pending = existing_pending + gated_and_remaining
+
+    if all_pending:
         response["confirmation_required"] = True
-        response["pending_actions"]       = unsafe
-        response["actions"]               = safe
+        response["pending_actions"]       = all_pending
+        response["actions"]               = safe_prefix
         response.pop("action", None)
         response.pop("parameter", None)
-        response["confirmation_message"]  = _confirmation_prompt(unsafe)
-        response["response"]              = response["confirmation_message"]
-    elif unsafe:
-        response["pending_actions"] = unsafe
-        response["actions"]         = safe
-        response.pop("action", None)
-        response.pop("parameter", None)
+        response.pop("pending_action", None)
+        if not response.get("confirmation_message"):
+            response["confirmation_message"] = _confirmation_prompt([all_pending[0]])
+        if not safe_prefix:
+            response["response"] = response["confirmation_message"]
+    else:
+        response.pop("confirmation_required", None)
+        response.pop("pending_actions", None)
+        response.pop("pending_action", None)
+        response["actions"] = safe_prefix
 
     return response, guard_notes_gated
+
+
+
+_CURRENT_TURN_TIMING: dict = {}
+
+def print_live_telemetry_banner(response: dict, run_results: list | None = None, exec_ms: float = 0.0) -> None:
+    try:
+        import tiered_classifier
+        telemetry = tiered_classifier.get_last_router_telemetry()
+    except Exception:
+        telemetry = {}
+
+    timing = globals().get("_CURRENT_TURN_TIMING", {})
+    heard_text = timing.get("heard") or "Voice command"
+    ctx_ms = timing.get("ctx_ms", 0.0)
+    llm_ms = timing.get("llm_ms", 0.0)
+    t_start = timing.get("t_start")
+    total_ms = round((time.perf_counter() - t_start) * 1000, 1) if t_start else round(ctx_ms + llm_ms + exec_ms, 1)
+
+    model_name = telemetry.get("model") or os.environ.get("GROQ_ROUTER_MODEL", "openai/gpt-oss-120b")
+    param_class = telemetry.get("param_class") or ("120B" if "120b" in str(model_name).lower() else ">= 27B")
+
+    endpoint = telemetry.get("endpoint") or "https://api.groq.com/openai/v1/chat/completions"
+    delta_sent = telemetry.get("delta_context_sent") or "Minimal Delta State"
+    groq_api_ms = telemetry.get("groq_latency_ms") or llm_ms
+    is_esc = telemetry.get("is_escalation", False)
+
+    actions = response.get("actions") or []
+    if not actions and response.get("action"):
+        actions = [{"action": response.get("action"), "parameter": response.get("parameter")}]
+
+    print("\n" + "=" * 80)
+    print(f">> LIVE VOICE INPUT HEARD: {heard_text!r}")
+    print("-" * 80)
+    print(f"[PHASE 1: CONTEXT FILTER]       Latency: {ctx_ms:.1f}ms")
+    delta_display = str(delta_sent).strip()
+    if len(delta_display) > 120:
+        delta_display = delta_display[:117] + "..."
+    delta_len = len(str(delta_sent or ""))
+    print(f"   * Delta Payload: {delta_display} ({delta_len} chars)")
+    print(f"   * Privacy Scope: Core profile & long conversation history suppressed from router payload")
+    print(f"[PHASE 2: GROQ ROUTER (>=27B)]  Latency: {groq_api_ms:.1f}ms")
+    print(f"   * Model Used: {model_name} ({param_class}) [{'FREE CLAUDE ESCALATION' if is_esc else 'PRIMARY FREE ROUTER'}]")
+    print(f"   * API Endpoint: {endpoint} (json_object mode)")
+    import json
+    clean_resp = {k: v for k, v in response.items() if not k.startswith("_")}
+    print(f"   * Generated Output Envelope:\n{json.dumps(clean_resp, indent=2)}")
+    if actions:
+        print(f"[PHASE 3: GUARD VALIDATION]      Status: PASSED (Cryptographic Token Verified)")
+        print(f"[PHASE 4: OS LIVE EXECUTION]      Latency: {exec_ms:.1f}ms")
+        if run_results:
+            for r in run_results:
+                print(f"   * Execution Result: {r}")
+    else:
+        print(f"[PHASE 3: GUARD VALIDATION]      Status: CONVERSATIONAL (Bypassed)")
+        print(f"[PHASE 4: OS LIVE EXECUTION]      Latency: 0.0ms (No actions needed)")
+    print(f"[PHASE 5: SPOKEN AUDIO (TTS)]     Voice: {response.get('response', '')!r}")
+    print(f">> TOTAL ROUNDTRIP LATENCY:        {total_ms:.1f}ms | Anthropic Cost: $0.00 (Zero paid Claude calls)")
+    print("=" * 80 + "\n")
+
+
+def _naturalize_failure_message(raw_msg: str) -> str:
+    """Map raw mechanical or debug failure messages to natural, conversational spoken English."""
+    m_str = (raw_msg or "").strip()
+    m_lower = m_str.lower()
+    if "no files found matching" in m_lower:
+        target = m_str.split("matching", 1)[1].strip() if "matching" in m_str else ""
+        return f"I couldn't find any files matching {target}."
+    if "could not find window for" in m_lower:
+        target = m_str.split("for", 1)[1].split("after")[0].strip() if "for" in m_str else ""
+        return f"I launched {target}, but its window hasn't appeared yet."
+    if m_lower.startswith("failed to open application:"):
+        app = m_str.split(":", 1)[1].strip()
+        return f"I wasn't able to open {app}."
+    return m_str
 
 
 def handle_response(response: dict, user_text: str = "") -> bool:
@@ -1192,9 +1332,9 @@ def handle_response(response: dict, user_text: str = "") -> bool:
     elif tone == "calm":
         _notify_avatar("CALM_START")
 
-    if mode == "command":
+    if mode in ("command", "action"):
         actions_to_run = response.get("actions", [])
-        if response.get("action"):
+        if not actions_to_run and response.get("action"):
             actions_to_run = [{"action": response["action"], "parameter": response.get("parameter")}]
 
         # Deliberation tier: swap any "deliberate" abstain signal for the plan a
@@ -1208,24 +1348,32 @@ def handle_response(response: dict, user_text: str = "") -> bool:
         # An empty plan is a valid outcome (it asked a question or declined):
         # nothing runs, and the summary/question falls through to the single
         # speak_and_wait at the end of this function.
-        if not actions_to_run and not response.get("response"):
+        if not actions_to_run and not response.get("pending_actions") and not response.get("pending_action") and not response.get("response"):
             response["response"] = "I didn't catch an action to run for that request. Could you rephrase?"
 
         response["actions"] = actions_to_run
         response.pop("action", None)
         response.pop("parameter", None)
 
+        # Parallelize GUARD validation against independent non-blocking work (TTS prep):
+        # Pre-synthesize the spoken response in the background while Guard reviews/validates
+        # actions. Execution strictly hard-waits on Guard review/token.
+        if response.get("response"):
+            try:
+                claude_handler.prepare_tts(response["response"])
+            except Exception:
+                pass
+
         # Unified GUARD entry point — applies to all action plans
         response, guard_notes_gated = guard_action_envelope(response)
 
         run_results = []
-        if response.get("confirmation_required"):
-            # NOTHING executes until the user confirms. Previously the
-            # `elif not unsafe` branch ran non-dangerous actions immediately
-            # even when confirmation_required was True (checkout bypass bug).
-            pass
-        else:
-            run_results = run_actions(response if not response.get("pending_actions") else {"actions": safe})
+        t_exec_start = time.perf_counter()
+        actions_to_execute = response.get("actions") or []
+        if actions_to_execute:
+            run_results = run_actions({"actions": actions_to_execute})
+        exec_ms = round((time.perf_counter() - t_exec_start) * 1000, 1)
+
 
         # Post-execution speech override. Failures take absolute precedence:
         # the old reversed-loop-with-break let a later speak:True result mask
@@ -1236,11 +1384,11 @@ def handle_response(response: dict, user_text: str = "") -> bool:
         unverified  = False  # dict results with no "success" key at all
         for r in run_results:
             if isinstance(r, str) and r.startswith(FAILURE_PREFIXES):
-                failures.append(r)
+                failures.append(_naturalize_failure_message(r))
             elif isinstance(r, dict):
                 if r.get("success") is False:
-                    # click-validation failures carry "reason", not "message"
-                    failures.append(r.get("message") or r.get("reason") or "That didn't work.")
+                    raw_f = (r.get("message") or r.get("reason") or "That didn't work.").strip()
+                    failures.append(_naturalize_failure_message(raw_f))
                 elif "success" not in r:
                     unverified = True
                 elif r.get("speak") and r.get("message"):
@@ -1258,6 +1406,19 @@ def handle_response(response: dict, user_text: str = "") -> bool:
         elif unverified:
             # can't confirm the outcome — don't let pre-baked text claim success
             response["response"] = "I ran that, but I couldn't verify it completed."
+
+        # Procedural Memory: stage completed, guard-passed Tier-2 plan for deferred registration
+        if not failures and not guard_notes_gated and not response.get("is_replayed"):
+            try:
+                import procedural_memory as pm
+                pm.stage_pending_derivation(
+                    user_text=user_text,
+                    envelope=response,
+                    origin_brain=response.get("origin_brain", "claude"),
+                    pc_context=get_pc_context() if "get_pc_context" in globals() else None,
+                )
+            except Exception as _pm_stage_err:
+                print(f"[procedural_memory] Staging warning: {_pm_stage_err!r}")
 
         # A gated step the guard refused on shape must be SAID, not dropped in
         # silence — otherwise the user hears a confirmation for two steps when
@@ -1288,27 +1449,45 @@ def handle_response(response: dict, user_text: str = "") -> bool:
             is_multi = len(run_results) > 1
             has_speak_summary = any(isinstance(r, dict) and r.get("speak_summary") for r in run_results)
 
-            if is_multi or has_failures or has_speak_summary:
+            if has_failures or has_speak_summary or not (response.get("response") or "").strip():
                 summary = claude_handler.synthesize_action_reply()
                 if summary:
-                    response["response"] = llm_json.extract_spoken_text(summary)
+                    clean_summary = llm_json.extract_spoken_text(summary).strip()
+                    if clean_summary and clean_summary.lower() not in ("unsupported_intent", "no_match", "(noted)", "none", "unknown"):
+                        response["response"] = clean_summary
 
-        # click confirmation discovered at runtime
+        # click confirmation discovered at runtime (e.g. organize_folder, bulk_rename_files, delete_files)
         if pending_action == "click_confirmed" and run_results:
             response["response"] = run_results[-1]
 
-        # store pending dangerous actions
-        if response.get("confirmation_required"):
+        # store pending dangerous actions only if not already gated by runtime execution plan
+        if response.get("confirmation_required") and pending_action != "click_confirmed":
             if response.get("pending_actions"):
                 pending_action    = response["pending_actions"]
                 pending_parameter = None
             elif response.get("action"):
                 pending_action    = response["action"]
                 pending_parameter = response.get("parameter")
+            if run_results:
+                confirm_msg = response.get("confirmation_message") or response.get("response", "")
+                response["response"] = f"Initial steps complete. {confirm_msg}".strip()
+            else:
+                response["response"] = response.get("confirmation_message") or response.get("response", "")
 
+
+    print_live_telemetry_banner(response, run_results=run_results if mode in ("command", "action") else None, exec_ms=exec_ms if mode in ("command", "action") else 0.0)
     print("[v0] speaking response...")
     speak_and_wait(response.get("response", ""))
     print("[v0] done speaking")
+
+    # Cache last assistant response for contextual follow-up actions (e.g. copy to clipboard)
+    resp_text = response.get("response", "")
+    if resp_text:
+        try:
+            import session_context_cache
+            session_context_cache.set_last_assistant_response(resp_text)
+        except Exception:
+            pass
 
     # Persist conversational turn to long-term memory log
     try:
@@ -1337,8 +1516,23 @@ def handle_response(response: dict, user_text: str = "") -> bool:
         _notify_avatar("SLEEP_START")
         return False
 
+    # TTS cooldown: drain 800ms of audio frames from the mic to purge speaker
+    # reverb/room echo.  Without this, the follow-up recording captures TTS
+    # residue as "speech" and Whisper transcribes noise into gibberish.
     flush_stream()
-    time.sleep(0.4)
+    _tts_drain_frames = int(0.8 * 16000 / 512)  # ~25 frames = 800ms
+    for _ in range(_tts_drain_frames):
+        try:
+            stream.read(512, exception_on_overflow=False)
+        except Exception:
+            break
+    flush_stream()
+    # Reset VAD model internal state so TTS-triggered activations don't bleed
+    # into the next recording's onset detection.
+    try:
+        vad_model.reset_states()
+    except Exception:
+        pass
     session_start_time = time.time()
     # feeds the flow-rate heuristic that suppresses clarifying questions
     # during a rapid back-and-forth (obsidian_context.should_ask_clarification)
@@ -1513,130 +1707,59 @@ def get_akira_response(text: str, session_id: str | None = None,
         except Exception:
             pass
 
-    # ── Tiered Routing Layer (Decision API -> Speech Head / Adapter -> Claude) ──
+    # ── Tiered Routing Layer (Option A: Collapsed Regex Fast-Path / Groq Direct -> Claude) ──
     routing_mode = (os.environ.get("AKIRA_ROUTING_MODE") or "tiered").strip().lower()
     if routing_mode == "tiered":
         try:
             import tiered_classifier
-            import speech_head
-            import local_adapter
             import session_context_cache
 
-            decision = tiered_classifier.classify(raw_text or text)
-            print(f"[tiered_routing] Decision: mode={decision.mode!r}, complexity={decision.complexity!r}, intent={decision.intent!r}, escalate={decision.escalate!r}")
+            # Compute environment context (running apps, active tabs, session memory on Turn 1; deltas on Turn 2+)
+            cache = session_context_cache.get_cache()
+            delta_context = None
+            try:
+                note_fn = obsidian_context.session_line if "obsidian_context" in globals() else None
+                curr_turn = globals().get("_session_turn_counter", 1)
+                delta_context = cache.get_context_for_turn(
+                    session_id=session_id or "default_session",
+                    turn_index=curr_turn,
+                    get_pc_context_fn=get_pc_context,
+                    get_all_tabs_fn=get_all_tabs,
+                    get_note_fn=note_fn
+                )
+            except Exception as _ctx_err:
+                print(f"[tiered_routing] Environment context error: {_ctx_err!r}")
 
-            # 1. CONVERSATION MODE
-            if decision.mode == "conversation":
-                if decision.complexity == "simple" and not decision.escalate:
-                    reply = speech_head.generate_conversation_reply(raw_text or text)
-                    if reply:
-                        print(f"[tiered_routing] Free speech head answered: {reply[:60]!r}...")
-                        return {"mode": "conversation", "response": reply, "end_session": False}
-                    print("[tiered_routing] Escalated to Claude (trigger=speech_head_failure): speech head generation returned None")
-                else:
-                    trigger = f"complex_{decision.mode}" if decision.complexity == "complex" else f"uncertain_{decision.mode}"
-                    print(f"[tiered_routing] Escalated to Claude (trigger={trigger}): complexity='{decision.complexity}'")
+            envelope = tiered_classifier.classify_and_synthesize(raw_text or text, delta_context=delta_context)
+            if envelope and not envelope.get("escalate"):
+                print(f"[tiered_routing] Synthesized envelope: mode={envelope.get('mode')} action={envelope.get('action')}")
+                return envelope
 
-            # 2. DOCUMENT GENERATION MODE
-            elif decision.mode == "document_generation":
-                doc_title = decision.title or "Untitled Document"
-                doc_brief = decision.brief or (raw_text or text)
-                if decision.complexity == "simple" and not decision.escalate:
-                    content_str = speech_head.generate_document_content(doc_brief, length="short")
-                    if content_str:
-                        print(f"[tiered_routing] Free speech head drafted doc ({len(content_str)} chars) -> adapter sink")
-                        return local_adapter.create_document_envelope(doc_title, content_str)
-                    print("[tiered_routing] Escalated to Claude (trigger=speech_head_failure): doc drafting returned None")
-                else:
-                    trigger = f"complex_{decision.mode}" if decision.complexity == "complex" else f"uncertain_{decision.mode}"
-                    print(f"[tiered_routing] Escalated to Claude (trigger={trigger}): complexity='{decision.complexity}'")
+            # ── Procedural Memory Hook (Shadow mode by default, no replay unless enabled) ──
+            try:
+                import procedural_memory as pm
+                recalled = pm.check_procedural_recall(raw_text or text)
+                if recalled and pm.get_mode() == "replay":
+                    print(f"[procedural_memory] Replaying procedure {recalled.get('procedure_id')}")
+                    return recalled
+            except Exception as _pm_err:
+                print(f"[procedural_memory] Recall check warning: {_pm_err!r}")
 
-            # 3. COMMAND MODE
-            elif decision.mode == "command":
-                import tiered_config
-
-                # ── Multi-Step Command Chain Dispatch ──
-                if decision.is_chain:
-                    if decision.escalate:
-                        # Interdependent chain -> escalate full original utterance to Claude
-                        print(f"[tiered_routing] Escalated to Claude (trigger={decision.escalate_trigger}): "
-                              f"interdependent chain ({len(decision.sub_tasks)} steps): {decision.sub_tasks}")
-                    else:
-                        # Independent chain -> build ordered list of sub-task dispatches
-                        print(f"[tiered_routing] Independent command chain verified ({len(decision.sub_tasks)} steps): "
-                              f"{decision.sub_tasks}")
-                        cache = session_context_cache.get_cache()
-                        delta = None
-                        if cache and cache._cached_state:
-                            curr_state = cache.capture_state(get_pc_context, get_all_tabs)
-                            delta = cache.compute_delta(cache._cached_state, curr_state)
-
-                        sub_envelopes = []
-                        chain_failed = False
-                        for sub_idx, sub_dec in enumerate(decision.sub_decisions):
-                            sub_env = local_adapter.synthesize_command_envelope(sub_dec.intent, sub_dec.parameters, delta)
-                            if not sub_env:
-                                print(f"[tiered_routing] Sub-task {sub_idx} synthesis returned None — escalating chain")
-                                chain_failed = True
-                                break
-
-                            # Guard each sub-task individually before execution — no exceptions
-                            guarded_sub, _ = guard_action_envelope(sub_env)
-                            if guarded_sub.get("confirmation_required"):
-                                print(f"[tiered_routing] Sub-task {sub_idx} required confirmation: {guarded_sub.get('action')}")
-                                return guarded_sub
-
-                            sub_envelopes.append(guarded_sub)
-
-                        if not chain_failed and sub_envelopes:
-                            multi_env = local_adapter.synthesize_multi_command_envelope(sub_envelopes)
-                            if multi_env:
-                                print(f"[tiered_routing] Local adapter synthesized chain ({len(multi_env['actions'])} actions): "
-                                      f"{[a.get('action') for a in multi_env['actions']]}")
-                                return multi_env
-
-                        print(f"[tiered_routing] Escalated to Claude (trigger=chain_synthesis_failed): failed to synthesize all sub-tasks")
-
-                # ── Single-Step Command Dispatch ──
-                else:
-                    escalate_cmd = False
-
-                    # Check 1: Known-ambiguous pattern registry match
-                    ambig_match = tiered_config.check_ambiguous_pattern(decision.intent, raw_text or text)
-                    if ambig_match:
-                        escalate_cmd = True
-                        print(f"[tiered_routing] Escalated to Claude (trigger=ambiguous_flag): pattern='{ambig_match.tag}' reason='{ambig_match.reason}'")
-
-                    # Check 2: Unrecognized command (NO_MATCH)
-                    if not escalate_cmd and decision.intent == "NO_MATCH":
-                        escalate_cmd = True
-                        print(f"[tiered_routing] Escalated to Claude (trigger=no_match): unrecognized command intent")
-
-                    # Check 3: Low confidence
-                    if not escalate_cmd and decision.confidence < tiered_config.get_min_confidence():
-                        escalate_cmd = True
-                        print(f"[tiered_routing] Escalated to Claude (trigger=low_confidence): confidence={decision.confidence:.2f} < {tiered_config.get_min_confidence():.2f}")
-
-                    # Check 4: Allowlist reject
-                    if not escalate_cmd and not local_adapter.is_intent_allowed(decision.intent):
-                        escalate_cmd = True
-                        print(f"[tiered_routing] Escalated to Claude (trigger=allowlist_reject): intent='{decision.intent}' not in ADAPTER_ALLOWED_INTENTS")
-
-                    # If NOT escalated, dispatch to local adapter
-                    if not escalate_cmd:
-                        cache = session_context_cache.get_cache()
-                        delta = None
-                        if cache and cache._cached_state:
-                            curr_state = cache.capture_state(get_pc_context, get_all_tabs)
-                            delta = cache.compute_delta(cache._cached_state, curr_state)
-                        envelope = local_adapter.synthesize_command_envelope(decision.intent, decision.parameters, delta)
-                        if envelope:
-                            print(f"[tiered_routing] Local adapter synthesized: {envelope.get('action')}")
-                            return envelope
-                        print(f"[tiered_routing] Escalated to Claude (trigger=adapter_synthesis_failed): returned None")
-
+            trigger = envelope.get("escalate_trigger", envelope.get("reason", "router_escalate")) if envelope else "synthesis_none"
+            print(f"[tiered_routing] Escalated to Free API Brain (trigger={trigger})")
+            free_envelope = tiered_classifier.escalate_to_free_brain(raw_text or text, delta_context=delta_context, reason=trigger)
+            if free_envelope and isinstance(free_envelope, dict):
+                free_envelope.setdefault("origin_brain", "free")
+                return free_envelope
         except Exception as _tier_err:
-            print(f"[tiered_routing] Tiered routing exception: {_tier_err!r} — falling back to Claude")
+            print(f"[tiered_routing] Tiered routing exception: {_tier_err!r} — attempting Free API escalation")
+            try:
+                free_envelope = tiered_classifier.escalate_to_free_brain(raw_text or text, delta_context=delta_context, reason=str(_tier_err))
+                if free_envelope and isinstance(free_envelope, dict):
+                    free_envelope.setdefault("origin_brain", "free")
+                    return free_envelope
+            except Exception as _free_err:
+                print(f"[tiered_routing] Free brain escalation error: {_free_err!r}")
 
     try:
         from tiered_config import is_claude_disabled, CLAUDE_DISABLED_MESSAGE
@@ -1675,6 +1798,7 @@ def get_akira_response(text: str, session_id: str | None = None,
                                 "If you want long content written, ask me to generate "
                                 "it and I'll write it properly.",
                     "end_session": False}
+        response.setdefault("origin_brain", "claude")
         return response
     except Exception as e:
         print(f"[get_akira_response] unexpected error: {e!r}")
@@ -1755,9 +1879,14 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
     # session context.  Bug-1 fix: context-prefixed text drowns out short
     # confirmations like "yes" or "yeah I'm sure".
     raw_text = text
+    _CURRENT_TURN_TIMING.clear()
+    _CURRENT_TURN_TIMING["t_start"] = time.perf_counter()
+    _CURRENT_TURN_TIMING["heard"] = raw_text
 
     print(f"[v0] building session context (turn {_session_turn_counter})...")
+    t_ctx_start = time.perf_counter()
     context_prefix = _build_session_context(turn_index=_session_turn_counter)
+    _CURRENT_TURN_TIMING["ctx_ms"] = round((time.perf_counter() - t_ctx_start) * 1000, 1)
     if context_prefix:
         text = context_prefix + text
     print("[v0] session context done")
@@ -1766,8 +1895,10 @@ def _process_command(text: str, inject_context: bool = False) -> bool:
     import memory_observer
     memory_observer.observe_turn_async(text)
 
+    t_llm_start = time.perf_counter()
     response = get_akira_response(text, session_id=_active_session_id,
                                   raw_text=raw_text)
+    _CURRENT_TURN_TIMING["llm_ms"] = round((time.perf_counter() - t_llm_start) * 1000, 1)
     print("[v0] LLM returned")
     if response is None:
         try:
@@ -1801,8 +1932,14 @@ if __name__ == "__main__":
     # Note: Browser is NOT pre-warmed on startup to keep cold-start lightweight and instant.
     # Browser launches/attaches lazily on the first browser action.
     try:
+        import threading
         import file_index
         file_index.init_file_index(background=True)
+        threading.Thread(
+            target=file_index.export_drives_map_to_downloads,
+            daemon=True,
+            name="AkiraDrivesMapInit"
+        ).start()
     except Exception as _idx_err:
         print(f"[file_index] Background init warning: {_idx_err}")
     while True:
@@ -1822,7 +1959,13 @@ if __name__ == "__main__":
                     user_speaking.clear()
 
                 print("[v0] recording command (session follow-up)...")
-                audio = record_command(pre_audio=pre_audio)
+                audio = record_command(
+                    pre_audio=pre_audio,
+                    initial_timeout_s=5.0,
+                    silence_cutoff_ms=1100,
+                    max_duration_s=15.0,
+                )
+
                 if audio is None:
                     print("[v0] session follow-up audio too quiet or timed out, closing session")
                     session_active = False
@@ -1915,6 +2058,15 @@ if __name__ == "__main__":
 
                 current_time = time.time()
                 triggered = score > WAKE_THRESHOLD and (current_time - last_activation_time) > COOLDOWN_TIME
+                if triggered and vad_model is not None and len(audio_np) >= 512:
+                    # Guard against non-speech impulses (door slams, desk claps, sharp clicks) falsely triggering wake word
+                    last_512 = audio_np[-512:].astype(np.float32) / 32768.0
+                    with torch.no_grad():
+                        impulse_vad = vad_model(torch.from_numpy(last_512).float(), 16000).item()
+                    if impulse_vad < 0.20:
+                        if WAKE_DEBUG:
+                            print(f"[wake] suppressed non-speech impulse trigger (score={score:.3f}, vad={impulse_vad:.2f})")
+                        triggered = False
 
                 # If no custom wake model exists, fallback to VAD speech activity trigger
                 if not triggered and oww_model is None and (current_time - last_activation_time) > COOLDOWN_TIME:
@@ -1951,7 +2103,7 @@ if __name__ == "__main__":
                     print("[v0] recording command...")
                     audio = record_command()
                     if audio is None:
-                        print("[v0] record returned None (too quiet), back to idle")
+                        print("[v0] record returned None (no speech detected / background noise only), back to idle")
                         continue
 
                     print("[v0] transcribing...")

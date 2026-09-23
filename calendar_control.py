@@ -14,14 +14,81 @@ from datetime import datetime, timedelta
 import google_mcp
 
 
+import re
+
+_MONTHS = {
+    'jan': 1, 'january': 1, 'feb': 2, 'february': 2, 'mar': 3, 'march': 3, 'apr': 4, 'april': 4,
+    'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7, 'aug': 8, 'august': 8, 'sep': 9, 'september': 9,
+    'oct': 10, 'october': 10, 'nov': 11, 'november': 11, 'dec': 12, 'december': 12
+}
+
+
+def _parse_dt(text: str) -> datetime:
+    """Parse strict ISO, YYYY-MM-DD HH:MM, or natural relative strings ('tomorrow 7pm', 'Sep 19 7pm')."""
+    t = (text or "").strip()
+    for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d %I:%M %p', '%Y-%m-%d %I%p', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(t, fmt)
+        except ValueError:
+            pass
+
+    now = datetime.now()
+    t_lower = t.lower()
+    target_year = now.year
+    target_month = now.month
+    target_day = now.day
+
+    if 'tomorrow' in t_lower:
+        d = now.date() + timedelta(days=1)
+        target_year, target_month, target_day = d.year, d.month, d.day
+        t_lower = t_lower.replace('tomorrow', '')
+    elif 'today' in t_lower:
+        d = now.date()
+        target_year, target_month, target_day = d.year, d.month, d.day
+        t_lower = t_lower.replace('today', '')
+    else:
+        m_month = None
+        for m_name, m_num in _MONTHS.items():
+            if re.search(r'\b' + m_name + r'\b', t_lower):
+                m_month = m_num
+                t_lower = re.sub(r'\b' + m_name + r'\b', '', t_lower)
+                break
+        if m_month:
+            target_month = m_month
+            m_day = re.search(r'\b(\d{1,2})(?:st|nd|rd|th)?\b', t_lower)
+            if m_day:
+                target_day = int(m_day.group(1))
+                t_lower = re.sub(r'\b' + m_day.group(0) + r'\b', '', t_lower)
+
+    t_lower = re.sub(r'\b(at|on|for)\b', '', t_lower).strip()
+    m_time = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', t_lower)
+    if m_time:
+        hour = int(m_time.group(1))
+        minute = int(m_time.group(2)) if m_time.group(2) else 0
+        meridiem = m_time.group(3)
+        if meridiem == 'pm' and hour < 12:
+            hour += 12
+        elif meridiem == 'am' and hour == 12:
+            hour = 0
+        elif not meridiem and hour <= 7:
+            hour += 12
+        return datetime(target_year, target_month, target_day, hour, minute)
+
+    # Fallback to direct strptime
+    return datetime.strptime(t, "%Y-%m-%d %H:%M")
+
+
 def _iso(text: str) -> str:
-    """'2026-07-17 15:00' -> RFC3339 with the machine's local UTC offset."""
-    dt = datetime.strptime(text.strip(), "%Y-%m-%d %H:%M")
+    """Convert any date string to RFC3339 with local timezone offset."""
+    dt = _parse_dt(text)
     return dt.astimezone().isoformat()
 
 
 def calendar_control(action: str, parameter: str | None = None) -> dict:
     action = (action or "").strip().lower()
+    if action in ("today", "tomorrow", "agenda"):
+        parameter = action if not parameter else f"{action}|{parameter}"
+        action = "list"
     parts = [p.strip() for p in (parameter or "").split("|")] if parameter else []
     print(f"[calendar_control] action={action!r} params={parts!r}")
 
@@ -53,15 +120,22 @@ def calendar_control(action: str, parameter: str | None = None) -> dict:
                 return {"success": False, "message": "Creating an event needs at least a title and start time."}
             title = parts[0]
             start_str = parts[1]
+            try:
+                dt_start = _parse_dt(start_str)
+            except Exception as e:
+                return {"success": False, "message": f"Couldn't understand start time '{start_str}': {e}"}
+
             if len(parts) >= 3 and parts[2]:
-                end_str = parts[2]
+                try:
+                    dt_end = _parse_dt(parts[2])
+                except Exception:
+                    dt_end = dt_start + timedelta(hours=1)
             else:
-                # Default end time to 1 hour after start
-                dt_start = datetime.strptime(start_str.strip(), "%Y-%m-%d %H:%M")
-                end_str = (dt_start + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+                dt_end = dt_start + timedelta(hours=1)
+
             args = {"summary": title,
-                    "start": {"dateTime": _iso(start_str)},
-                    "end": {"dateTime": _iso(end_str)}}
+                    "start": {"dateTime": dt_start.astimezone().isoformat()},
+                    "end": {"dateTime": dt_end.astimezone().isoformat()}}
             if len(parts) > 3 and parts[3]:
                 args["description"] = parts[3]
             return google_mcp.call("workspace", "create_event", args)

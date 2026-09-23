@@ -27,9 +27,9 @@ def _get_speech_client(timeout: float):
     model = get_speech_head_model()
 
     if provider == "groq":
-        groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+        groq_key = (os.environ.get("SPEECH_API_KEY") or os.environ.get("GROQ_API_KEY") or "").strip()
         if not groq_key:
-            logger.warning("[speech_head] GROQ_API_KEY not set — failing open to Claude")
+            logger.warning("[speech_head] SPEECH_API_KEY / GROQ_API_KEY not set — failing open to Claude")
             return None, None
         from groq import Groq
         return Groq(api_key=groq_key, timeout=timeout), model
@@ -53,7 +53,7 @@ def _get_speech_client(timeout: float):
 
     else:
         # Default fallback to Groq
-        groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+        groq_key = (os.environ.get("SPEECH_API_KEY") or os.environ.get("GROQ_API_KEY") or "").strip()
         if not groq_key:
             return None, None
         from groq import Groq

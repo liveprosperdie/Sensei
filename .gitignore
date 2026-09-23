@@ -29,6 +29,15 @@ __pycache__/
 !.env.example
 credentials.json
 token.json
+memory/.session_vault.key
+memory/*.vault
+memory/*.key
+*.procedures.key
+.procedures.key
+
+# temporary office lock files & test artifacts
+~$*
+tests/*_results.json
 
 # models
 *.onnx
@@ -52,6 +61,10 @@ akira_system_prompts_dump.md
 live_all_local_functions_report.json
 live_function_test_results.json
 live_verified_report.json
+akira_performance_dashboard.html
 *.db
+procedures.db
+.procedures.key
+*.procedures.key
 voice_engine_branch/
 memory/logs/

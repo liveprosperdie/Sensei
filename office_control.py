@@ -36,8 +36,10 @@ exactly ONE confirmation mechanism.
 
 import os
 import re as _re
+from typing import Any
 
 import doc_image_plan
+
 
 # pywin32 is Windows-only. Probing once at import keeps this module importable
 # on any platform (and keeps `import executor` working in CI/sandbox) — every
@@ -70,31 +72,50 @@ _APP_LABEL = {"word": "Word", "excel": "Excel", "powerpoint": "PowerPoint"}
 
 # ── COM plumbing ──────────────────────────────────────────────────────────────
 
+_APP_CACHE: dict[str, Any] = {}
+
 def _app(kind: str, create: bool = True):
     """Return a running Office application object, or (None, message).
 
-    GetActiveObject attaches to an ALREADY-OPEN instance so we act on the
-    user's real session (their open documents, their unsaved edits) instead of
-    silently spawning a second invisible copy. Dispatch is the fallback that
-    starts one when nothing is running.
+    1. Checks _APP_CACHE for an already-connected live instance in this process.
+    2. Uses GetActiveObject to attach to an ALREADY-OPEN instance in the ROT.
+    3. Falls back to Dispatch only if no instance exists.
     """
     if _COM_ERROR:
         return None, ("Office control needs pywin32 on Windows — "
                       f"COM isn't available here ({_COM_ERROR}).")
     progid = _APP_PROGID[kind]
+
+    # 1. In-process live cache check
+    cached = _APP_CACHE.get(kind)
+    if cached is not None:
+        try:
+            _ = cached.Visible
+            return cached, None
+        except Exception:
+            _APP_CACHE.pop(kind, None)
+
+    # 2. Try GetActiveObject
     try:
-        return _com.GetActiveObject(progid), None
+        app = _com.GetActiveObject(progid)
+        _APP_CACHE[kind] = app
+        return app, None
     except Exception:
         pass
+
     if not create:
         return None, f"{_APP_LABEL[kind]} isn't open."
+
+    # 3. Dispatch new instance
     try:
         app = _com.Dispatch(progid)
         app.Visible = True
+        _APP_CACHE[kind] = app
         return app, None
     except Exception as e:
         return None, (f"I couldn't start {_APP_LABEL[kind]} — "
                       f"it may not be installed ({e}).")
+
 
 
 def _search_dirs() -> list[str]:
@@ -389,10 +410,35 @@ def _word(sub: str, parameter: str | None) -> dict:
             return _err(f"I couldn't open that document: {ex}")
 
     # Everything below needs an active document.
+    doc = None
     try:
         doc = app.ActiveDocument
     except Exception:
-        return _err("There's no document open in Word.")
+        pass
+    if doc is None:
+        try:
+            if app.Documents.Count > 0:
+                doc = app.Documents(1)
+                try:
+                    doc.Activate()
+                except Exception:
+                    pass
+        except Exception:
+            doc = None
+    if doc is None:
+        if sub in ("generate", "insert", "dictate", "new"):
+            try:
+                doc = app.Documents.Add()
+                app.Visible = True
+                try:
+                    doc.Activate()
+                except Exception:
+                    pass
+            except Exception as e:
+                return _err(f"There's no document open in Word and couldn't create one: {e}")
+        else:
+            return _err("There's no document open in Word.")
+
 
     if sub in ("insert", "dictate"):
         text = (parameter or "").strip()
@@ -917,9 +963,13 @@ def _word_generate(app, doc, parameter: str | None) -> dict:
     except Exception as e:                                # pragma: no cover
         return _err(f"The content generator isn't available ({e}).")
 
+    gen_length = _GEN_LENGTHS.get(
+        length.lower().strip(),
+        "detailed" if any(w in (brief or "").lower() for w in ("detailed", "comprehensive", "pages", "page", "long", "full", "2-3", "two")) else "short"
+    )
     gen = gemini_content.generate(
-        brief, _GEN_FORMAT_INSTRUCTIONS,
-        _GEN_LENGTHS.get(length.lower().strip(), "short"))
+        brief, _GEN_FORMAT_INSTRUCTIONS, gen_length
+    )
     if not gen.get("success"):
         return _err(gen.get("message", "I couldn't generate that content."))
 
@@ -928,9 +978,35 @@ def _word_generate(app, doc, parameter: str | None) -> dict:
     if err:
         return _err(f"I couldn't write it into the document: {err}")
 
+    # Auto-save so the document is immediately persistent, downloadable, and ready to edit
+    saved_path = None
+    try:
+        if not getattr(doc, "Path", None):
+            clean_title = re.sub(r'[\\/*?:"<>|]', "", title).strip().replace(" ", "_") or "Document"
+            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+            os.makedirs(downloads_dir, exist_ok=True)
+            target_path = os.path.join(downloads_dir, f"{clean_title}.docx")
+            try:
+                doc.SaveAs2(target_path)
+                saved_path = target_path
+            except Exception:
+                try:
+                    doc.SaveAs(target_path)
+                    saved_path = target_path
+                except Exception:
+                    pass
+        else:
+            doc.Save()
+            saved_path = getattr(doc, "FullName", None)
+    except Exception as save_err:
+        print(f"[office_control] auto-save notice: {save_err}")
+
     headings = [text for style, text in blocks[1:] if style.startswith("heading")]
-    written = (f"Wrote {title} into the document with {len(headings)} "
-               f"{'section' if len(headings) == 1 else 'sections'}.")
+    if saved_path:
+        written = (f"Generated {title} ({len(headings)} sections) and saved directly to {os.path.basename(saved_path)} in Downloads.")
+    else:
+        written = (f"Wrote {title} into the document with {len(headings)} "
+                   f"{'section' if len(headings) == 1 else 'sections'}.")
 
     return _ok(written, speak=True)
 
@@ -962,12 +1038,29 @@ def _excel(sub: str, parameter: str | None) -> dict:
         except Exception as ex:
             return _err(f"I couldn't open that workbook: {ex}")
 
+    if sub == "generate":
+        try:
+            wb = app.ActiveWorkbook
+            if wb is None:
+                wb = app.Workbooks.Add()
+        except Exception:
+            wb = app.Workbooks.Add()
+        return _excel_generate(app, wb, parameter)
+
+    wb = None
     try:
         wb = app.ActiveWorkbook
-        if wb is None:
-            raise AttributeError("no workbook")
     except Exception:
+        pass
+    if wb is None:
+        try:
+            if app.Workbooks.Count > 0:
+                wb = app.Workbooks(1)
+        except Exception:
+            wb = None
+    if wb is None:
         return _err("There's no workbook open in Excel.")
+
 
     if sub == "read":
         # "read|workbook|range" or "read|range" — the workbook field is
@@ -1073,6 +1166,77 @@ def _excel(sub: str, parameter: str | None) -> dict:
             return _err(f"I couldn't undo that: {e}")
 
     return _err(f"I can't do '{sub}' in Excel.")
+
+
+def _excel_generate(app, wb, parameter: str | None) -> dict:
+    """generate|<title>|<topic or instructions>|<brief or detailed>"""
+    title, brief, length = _fields(parameter, 3)
+    if not title or not brief:
+        title = title or "Budget_Planner"
+        brief = brief or "Weekly budget planner with categories, planned, actual expenses, and formulas"
+
+    try:
+        import gemini_content
+    except Exception as e:
+        return _err(f"The content generator isn't available ({e}).")
+
+    format_instr = (
+        "Generate clean, structured spreadsheet data in comma-separated CSV format with headers in row 1: "
+        "Day/Category, Item, Planned, Actual, Difference. "
+        "Each row on a new line, values separated by comma. "
+        "Use real formulas starting with '=' like =C2-D2 for Difference and =SUM(...) for totals. "
+        "Do NOT include markdown formatting, code blocks, or explanatory preambles."
+    )
+    gen = gemini_content.generate(brief, format_instr, "short")
+    if not gen.get("success"):
+        return _err(gen.get("message", "I couldn't generate the spreadsheet data."))
+
+    lines = [ln.strip() for ln in (gen.get("text") or "").splitlines() if ln.strip() and not ln.strip().startswith("```")]
+    if not lines:
+        return _err("Generated empty spreadsheet content.")
+
+    try:
+        sheet = wb.ActiveSheet
+        for r_idx, line in enumerate(lines, start=1):
+            cols = [c.strip().strip('"') for c in line.split(",")]
+            for c_idx, val in enumerate(cols, start=1):
+                cell = sheet.Cells(r_idx, c_idx)
+                if val.startswith("="):
+                    try:
+                        cell.Formula = val
+                    except Exception:
+                        cell.Value = val
+                else:
+                    cell.Value = _coerce(val)
+
+        try:
+            sheet.Rows(1).Font.Bold = True
+            sheet.Columns.AutoFit()
+        except Exception:
+            pass
+
+        clean_title = _re.sub(r'[\\/*?:"<>|]', "", title).strip().replace(" ", "_") or "Workbook"
+        downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        os.makedirs(downloads_dir, exist_ok=True)
+        target_path = os.path.join(downloads_dir, f"{clean_title}.xlsx")
+        if os.path.exists(target_path):
+            import datetime
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            target_path = os.path.join(downloads_dir, f"{clean_title}_{ts}.xlsx")
+        try:
+            prev_alerts = getattr(app, "DisplayAlerts", True)
+            app.DisplayAlerts = False
+            try:
+                wb.SaveAs(target_path, 51)
+            except Exception:
+                wb.SaveAs(target_path)
+            app.DisplayAlerts = prev_alerts
+            return _ok(f"Created Excel workbook '{os.path.basename(target_path)}' in Downloads with {len(lines)} rows and formulas.", file_path=target_path)
+        except Exception as save_err:
+            print(f"[OFFICE] excel save error: {save_err}")
+            return _ok(f"Populated Excel sheet '{clean_title}' with {len(lines)} rows.")
+    except Exception as e:
+        return _err(f"I couldn't write into Excel: {e}")
 
 
 _XL_FORMAT_SUBS = frozenset({"bold", "italic", "font size", "fill color",
@@ -1262,8 +1426,7 @@ def _read_range(wb, ref: str) -> dict:
             shown = "empty" if val in (None, "") else _fmt(val)
             return _ok(f"{rng.Address(False, False)} is {shown}.", speak=True)
 
-        # Multi-cell: flatten, cap the spoken list so a huge range can't
-        # monopolise the voice loop, and report the true total.
+        # Multi-cell: summarize first so huge ranges don't monopolize speech
         raw = rng.Value
         flat = []
         for row in (raw if isinstance(raw, tuple) else [(raw,)]):
@@ -1271,11 +1434,20 @@ def _read_range(wb, ref: str) -> dict:
             flat.extend(_fmt(c) for c in cells_row if c not in (None, ""))
         if not flat:
             return _ok(f"{ref} is empty.", speak=True)
-        shown = flat[:12]
-        msg = f"{ref} has {', '.join(shown)}"
-        if len(flat) > len(shown):
-            msg += f", and {len(flat) - len(shown)} more values"
-        return _ok(msg + ".", speak=True)
+        if len(flat) <= 4:
+            return _ok(f"{ref} has {', '.join(flat)}.", speak=True)
+
+        rows_cnt = getattr(rng, "Rows", None)
+        cols_cnt = getattr(rng, "Columns", None)
+        r_num = getattr(rows_cnt, "Count", 0) if rows_cnt else 0
+        c_num = getattr(cols_cnt, "Count", 0) if cols_cnt else 0
+        dim_str = f" across {r_num} rows and {c_num} columns" if (r_num and c_num) else ""
+
+        import chunked_read
+        chunked_read.prime(f"Values in {ref}", f"Cells in {ref}: " + ", ".join(flat))
+
+        msg = f"{ref} contains {len(flat)} values{dim_str}. Would you like me to read them in detail?"
+        return _ok(msg, speak=True)
     except Exception as e:
         return _err(f"I couldn't read {ref}: {e}")
 

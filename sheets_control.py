@@ -29,9 +29,31 @@ def _cell(raw: str) -> str:
 
 
 def _grid(text: str) -> list[list[str]]:
-    """'a,b;c,d' -> [["a","b"],["c","d"]]"""
-    return [[_cell(cell) for cell in row.split(",")]
-            for row in text.split(";") if row.strip()]
+    """Tolerantly parses 'a,b;c,d', newlines, and CSV rows into [["a","b"],["c","d"]]."""
+    import re
+    clean = text.strip()
+    # Strip markdown fences
+    if "```" in clean:
+        clean = re.sub(r"^```(?:csv|plaintext)?\s*", "", clean, flags=re.IGNORECASE)
+        clean = re.sub(r"\s*```$", "", clean)
+        clean = clean.strip()
+
+    # If rows are separated by semicolons
+    if ";" in clean and "\n" not in clean:
+        raw_rows = [r.strip() for r in clean.split(";") if r.strip()]
+    else:
+        # Split on newlines, handling trailing semicolons if present
+        raw_rows = [r.strip().rstrip(";") for r in clean.splitlines() if r.strip().rstrip(";")]
+
+    grid = []
+    for row in raw_rows:
+        # Also split if multiple rows joined with semicolon in one line
+        sub_rows = [sr.strip() for sr in row.split(";") if sr.strip()] if ";" in row else [row]
+        for sub in sub_rows:
+            cells = [_cell(c) for c in sub.split(",")]
+            if cells:
+                grid.append(cells)
+    return grid
 
 
 def sheets_control(action: str, parameter: str | None = None) -> dict:
@@ -79,9 +101,18 @@ def sheets_control(action: str, parameter: str | None = None) -> dict:
         if not data:
             return {"success": False,
                     "message": "The generated sheet data came back in an unusable format."}
-        return google_mcp.call("workspace", "create_google_sheet",
-                               {"name": parts[0].strip(), "data": data,
+        name = parts[0].strip()
+        res = google_mcp.call("workspace", "create_google_sheet",
+                               {"name": name, "data": data,
                                 "valueInputOption": "USER_ENTERED"})
+        if not res.get("success") and "already exists" in str(res.get("message", "")).lower():
+            import datetime
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            alt_name = f"{name} ({ts})"
+            res = google_mcp.call("workspace", "create_google_sheet",
+                                  {"name": alt_name, "data": data,
+                                   "valueInputOption": "USER_ENTERED"})
+        return res
 
     if action == "read":
         if not parts or not parts[0].strip():

@@ -43,11 +43,72 @@ reads two, the correct answer is "don't run this", and asking the user to
 approve a shape they cannot see would launder a bug into consent.
 """
 
-from __future__ import annotations
-
+import hashlib
+import hmac
 import re
+import secrets
 import sys
+import time
 from dataclasses import dataclass, field
+
+class GuardBypassError(PermissionError):
+    """Raised when execution is attempted without a valid GuardToken."""
+    pass
+
+
+# Module-private secret for cryptographic signing of guard tokens.
+# Process-isolated: cannot be forged or replayed across processes.
+_GUARD_TOKEN_SECRET: bytes = secrets.token_bytes(32)
+
+
+def _hash_param(parameter: object) -> str:
+    if parameter is None:
+        raw = b""
+    elif isinstance(parameter, (str, bytes)):
+        raw = str(parameter).encode("utf-8")
+    else:
+        raw = repr(parameter).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _compute_token_signature(action: str, param_hash: str, decision: str, created_at: float) -> str:
+    msg = f"{action}:{param_hash}:{decision}:{created_at:.6f}".encode("utf-8")
+    return hmac.new(_GUARD_TOKEN_SECRET, msg, hashlib.sha256).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class GuardToken:
+    """Cryptographic authorization token proving an action passed Guard screening.
+    
+    Required by executor.execute(). Only mintable by guard_rules.validate().
+    """
+    action: str
+    parameter_hash: str
+    decision: str
+    created_at: float
+    signature: str
+
+    def is_valid_for(self, action: str, parameter: object) -> bool:
+        if self.action != action:
+            return False
+        if self.parameter_hash != _hash_param(parameter):
+            return False
+        if self.decision == BLOCK:
+            return False
+        if time.time() - self.created_at > 120.0:  # 2 minute expiry for confirmed prompts
+            return False
+        expected_sig = _compute_token_signature(self.action, self.parameter_hash, self.decision, self.created_at)
+        return hmac.compare_digest(self.signature, expected_sig)
+
+
+def _issue_guard_token(action: str, parameter: object, decision: str) -> GuardToken | None:
+    if decision == BLOCK:
+        return None
+    p_hash = _hash_param(parameter)
+    now = time.time()
+    sig = _compute_token_signature(action, p_hash, decision, now)
+    return GuardToken(action, p_hash, decision, now, sig)
+
 
 # Verdict vocabulary. Deliberately three-valued rather than a bool: "needs a
 # human" and "refuse outright" are different outcomes, and collapsing them is
@@ -72,6 +133,7 @@ class Verdict:
     decision: str
     reasons: tuple[str, ...] = ()
     source: str = "static"  # static | model | fail-closed
+    token: GuardToken | None = None
 
     @property
     def allowed(self) -> bool:
@@ -105,9 +167,12 @@ class Verdict:
             f"{self.source}+{other.source}"
             if _SEVERITY[self.decision] == _SEVERITY[other.decision]
             else worst.source)
+        # Token is only preserved if the merged decision is not BLOCK
+        token = self.token if worst.decision != BLOCK else None
         return Verdict(worst.decision,
                        (*self.reasons, *other.reasons),
-                       source)
+                       source,
+                       token=token)
 
     def __str__(self) -> str:
         why = "; ".join(self.reasons) or "no objection"
@@ -155,7 +220,7 @@ FILL = Rule(1, 999, screen=True, split_pipe=True)               # "field|text" o
 ACTION_RULES: dict[str, Rule] = {
     # ── applications & windows ────────────────────────────────────────────
     "open_application": OPAQUE_TEXT,
-    "close_application": OPAQUE_TEXT,
+    "close_application": OPT_OPAQUE_TEXT,
     "switch_window": OPAQUE_TEXT,
     "maximize_window": OPT_OPAQUE_TEXT,
     "minimize_window": OPT_OPAQUE_TEXT,
@@ -165,7 +230,7 @@ ACTION_RULES: dict[str, Rule] = {
     "site_search": SUB_FREE_TEXT_UNSCREENED,
     "fill": FILL,
     "scroll": OPT_TEXT,
-    "new_tab": SUB_FREE_TEXT,
+    "new_tab": OPT_OPAQUE_TEXT,
     "open_site_tab": OPAQUE_TEXT,
     "list_tabs": IGNORED,
     "switch_tab": OPAQUE_TEXT,
@@ -438,13 +503,41 @@ def validate(action: str, parameter=None) -> Verdict:
     if is_destr:
         return Verdict(BLOCK, (destr_reason or "destructive OS command forbidden",))
 
-    if name in (
-        "create_file", "write_file", "edit_file", "delete_files", "delete_file",
-        "copy_files", "move_files", "organize_files", "organize_folder",
-        "bulk_rename_files", "compress_files", "extract_files", "vscode_control",
-        "github_control", "office_control"
-    ):
-        is_self_mod, mod_reason = security_guard.check_self_modification(parameter)
+    target_paths: list[str] = []
+    if name in ("create_file", "write_file", "edit_file", "delete_file"):
+        if fields:
+            target_paths.append(fields[0])
+    elif name == "delete_files":
+        if parameter:
+            for item in parameter.split(","):
+                p = item.split("|")[0].strip()
+                if p:
+                    target_paths.append(p)
+    elif name in ("copy_files", "move_files", "compress_files", "extract_files"):
+        for f in fields[:2]:
+            if f.strip():
+                target_paths.append(f.strip())
+    elif name in ("organize_files", "organize_folder", "bulk_rename_files"):
+        if fields:
+            target_paths.append(fields[0])
+    elif name == "vscode_control":
+        if fields:
+            sub = fields[0].strip().lower().replace("_", " ")
+            if sub in ("create file", "write file", "edit file") and len(fields) > 1 and fields[1].strip():
+                target_paths.append(fields[1].strip())
+    elif name == "github_control":
+        if fields:
+            sub = fields[0].strip().lower().replace("_", " ")
+            if sub == "clone repo" and len(fields) > 2 and fields[2].strip():
+                target_paths.append(fields[2].strip())
+    elif name == "office_control":
+        if len(fields) >= 3:
+            sub = fields[1].strip().lower().replace("_", " ")
+            if sub in ("save as", "save_as"):
+                target_paths.append(fields[2].strip())
+
+    for target in target_paths:
+        is_self_mod, mod_reason = security_guard.check_self_modification(target)
         if is_self_mod:
             return Verdict(BLOCK, (mod_reason or "self-modification forbidden: target is inside Akira codebase",))
 
@@ -485,4 +578,6 @@ def validate(action: str, parameter=None) -> Verdict:
             if hits:
                 reasons.append(f"risky keyword(s): {', '.join(hits)}")
 
-    return Verdict(FLAG if reasons else ALLOW, tuple(reasons))
+    dec = FLAG if reasons else ALLOW
+    token = _issue_guard_token(name, parameter, dec)
+    return Verdict(dec, tuple(reasons), token=token)

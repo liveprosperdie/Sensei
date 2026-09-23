@@ -22,7 +22,14 @@ from .db import (
     get_index_size_bytes,
     _db_lock
 )
-from .scanner import initial_scan, scan_directory_tree, export_directory_map
+from .scanner import (
+    initial_scan,
+    scan_directory_tree,
+    export_directory_map,
+    export_drives_map_to_downloads,
+    load_drive_map,
+    lookup_in_drive_map
+)
 from .watcher import IndexWatcher
 from .content_extractor import ContentExtractionWorker
 from .search import search_files as _search_files
@@ -94,6 +101,12 @@ def init_file_index(
                 except Exception as _map_err:
                     print(f"[file_index] warning exporting directory map: {_map_err}")
 
+            # Export detailed map of D & E drives strictly to Downloads (accessed only by code)
+            try:
+                export_drives_map_to_downloads(resolved_path)
+            except Exception as _drv_err:
+                print(f"[file_index] warning exporting drive map to Downloads: {_drv_err}")
+
             # Start real-time filesystem watcher
             global _active_watcher
             if _active_watcher is None:
@@ -161,10 +174,17 @@ def manage_index_scope(action: str, folder_path: Optional[str] = None) -> Dict[s
                     rows = cur.fetchall()
                     for (fid,) in rows:
                         cur.execute("DELETE FROM folders WHERE id = ?;", (fid,))
+
+        # Regenerate drive map in Downloads immediately to reflect exclusion
+        try:
+            threading.Thread(target=export_drives_map_to_downloads, daemon=True, name="AkiraMapScopeRefresh").start()
+        except Exception:
+            pass
+
         return {
             "success": True,
             "speak": True,
-            "message": f"Excluded {norm_path} from search index and cleaned up existing entries."
+            "message": f"Excluded {norm_path} from search index and updated your drive map in Downloads."
         }
 
     if act in ("include", "add"):

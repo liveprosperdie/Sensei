@@ -42,12 +42,9 @@ class TestSessionContextCache(unittest.TestCase):
         )
 
         self.assertIn("[SESSION START]", ctx_str)
-        self.assertIn("<untrusted_external_context>", ctx_str)
-        self.assertIn("[CURRENT BROWSER TABS]", ctx_str)
-        self.assertIn("YouTube - Starboy, GitHub - Sensei", ctx_str)
-        self.assertIn("[PC STATE]", ctx_str)
-        self.assertIn("Focused app: Google Chrome", ctx_str)
-        self.assertIn("Windows: Chrome, VS Code", ctx_str)
+        self.assertIn("[DESKTOP ENVIRONMENT]", ctx_str)
+        self.assertIn("Running Applications:", ctx_str)
+        self.assertIn("Active Browser Tabs:", ctx_str)
         self.assertIn("[RECENT ACTIONS THIS SESSION]", ctx_str)
 
     def test_turn2_returns_minimal_delta_on_window_change(self):
@@ -186,8 +183,7 @@ class TestSessionContextCache(unittest.TestCase):
 
         # Must fall back to sending full context
         self.assertIn("[SESSION START]", fallback_str)
-        self.assertIn("[CURRENT BROWSER TABS]", fallback_str)
-        self.assertIn("[PC STATE]", fallback_str)
+        self.assertIn("[DESKTOP ENVIRONMENT]", fallback_str)
         self.assertNotIn("[CONTEXT DELTA]", fallback_str)
 
     def test_session_reset(self):

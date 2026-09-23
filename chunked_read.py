@@ -109,6 +109,22 @@ def _clear_locked() -> None:
     _state = None
 
 
+def prime(label: str, full_text: str) -> None:
+    """Stage `full_text` in chunked_read state at cursor 0 without emitting yet.
+
+    Used when an action summarizes the content first and asks if the user wants
+    to hear it in detail. When the user follows up with 'yes' / 'read in detail',
+    the next call to more() will emit part 1.
+    """
+    global _state
+    text = (full_text or "").strip()
+    if not text:
+        return
+    with _lock:
+        _state = {"label": label.strip() or "That", "text": text,
+                  "cursor": 0, "part": 0}
+
+
 def begin(label: str, full_text: str) -> dict:
     """Start reading `full_text` aloud in chunks. Returns the first chunk.
 

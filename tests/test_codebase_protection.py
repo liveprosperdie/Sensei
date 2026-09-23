@@ -88,32 +88,26 @@ class TestCodebaseProtection(unittest.TestCase):
     def test_executor_execute_action_blocks_codebase(self):
         akira_py = os.path.join(self.codebase_root, "akira.py")
 
-        # execute with create_file
-        res = executor.execute("create_file", f"{akira_py}|overwrite")
-        if isinstance(res, dict):
-            self.assertFalse(res.get("success", False))
-            msg = res.get("message", "").lower()
-        else:
-            msg = str(res).lower()
-        self.assertTrue("prohibited" in msg or "not permitted" in msg)
+        # Direct execution without token structurally raises GuardBypassError
+        from guard_rules import GuardBypassError
+        with self.assertRaises(GuardBypassError):
+            executor.execute("create_file", f"{akira_py}|overwrite")
 
-        # execute with delete_files
-        res = executor.execute("delete_files", akira_py)
-        if isinstance(res, dict):
-            self.assertFalse(res.get("success", False))
-            msg = res.get("message", "").lower()
-        else:
-            msg = str(res).lower()
-        self.assertTrue("prohibited" in msg or "not permitted" in msg)
+        with self.assertRaises(GuardBypassError):
+            executor.execute("delete_files", akira_py)
 
-        # execute with organize_folder
-        res = executor.execute("organize_folder", self.codebase_root)
-        if isinstance(res, dict):
-            self.assertFalse(res.get("success", False))
-            msg = res.get("message", "").lower()
-        else:
-            msg = str(res).lower()
-        self.assertTrue("prohibited" in msg or "not permitted" in msg)
+        with self.assertRaises(GuardBypassError):
+            executor.execute("organize_folder", self.codebase_root)
+
+        # Calling through action_router is blocked statically with BLOCK and produces no token
+        import action_router
+        step = {"action": "create_file", "parameter": f"{akira_py}|overwrite"}
+        outcome = action_router.run_guarded(
+            step,
+            lambda tok=None: executor.execute("create_file", f"{akira_py}|overwrite", guard_token=tok),
+        )
+        self.assertFalse(outcome.executed)
+        self.assertEqual(outcome.verdict.decision, "block")
 
     def test_destructive_command_checks(self):
         akira_py = os.path.join(self.codebase_root, "akira.py")

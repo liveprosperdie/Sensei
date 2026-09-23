@@ -39,6 +39,7 @@ from pycaw.pycaw import AudioUtilities
 
 import image_flow
 import system_control as _system_control
+from guard_rules import GuardToken, GuardBypassError
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -3713,18 +3714,46 @@ def _extract_document_text(fpath: str, max_chars: int = 24000) -> tuple[str | No
 _READ_ALOUD_MAX_CHARS = 400_000
 
 
-def read_file(parameter: str | None = None) -> dict:
-    """read_file|path — reads the file and speaks the FIRST CHUNK ONLY, then
-    asks whether to continue (see chunked_read). PDF and docx route through
-    _extract_document_text (same path summarize_file uses); other binary
-    formats are still refused.
+def _summarize_for_speech(text: str, filename: str) -> str:
+    """Generate a crisp 1-2 sentence spoken summary for voice output.
+    Uses gemini_content / groq if available, falling back cleanly to heuristic extraction."""
+    t_clean = (text or "").strip()
+    if not t_clean:
+        return f"{filename} is empty."
+    if len(t_clean) <= 200:
+        return f"{filename} reads: {t_clean}"
+    try:
+        import gemini_content
+        res = gemini_content.generate(
+            f"Summarize the following document content in 1 or 2 concise spoken sentences for a voice assistant. No markdown, no preambles: {t_clean[:4000]}",
+            "Output 1 to 2 clear spoken sentences describing what the file is and its main highlights. Plain spoken English.",
+            "short"
+        )
+        if res.get("success") and res.get("text"):
+            s = res["text"].strip().replace("\n", " ")
+            s = (s.replace("\u2011", "-")
+                  .replace("\u2013", "-")
+                  .replace("\u2014", "-")
+                  .replace("\u2018", "'")
+                  .replace("\u2019", "'")
+                  .replace("\u201c", '"')
+                  .replace("\u201d", '"'))
+            if len(s) > 15:
+                return s
+    except Exception:
+        pass
 
-    The chunking here bounds what is SPOKEN, not what is read off disk. The
-    full text is loaded and handed to chunked_read intact so the progress
-    count is honest and 'keep going' has something to continue into.
-    Internal-ingestion callers (summarize_file, file_to_doc) deliberately do
-    NOT come through here — they need the whole text at once.
-    """
+    # Fast offline fallback: extract clean title / opening line
+    lines = [ln.strip() for ln in t_clean.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    first_few = " ".join(lines[:2])[:150]
+    words = len(t_clean.split())
+    return f"{filename} is a {words}-word file covering {first_few}."
+
+
+def read_file(parameter: str | None = None) -> dict:
+    """read_file|path|[detailed] — summarizes the file by default and primes
+    chunked_read for detailed reading on follow-up. If 'detailed' is explicitly
+    passed, speaks the first chunk immediately."""
     print(f"[read_file] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
     fpath, err = _resolve_path(parts[0] if parts and parts[0] else None)
@@ -3733,6 +3762,9 @@ def read_file(parameter: str | None = None) -> dict:
     if not os.path.isfile(fpath):
         return {"success": False, "message": f"That file doesn't exist: {fpath}"}
     ext = os.path.splitext(fpath)[1].lower()
+    name = os.path.basename(fpath)
+    is_detailed = len(parts) > 1 and parts[1].strip().lower() in ("detail", "detailed", "full", "all", "verbatim")
+
     # PDFs/docx are extractable — same proven path summarize_file uses
     if ext in {".pdf", ".docx"}:
         text, xerr = _extract_document_text(fpath)
@@ -3740,31 +3772,41 @@ def read_file(parameter: str | None = None) -> dict:
             return {"success": False, "message": xerr}
         _remember(fpath)
         import chunked_read
-        first = chunked_read.begin(os.path.basename(fpath), text)
-        return {"success": True, "speak": True, "message": first["message"]}
+        if is_detailed:
+            first = chunked_read.begin(name, text)
+            return {"success": True, "speak": True, "message": first["message"]}
+        chunked_read.prime(name, text)
+        summary = _summarize_for_speech(text, name)
+        return {"success": True, "speak": True,
+                "message": f"{summary} Would you like me to read it in detail?",
+                "detail": f"File: {name}\n" + text[:2000]}
+
     # binary guard — reading an image/exe as text produces spoken garbage
     if ext in {".doc", ".xls", ".xlsx", ".ppt", ".pptx",
                ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".heic",
                ".mp3", ".mp4", ".wav", ".mkv", ".avi", ".mov", ".zip", ".rar",
                ".7z", ".exe", ".msi", ".dll", ".bin", ".iso"}:
         return {"success": False,
-                "message": f"{os.path.basename(fpath)} is a {ext[1:]} file — I can't read it as text. Say 'open it' and I'll launch it in the default app instead."}
+                "message": f"{name} is a {ext[1:]} file — I can't read it as text. Say 'open it' and I'll launch it in the default app instead."}
     try:
         with open(fpath, "rb") as f:
-            # Sniff for binary on a small prefix, then load the rest. The cap
-            # is a memory guard, NOT a reading-aloud limit — chunked_read does
-            # the spoken bounding.
             raw = f.read(_READ_ALOUD_MAX_CHARS)
         if b"\x00" in raw[:4000]:  # unknown binary format
             return {"success": False,
-                    "message": f"{os.path.basename(fpath)} looks like a binary file — I can't read it as text. Want me to open it instead?"}
+                    "message": f"{name} looks like a binary file — I can't read it as text. Want me to open it instead?"}
         content = raw.decode("utf-8", errors="replace")
     except Exception as e:
         return {"success": False, "message": f"Couldn't read the file: {e}"}
     _remember(fpath)
     import chunked_read
-    first = chunked_read.begin(os.path.basename(fpath), content)
-    return {"success": True, "speak": True, "message": first["message"]}
+    if is_detailed:
+        first = chunked_read.begin(name, content)
+        return {"success": True, "speak": True, "message": first["message"]}
+    chunked_read.prime(name, content)
+    summary = _summarize_for_speech(content, name)
+    return {"success": True, "speak": True,
+            "message": f"{summary} Would you like me to read it in detail?",
+            "detail": f"File: {name}\n" + content[:2000]}
 
 
 def read_more(parameter: str | None = None) -> dict:
@@ -3941,22 +3983,81 @@ def _resolve_targets(spec: str | None, root: str | None = None,
         if not part:
             continue
         p = _normalize_path(part)
+        p_name = os.path.basename(p) if os.path.sep in p else part
+        p_stem = os.path.splitext(p_name)[0].lower()
+
+        # 1. Exact match
         if os.path.isabs(p) and _ok(p):
             files.append(p)
-        elif any(ch in part for ch in "*?["):
+            continue
+
+        # 2. Check common extensions if given without extension
+        ext_hit = None
+        for ext in (".docx", ".pdf", ".txt", ".xlsx", ".csv", ".doc", ".png", ".jpg", ".zip"):
+            candidate = p + ext if os.path.isabs(p) else os.path.join(base, part + ext)
+            if _ok(candidate):
+                ext_hit = candidate
+                break
+        if ext_hit:
+            files.append(ext_hit)
+            continue
+
+        if any(ch in part for ch in "*?["):
             files.extend(f for f in glob.glob(os.path.join(base, part)) if _ok(f))
         elif _ok(os.path.join(base, part)):
             files.append(os.path.join(base, part))
-        else:  # partial name — must resolve unambiguously, never guess
-            hits = [os.path.join(base, fn) for fn in os.listdir(base)
-                    if part.lower() in fn.lower() and _ok(os.path.join(base, fn))]
+        else:  # partial name / stem — search directory tree and user folders
+            hits = []
+            # If path has a directory component, check it and its subdirectories (e.g. Downloads/Documents)
+            p_dir = os.path.dirname(p) if os.path.isabs(p) or os.path.sep in p else base
+            if os.path.isdir(p_dir):
+                for root_dir, dirs, fn_list in os.walk(p_dir):
+                    for fn in fn_list:
+                        if (p_stem in fn.lower() or part.lower() in fn.lower()) and _ok(os.path.join(root_dir, fn)):
+                            hits.append(os.path.join(root_dir, fn))
+                    if len(root_dir) > len(p_dir) + 30:  # don't walk too deep
+                        break
+
+            if not hits:
+                # Check user's Downloads, Documents, Desktop
+                for alt_dir in [
+                    os.path.join(os.path.expanduser("~"), "Downloads"),
+                    os.path.join(os.path.expanduser("~"), "Documents"),
+                    os.path.join(os.path.expanduser("~"), "Desktop")
+                ]:
+                    if os.path.isdir(alt_dir) and alt_dir != p_dir:
+                        for root_dir, dirs, fn_list in os.walk(alt_dir):
+                            for fn in fn_list:
+                                if (p_stem in fn.lower() or part.lower() in fn.lower()) and _ok(os.path.join(root_dir, fn)):
+                                    hits.append(os.path.join(root_dir, fn))
+                            if len(root_dir) > len(alt_dir) + 30:
+                                break
+                            if hits:
+                                break
+
+            if not hits:
+                # Finally, query the drive map
+                try:
+                    from file_index.scanner import lookup_in_drive_map
+                    for query_term in (p_stem, p_name, part):
+                        map_hits = lookup_in_drive_map(query_term)
+                        for mh in map_hits:
+                            mp = mh.get("path")
+                            if mp and _ok(mp) and mp not in hits:
+                                hits.append(mp)
+                        if hits:
+                            break
+                except Exception:
+                    pass
+
+            hits = list(dict.fromkeys(hits))  # preserve order, deduplicate
             if len(hits) == 1:
                 files.append(hits[0])
             elif len(hits) > 1:
                 names = ", ".join(os.path.basename(h) for h in hits[:6])
                 return [], base, f"'{part}' matches {len(hits)} items: {names}. Which ones?"
             else:
-                return [], base, f"I couldn't find '{part}' in {base}."
+                return [], base, f"I couldn't find '{part}' in {base} or your user folders."
     files = sorted(set(files))
     if not files:
         return [], base, f"Nothing matched '{spec}' in {base}."
@@ -4002,7 +4103,7 @@ def _gated(confirm_message: str, execute_fn) -> dict:
     """Standard gated-plan result — akira.py speaks confirm_message and runs
     execute_fn only after a spoken yes."""
     return {"needs_confirmation": True, "confirm_message": confirm_message,
-            "_execute": execute_fn}
+            "message": confirm_message, "_execute": execute_fn}
 
 
 # Spoken names for standard user folders — the LLM sends what the user SAYS
@@ -4106,11 +4207,16 @@ def open_folder(parameter: str | None = None) -> dict:
 
 
 def list_folder(parameter: str | None = None) -> dict:
-    """list_folder|name or path — speaks what's inside a folder so the user
-    can navigate by voice without looking. Ungated, read-only."""
+    """list_folder|name or path|[detailed] — speaks a concise summary of what's
+    inside a folder by default and primes chunked_read for detailed listing on follow-up.
+    If 'detailed' is passed, speaks the full listing. Ungated, read-only."""
     print(f"[list_folder] called with parameter={parameter!r}")
     global _vsc_last_folder
-    folder, err = _resolve_folder(parameter or _vsc_last_folder or "~")
+    parts = (parameter or "").split("|")
+    raw_folder = parts[0].strip() if parts and parts[0].strip() else None
+    is_detailed = len(parts) > 1 and parts[1].strip().lower() in ("detail", "detailed", "all", "full", "verbatim")
+
+    folder, err = _resolve_folder(raw_folder or _vsc_last_folder or "~")
     if err:
         return {"success": False, "message": err}
     if not os.path.isdir(folder):
@@ -4125,22 +4231,53 @@ def list_folder(parameter: str | None = None) -> dict:
     if not dirs and not files:
         return {"success": True, "speak": True, "message": f"{os.path.basename(folder) or folder} is empty."}
     name = os.path.basename(folder) or folder
-    # spoken message stays SHORT (10 named, "and X more") — but "detail"
-    # carries the COMPLETE list (cap 200) which record_action_results feeds
-    # to the LLM, so keep-list bulk deletes can reason over every name
-    spoken, full = [], []
+
+    full = []
     if dirs:
-        shown = ", ".join(dirs[:10]) + (f", and {len(dirs) - 10} more" if len(dirs) > 10 else "")
-        spoken.append(f"{len(dirs)} folder{'s' if len(dirs) != 1 else ''}: {shown}")
         full.append(f"{len(dirs)} folders: {', '.join(dirs[:200])}"
                     + (f" (+{len(dirs) - 200} more not shown)" if len(dirs) > 200 else ""))
     if files:
-        shown = ", ".join(files[:10]) + (f", and {len(files) - 10} more" if len(files) > 10 else "")
-        spoken.append(f"{len(files)} file{'s' if len(files) != 1 else ''}: {shown}")
         full.append(f"{len(files)} files: {', '.join(files[:200])}"
                     + (f" (+{len(files) - 200} more not shown)" if len(files) > 200 else ""))
+
+    if is_detailed:
+        spoken = []
+        if dirs:
+            shown = ", ".join(dirs[:10]) + (f", and {len(dirs) - 10} more" if len(dirs) > 10 else "")
+            spoken.append(f"{len(dirs)} folder{'s' if len(dirs) != 1 else ''}: {shown}")
+        if files:
+            shown = ", ".join(files[:10]) + (f", and {len(files) - 10} more" if len(files) > 10 else "")
+            spoken.append(f"{len(files)} file{'s' if len(files) != 1 else ''}: {shown}")
+        spoken_msg = f"In {name}: " + ". ".join(spoken) + "."
+    else:
+        total_items = len(dirs) + len(files)
+        if total_items <= 3:
+            all_items = [f"{d}/" for d in dirs] + files
+            spoken_msg = f"In {name}: {', '.join(all_items)}."
+        else:
+            cat_counts = {}
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                cat = next((c for c, exts in _ORGANIZE_CATEGORIES.items() if ext in exts), "other")
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+            top_cats = [f"{cat.lower()} ({n})" for cat, n in sorted(cat_counts.items(), key=lambda x: -x[1])[:2]]
+            types_str = f", mainly {', '.join(top_cats)}" if top_cats else ""
+            folder_str = f"{len(dirs)} folder{'s' if len(dirs) != 1 else ''}" if dirs else ""
+            file_str = f"{len(files)} file{'s' if len(files) != 1 else ''}" if files else ""
+            counts_str = " and ".join(filter(None, [folder_str, file_str]))
+            spoken_msg = f"{name} contains {counts_str}{types_str}. Would you like me to list them in detail?"
+
+            # Prime chunked_read so if user says "yes" or "read in detail", it lists them
+            import chunked_read
+            listing_lines = []
+            if dirs:
+                listing_lines.append(f"Folders in {name}:\n" + "\n".join(f"- {d}" for d in dirs[:50]))
+            if files:
+                listing_lines.append(f"Files in {name}:\n" + "\n".join(f"- {f}" for f in files[:100]))
+            chunked_read.prime(f"Contents of {name}", "\n\n".join(listing_lines))
+
     return {"success": True, "speak": True,
-            "message": f"In {name}: " + ". ".join(spoken) + ".",
+            "message": spoken_msg,
             "detail": f"COMPLETE listing of {folder}: " + ". ".join(full) + "."}
 
 
@@ -4219,6 +4356,7 @@ def move_files(parameter: str | None = None) -> dict:
     parts = (parameter or "").split("|")
     if len(parts) < 2 or not parts[1].strip():
         return {"success": False, "message": "Move needs files and a destination — move files|*.pdf|D:\\archive."}
+    is_confirmed = any(p.strip().lower() in ("confirmed", "yes", "true") for p in parts[2:])
     targets, _, err = _resolve_targets(parts[0], include_dirs=True)
     if err:
         return {"success": False, "message": err}
@@ -4229,6 +4367,10 @@ def move_files(parameter: str | None = None) -> dict:
     if derr:
         return {"success": False, "message": derr}
     pairs = [(t, os.path.join(dest, os.path.basename(t))) for t in targets]
+    if is_confirmed:
+        res = _move_batch(pairs)
+        res["speak"] = True
+        return res
     msg = (f"I'll move {_count_kinds(targets)} to {os.path.basename(dest) or dest}: "
            f"{_enumerate_files(targets)}. Should I go ahead?")
     return _gated(msg, lambda: _move_batch(pairs))
@@ -4247,8 +4389,9 @@ def delete_files(parameter: str | None = None) -> dict:
     Folders are deleted recursively — the confirmation says so explicitly."""
     print(f"[delete_files] called with parameter={parameter!r}")
     parts = (parameter or "").split("|")
+    is_confirmed = any(p.strip().lower() in ("confirmed", "yes", "true", "proceed", "go ahead") for p in parts[1:])
     targets, _, err = _resolve_targets(parts[0] if parts and parts[0] else None,
-                                       parts[1] if len(parts) > 1 else None,
+                                       parts[1] if len(parts) > 1 and parts[1].strip().lower() not in ("confirmed", "yes", "true") else None,
                                        include_dirs=True)
     if err:
         return {"success": False, "message": err}   # vague/ambiguous → ask, never guess
@@ -4273,6 +4416,10 @@ def delete_files(parameter: str | None = None) -> dict:
             return {"success": len(failed) < len(targets),
                     "message": f"Deleted {len(targets) - len(failed)}, but couldn't delete: {'; '.join(failed[:3])}"}
         return {"success": True, "message": f"Deleted {kinds}. That's permanent."}
+    if is_confirmed:
+        res = _do()
+        res["speak"] = True
+        return res
     warning = " Folders go with everything inside them." if n_dirs else ""
     msg = (f"This will permanently delete {kinds}: "
            f"{_enumerate_files(targets, limit=15)}.{warning} Are you sure?")
@@ -4292,9 +4439,12 @@ _ORGANIZE_CATEGORIES = {
 
 def organize_folder(parameter: str | None = None) -> dict:
     """organize_folder|folder — plans category subfolders by extension,
-    GATED with a spoken per-category enumeration."""
+    GATED with a spoken per-category enumeration. If confirmed, executes directly."""
     print(f"[organize_folder] called with parameter={parameter!r}")
-    folder, err = _resolve_path(parameter, want_dir=True)
+    parts = (parameter or "").split("|")
+    raw_folder = parts[0].strip() if parts else parameter
+    is_confirmed = len(parts) > 1 and parts[1].strip().lower() in ("confirmed", "yes", "true", "proceed", "go ahead")
+    folder, err = _resolve_path(raw_folder, want_dir=True)
     if err:
         return {"success": False, "message": err}
     import security_guard
@@ -4313,9 +4463,17 @@ def organize_folder(parameter: str | None = None) -> dict:
         counts[cat] = counts.get(cat, 0) + 1
     if not pairs:
         return {"success": False, "message": f"There are no loose files to organize in {folder}."}
-    summary = ", ".join(f"{n} to {cat}" for cat, n in sorted(counts.items()))
-    msg = (f"I'll organize {len(pairs)} files in {os.path.basename(folder)} into subfolders: "
-           f"{summary}. Should I go ahead?")
+    if is_confirmed:
+        res = _move_batch(pairs)
+        res["speak"] = True
+        return res
+    top_cats = sorted(counts.items(), key=lambda x: -x[1])[:2]
+    cat_summary = " and ".join(f"{cat} ({n})" for cat, n in top_cats)
+    other_count = sum(n for cat, n in counts.items() if cat not in dict(top_cats))
+    if other_count > 0:
+        cat_summary += f", plus {other_count} other files"
+    msg = (f"I found {len(pairs)} loose files in {os.path.basename(folder)}, mainly {cat_summary}. "
+           f"Should I organize them into category subfolders?")
     return _gated(msg, lambda: _move_batch(pairs))
 
 
@@ -5105,11 +5263,14 @@ def spotify_control(action: str, parameter: str | None = None) -> dict:
         if action == "play":
             if not parameter:
                 return {"success": False, "message": "Play what? Give me a track or artist."}
-            res = sp.search(parameter, limit=1, type="track")
+            # Search limit=5 avoids Spotify's limit=1 ranker anomaly and enables title/artist matching
+            res = sp.search(parameter, limit=5, type="track")
             items = res.get("tracks", {}).get("items", [])
             if not items:
                 return {"success": False, "message": f"Couldn't find '{parameter}' on Spotify."}
-            t = items[0]
+            want = (parameter or "").strip().lower()
+            best_track = next((t for t in items if want in t["name"].lower() or any(want in a["name"].lower() for a in t["artists"])), items[0])
+            t = best_track
             sp.start_playback(device_id=dev_id, uris=[t["uri"]])
             msg = f"Playing {t['name']} by {t['artists'][0]['name']} on {device.get('name')}."
             if path == "remote fallback":
@@ -5379,14 +5540,16 @@ def _find_exe(name: str) -> str | None:
 
 def _activate_launched_window(name: str) -> None:
     """Best-effort bring-to-foreground for a freshly launched application.
-    Waits up to 2s for the window to appear, then activates it."""
+    Fast-polls synchronously up to 0.8s for light apps, then continues polling
+    in a background thread up to 6.0s for slow Electron apps (Spotify, Discord, VSCode)
+    so open_application never blocks or prints false failures.
+    """
     title_hint = WINDOW_TITLE_MAP.get(name.lower(), name.title())
-    for _ in range(10):
-        time.sleep(0.2)
+
+    def _try_focus() -> bool:
         try:
             wins = gw.getWindowsWithTitle(title_hint)
             if not wins:
-                # Also try partial match on the raw name
                 for w in gw.getAllWindows():
                     if name.lower() in (w.title or "").lower():
                         wins = [w]
@@ -5396,10 +5559,26 @@ def _activate_launched_window(name: str) -> None:
                 win32gui.ShowWindow(hwnd, 5)          # SW_SHOW
                 win32gui.SetForegroundWindow(hwnd)
                 print(f"[open_application] activated window hwnd={hwnd} title={wins[0].title!r}")
-                return
+                return True
         except Exception as e:
-            print(f"[open_application] SetForegroundWindow attempt: {e}")
-    print(f"[open_application] could not find window for {name!r} after 2s")
+            pass
+        return False
+
+    # 1. Fast synchronous attempts (0.8s) for snappy local apps
+    for _ in range(4):
+        time.sleep(0.2)
+        if _try_focus():
+            return
+
+    # 2. Asynchronous background poll up to 6s for slow cold-starts
+    def _bg_poll():
+        for _ in range(12):
+            time.sleep(0.5)
+            if _try_focus():
+                return
+        print(f"[open_application] background window check ended for {name!r}")
+
+    threading.Thread(target=_bg_poll, daemon=True).start()
 
 
 def _open_single_app(name: str) -> str:
@@ -5519,7 +5698,11 @@ def close_application(parameter: str) -> str:
         return "Closed everything."
     apps = [p.strip() for p in parameter.split(",") if p.strip()]
     if not apps:
-        return "No application specified."
+        fg = get_foreground_app()
+        if not fg:
+            return "No application specified."
+        target = fg[:-4] if fg.lower().endswith(".exe") else fg
+        apps = [target]
     results = [_close_single_app(app) for app in apps]
     return " ".join(results)
 
@@ -5528,6 +5711,10 @@ def adjust_volume(parameter: str) -> str:
     devices = AudioUtilities.GetSpeakers()
     volume = devices.EndpointVolume
     param = parameter.lower().strip()
+    if param in ("up", "higher", "louder"):
+        param = "+10"
+    elif param in ("down", "lower", "softer"):
+        param = "-10"
     if param in MUTE_MAP:
         volume.SetMute(MUTE_MAP[param], None)
         return f"Volume {'muted' if MUTE_MAP[param] else 'unmuted'}."
@@ -5584,32 +5771,135 @@ def screenshot() -> dict:
 # (see _ACTION_MAP aliases) so power handling has a single implementation.
 
 
+def _normalize_win_text(text: str) -> str:
+    """Normalize window title / query for robust matching.
+    - Case-insensitive
+    - Map number words to digits ('one' -> '1', 'four' -> '4')
+    - Normalize number-letter adjacency ('Book1' <-> 'book 1')
+    - Strip punctuation and excess whitespace
+    """
+    import re
+    if not text:
+        return ""
+    t = text.lower().strip()
+    # Word numbers to digits
+    num_words = {
+        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+        "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+        "first": "1", "second": "2", "third": "3", "fourth": "4",
+    }
+    for word, digit in num_words.items():
+        t = re.sub(r"\b" + word + r"\b", digit, t)
+    # Insert space between letters and numbers: "book1" -> "book 1"
+    t = re.sub(r"([a-z])(\d+)", r"\1 \2", t)
+    t = re.sub(r"(\d+)([a-z])", r"\1 \2", t)
+    # Strip non-alphanumeric punctuation
+    t = re.sub(r"[^\w\s]", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
 def _find_window(param: str):
-    for win in gw.getAllWindows():
-        if win.title and param in win.title.lower():
+    """Locate open window using multi-stage normalized and token-based matching."""
+    import re
+    raw_param = (param or "").strip()
+    if not raw_param:
+        return None
+
+    norm_param = _normalize_win_text(raw_param)
+    param_tokens = set(norm_param.split()) if norm_param else set()
+    collapsed_param = re.sub(r"\s+", "", norm_param)
+
+    all_windows = []
+    try:
+        all_windows = list(gw.getAllWindows())
+    except Exception:
+        all_windows = []
+
+    # Stage 1: Exact / substring match on normalized title
+    for win in all_windows:
+        if not win.title:
+            continue
+        norm_title = _normalize_win_text(win.title)
+        collapsed_title = re.sub(r"\s+", "", norm_title)
+        if raw_param.lower() in win.title.lower():
             return win
-    for win in gw.getAllWindows():
+        if norm_param and norm_param in norm_title:
+            return win
+        if collapsed_param and (collapsed_param in collapsed_title or collapsed_title in collapsed_param):
+            return win
+
+    # Stage 2: Token overlap on title
+    if param_tokens:
+        best_win = None
+        best_score = 0
+        for win in all_windows:
+            if not win.title:
+                continue
+            norm_title = _normalize_win_text(win.title)
+            title_tokens = set(norm_title.split())
+            overlap = len(param_tokens & title_tokens)
+            if overlap > best_score and overlap >= len(param_tokens) * 0.5:
+                best_score = overlap
+                best_win = win
+        if best_win:
+            return best_win
+
+    # Stage 3: Process name matching
+    for win in all_windows:
         if not win.title:
             continue
         try:
             _, pid = win32process.GetWindowThreadProcessId(win._hWnd)
             proc = psutil.Process(pid)
-            if param in proc.name().lower():
+            p_name = proc.name().lower()
+            if raw_param.lower() in p_name or norm_param in p_name:
                 return win
         except Exception:
             continue
+
+    # Stage 4: Semantic application fallbacks
+    app_synonyms = {
+        "excel": ("excel", "sheet", "spreadsheet", "book", "workbook"),
+        "word": ("word", "winword", "doc", "document"),
+        "powerpoint": ("powerpoint", "powerpnt", "presentation", "slide", "slides", "deck"),
+        "spotify": ("spotify", "music", "playlist"),
+        "chrome": ("chrome", "browser", "tab", "web"),
+        "code": ("code", "vscode", "visual studio code"),
+    }
+    for app_key, synonyms in app_synonyms.items():
+        if any(syn in norm_param.split() or syn in raw_param.lower() for syn in synonyms):
+            for win in all_windows:
+                if not win.title:
+                    continue
+                t_lower = win.title.lower()
+                if any(syn in t_lower for syn in synonyms):
+                    return win
+                try:
+                    _, pid = win32process.GetWindowThreadProcessId(win._hWnd)
+                    proc = psutil.Process(pid)
+                    if app_key in proc.name().lower():
+                        return win
+                except Exception:
+                    continue
+
     return None
 
 
 def switch_window(parameter: str) -> str:
-    win = _find_window(parameter.lower().strip())
+    param_clean = (parameter or "").strip()
+    win = _find_window(param_clean)
     if win:
         try:
             win.activate()
         except Exception:
             pass
-        return f"Switched to {parameter}."
+        return f"Switched to {win.title or parameter}."
+
+    open_titles = [w.title for w in gw.getAllWindows() if w.title and w.title.strip()]
+    if open_titles:
+        return f"Couldn't find {parameter}. Open windows: {', '.join(open_titles[:4])}."
     return f"Couldn't find {parameter}."
+
 
 
 def maximize_window(parameter: str) -> str:
@@ -5680,12 +5970,54 @@ def new_tab(parameter: str | None = None) -> str:
 
 
 def open_site_tab(parameter: str) -> str:
-    """Opens the requested site in a NEW tab — never reuses the pre-warmed
-    Akira tab.  Named-site opens ("open youtube") should always produce a
-    fresh tab; the _akira_tab handle is updated so subsequent control
-    operations (click, scroll, fill) target the new page."""
+    """Opens the requested site. If an existing tab for this site is already open,
+    switches to that tab instead of opening a redundant new tab.
+    Only creates a new tab if no existing matching tab is found."""
     browser = get_browser(_last_browser_name)
+    site_clean = (parameter or "").strip().lower()
     url = resolve_site_url(parameter.strip())
+
+    # Extract site keyword (e.g., 'youtube', 'amazon', 'netflix', 'github')
+    site_keyword = site_clean.replace("https://", "").replace("http://", "").replace("www.", "").split(".")[0]
+    if not site_keyword or len(site_keyword) < 3:
+        site_keyword = site_clean
+
+    matching_handle = None
+    original_handle = None
+    try:
+        original_handle = browser.current_window_handle
+    except Exception:
+        pass
+
+    try:
+        for handle in browser.window_handles:
+            try:
+                browser.switch_to.window(handle)
+                cur_url = (browser.current_url or "").lower()
+                cur_title = (browser.title or "").lower()
+                if site_keyword in cur_url or site_keyword in cur_title or (url.lower() in cur_url):
+                    matching_handle = handle
+                    break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    if matching_handle:
+        browser.switch_to.window(matching_handle)
+        browser._akira_tab = matching_handle
+        if "youtube" in site_clean:
+            browser._youtube_target_tab = matching_handle
+            global _last_youtube_tab_handle
+            _last_youtube_tab_handle = matching_handle
+        return f"Switched to existing {parameter} tab."
+
+    # Restore original window if no match was found during inspection
+    if original_handle:
+        try:
+            browser.switch_to.window(original_handle)
+        except Exception:
+            pass
 
     existing = set(browser.window_handles)
     browser.execute_cdp_cmd("Target.createTarget", {"url": url})
@@ -5696,7 +6028,6 @@ def open_site_tab(parameter: str) -> str:
             browser._akira_tab = new_handles[0]
             if "youtube" in parameter.lower():
                 browser._youtube_target_tab = new_handles[0]
-                global _last_youtube_tab_handle
                 _last_youtube_tab_handle = new_handles[0]
             return f"Opened {parameter} in a new tab."
         time.sleep(0.02)
@@ -6129,7 +6460,15 @@ def _bookmark() -> str:
         return "Couldn't bookmark."
 
 
-def execute(action: str, parameter) -> str | dict:
+def execute(action: str, parameter, guard_token: GuardToken | None = None) -> str | dict:
+    if guard_token is None:
+        raise GuardBypassError(
+            f"GUARD bypass rejected: execution of {action!r} structurally blocked (missing required GuardToken)."
+        )
+    if not isinstance(guard_token, GuardToken) or not guard_token.is_valid_for(action, parameter):
+        raise GuardBypassError(
+            f"GUARD bypass rejected: execution of {action!r} structurally blocked (invalid, forged, or mismatched GuardToken)."
+        )
     handler = _ACTION_MAP.get(action)
     if handler:
         try:

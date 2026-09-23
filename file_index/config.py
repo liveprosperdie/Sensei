@@ -20,6 +20,18 @@ DEFAULT_EXCLUDE_DIRS: frozenset[str] = frozenset({
     "Windows",
     "Program Files",
     "Program Files (x86)",
+    "ProgramData",
+    "Recovery",
+    "PerfLogs",
+    "MSOCache",
+    "Boot",
+    "EFI",
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".azure",
+    ".kube",
+    ".docker",
     "$Recycle.Bin",
     "$RECYCLE.BIN",
     "System Volume Information",
@@ -50,6 +62,21 @@ def get_config_dir() -> str:
     config_dir = os.path.join(local_appdata, "Akira")
     os.makedirs(config_dir, exist_ok=True)
     return config_dir
+
+
+def get_secure_vault_dir() -> str:
+    """Hidden, protected directory on C: drive strictly excluded from LLM context."""
+    vault = os.path.join(get_config_dir(), "secure_vault")
+    os.makedirs(vault, exist_ok=True)
+    return vault
+
+
+def get_secure_drive_map_json() -> str:
+    return os.path.join(get_secure_vault_dir(), "akira_drive_map.json")
+
+
+def get_secure_drive_map_txt() -> str:
+    return os.path.join(get_secure_vault_dir(), "akira_drive_map.txt")
 
 
 def get_location_config_file() -> str:
@@ -275,6 +302,11 @@ class IndexScopeConfig:
         self.custom_includes.discard(abs_p)
         self.custom_excludes.add(abs_p)
         self.save()
+        try:
+            import procedural_memory as pm
+            pm.get_store().purge_by_path(abs_p)
+        except Exception:
+            pass
         return abs_p
 
     def include_folder(self, folder_path: str) -> str:

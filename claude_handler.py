@@ -2026,9 +2026,11 @@ def record_action_results(results: list) -> None:
 _ACTION_REPLY_PROMPT = (
     "You are Akira, a voice assistant. The last [ACTION RESULT] message "
     "contains the outcome of the action(s) just executed for the user's request. "
-    "Summarize the actual outcome in 1 to 4 natural spoken sentences. "
+    "Summarize the actual outcome in 1 to 2 concise, natural spoken sentences. "
     "Acknowledge ALL steps that were executed, including early successful steps and any failures. "
     "Be direct and clear about what succeeded and what failed. "
+    "NEVER recite long lists of file names, folder contents, cell values, or steps/tutorials on how to make files. "
+    "If an action read a file or folder, summarize what was found and ask if the user wants details. "
     "Plain conversational language — no markdown, no bullet points, no lists, "
     "nothing that sounds broken read aloud. "
     "CRITICAL: Output ONLY pure spoken English prose sentences to be read aloud by TTS. "
@@ -2081,21 +2083,45 @@ def synthesize_action_reply() -> str | None:
     try:
         servant = servant_or_none("synthesize_action_reply")
         text = _synthesize_on_servant(servant, messages) if servant else None
+        if text and text.strip().lower() in ("unsupported_intent", "no_match", "none", "unknown"):
+            text = None
         if text is None:
-            message = client.messages.create(
-                model=HAIKU_MODEL,
-                max_tokens=_ACTION_REPLY_TOKENS_BRAIN,
-                system=_ACTION_REPLY_PROMPT,
-                messages=messages,
-            )
-            text = response_text(message).strip()
+            # 1. Try Groq free synthesis first
+            groq_key = (os.environ.get("GROQ_API_KEY") or os.environ.get("SPEECH_API_KEY") or "").strip()
+            if groq_key:
+                try:
+                    from groq import Groq
+                    g_client = Groq(api_key=groq_key)
+                    g_model = os.environ.get("GROQ_ESCALATION_MODEL", "openai/gpt-oss-120b")
+                    g_resp = g_client.chat.completions.create(
+                        model=g_model,
+                        messages=[{"role": "system", "content": _ACTION_REPLY_PROMPT}] + [{"role": m["role"], "content": m["content"]} for m in messages],
+                        max_tokens=_ACTION_REPLY_TOKENS,
+                        temperature=0.3,
+                        timeout=8.0,
+                    )
+                    text = (g_resp.choices[0].message.content or "").strip()
+                except Exception as _g_err:
+                    print(f"[synthesize_action_reply] Groq free synthesis error: {_g_err}")
+
+            # 2. Ultimate last-resort fallback: Claude Haiku if free tiers failed
+            from tiered_config import is_claude_disabled
+            if text is None and not is_claude_disabled() and client is not None:
+                print("[synthesize_action_reply] Free tiers exhausted — falling back to Claude as ultimate last option")
+                message = client.messages.create(
+                    model=HAIKU_MODEL,
+                    max_tokens=_ACTION_REPLY_TOKENS_BRAIN,
+                    system=_ACTION_REPLY_PROMPT,
+                    messages=messages,
+                )
+                text = response_text(message).strip()
         if not text:
             return None
 
         # Clean out any JSON envelopes, quotes, or thoughts that the LLM may have emitted
         import llm_json
         text = llm_json.extract_spoken_text(text)
-        if not text:
+        if not text or text.strip().lower() in ("unsupported_intent", "no_match", "(noted)", "none", "unknown"):
             return None
 
         # keep history honest: what Akira actually SAID replaces the stub ack —
@@ -2338,6 +2364,54 @@ def is_speaker_echo(mic_chunk: np.ndarray) -> bool:
         return False
 
 
+_prepped_tts_cache: dict[str, tuple] = {}
+_prepped_tts_lock = threading.Lock()
+
+
+def prepare_tts(text: str) -> None:
+    """Non-blocking background pre-synthesis of TTS audio to hide synthesis latency behind GUARD."""
+    if not text or not text.strip():
+        return
+    import llm_json
+    clean = llm_json.extract_spoken_text(text)
+    if not clean or not clean.strip():
+        return
+
+    def _worker():
+        try:
+            import edge_tts, asyncio, tempfile, os
+            import soundfile as sf, scipy.signal
+            import numpy as np
+
+            async def _synth():
+                comm = edge_tts.Communicate(clean.strip(), "en-US-AvaNeural")
+                with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+                    tmp_p = f.name
+                await comm.save(tmp_p)
+                return tmp_p
+
+            tmp_path = asyncio.run(_synth())
+            data, fs = sf.read(tmp_path)
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+            if data.ndim > 1:
+                data_mono = np.mean(data, axis=1).astype(np.float32)
+            else:
+                data_mono = data.astype(np.float32)
+            if fs != 16000:
+                data_16k = scipy.signal.resample_poly(data_mono, 16000, fs).astype(np.float32)
+            else:
+                data_16k = data_mono
+            with _prepped_tts_lock:
+                _prepped_tts_cache[clean.strip()] = (data, fs, data_16k)
+        except Exception:
+            pass
+
+    threading.Thread(target=_worker, name="tts_pre_synth", daemon=True).start()
+
+
 def speak(text: str) -> None:
     """Fast, low-latency TTS pipeline (sub-2s responses) with pyttsx3 fallback."""
     global _current_tts_audio, _current_tts_audio_16k, _current_tts_fs, _playback_start_time
@@ -2350,6 +2424,38 @@ def speak(text: str) -> None:
         return
 
     _tts_stop_event.clear()
+
+    # Check pre-synthesized cache first (prepared concurrently with GUARD)
+    prepped = None
+    with _prepped_tts_lock:
+        if text.strip() in _prepped_tts_cache:
+            prepped = _prepped_tts_cache.pop(text.strip())
+
+    if prepped:
+        try:
+            import sounddevice as sd
+            data, fs, data_16k = prepped
+            with _current_tts_lock:
+                _current_tts_audio = data.astype(np.float32)
+                _current_tts_audio_16k = data_16k
+                _current_tts_fs = fs
+
+            with _tts_engine_lock:
+                if not _tts_stop_event.is_set():
+                    with _current_tts_lock:
+                        _playback_start_time = time.time()
+                    sd.play(data, fs)
+                    while not _tts_stop_event.is_set():
+                        stream_obj = sd.get_stream()
+                        if stream_obj is None or not stream_obj.active:
+                            break
+                        time.sleep(0.01)
+                    if _tts_stop_event.is_set():
+                        sd.stop()
+                        print("[TTS] Playback interrupted by user barge-in.")
+            return
+        except Exception as _play_err:
+            pass
 
     # 1. Fast Edge-TTS Neural Pipeline (~1.2s latency)
     try:

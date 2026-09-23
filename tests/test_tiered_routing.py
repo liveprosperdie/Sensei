@@ -219,7 +219,7 @@ class TestTieredRoutingIntegration(unittest.TestCase):
         self.assertEqual(len(res.sub_tasks), 3)
 
         envelope = akira.get_akira_response(multi_cmd, raw_text=multi_cmd)
-        self.assertEqual(envelope.get("mode"), "action")
+        self.assertEqual(envelope.get("mode"), "command")
         actions = envelope.get("actions", [])
         self.assertEqual(len(actions), 3)
         self.assertEqual(actions[0]["parameter"], "notepad")

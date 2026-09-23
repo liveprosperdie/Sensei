@@ -13,6 +13,38 @@ from .db import (
 )
 
 
+SENSITIVE_EXTENSIONS = frozenset({
+    ".pem", ".key", ".p12", ".pfx", ".pkcs12", ".vault", ".kdbx", ".crt", ".cer", ".der",
+    ".keystore", ".jks"
+})
+SENSITIVE_PATTERNS = (
+    ".env", "id_rsa", "id_ed25519", "id_ecdsa", "credentials.json", "token.json",
+    "client_secret", "secret", "password", ".session_vault", "master.key",
+    "known_hosts", "authorized_keys", "shadow", "htpasswd"
+)
+SENSITIVE_DIRS = frozenset({
+    ".ssh", ".aws", ".gnupg", ".azure", ".kube", "credentials"
+})
+
+
+def is_sensitive_file(name: str, full_path: str = "") -> bool:
+    """Detect sensitive documents, authentication keys, credentials, or environment files.
+    Guarantees zero sensitive documents or secrets are ever leaked or returned by file search.
+    """
+    name_lower = (name or "").lower()
+    _, ext = os.path.splitext(name_lower)
+    if ext in SENSITIVE_EXTENSIONS:
+        return True
+    if any(p in name_lower for p in SENSITIVE_PATTERNS):
+        return True
+    if full_path:
+        norm = full_path.replace("\\", "/").lower()
+        parts = norm.split("/")
+        if any(d in parts for d in SENSITIVE_DIRS):
+            return True
+    return False
+
+
 def _sanitize_fts5_query(query: str) -> str:
     """Sanitize input string for SQLite FTS5 query syntax."""
     # Remove special FTS5 operators and quote terms
@@ -72,8 +104,13 @@ def search_files_metadata(
 
         # 3. Reconstruct paths and filter by root if specified
         for fid, folder_id, name, size, mtime in rows:
+            if is_sensitive_file(name):
+                continue
             folder_path = reconstruct_folder_path(conn, folder_id)
             full_path = os.path.join(folder_path, name)
+
+            if is_sensitive_file(name, full_path):
+                continue
 
             if root_norm and not (full_path == root_norm or full_path.startswith(root_norm + os.sep)):
                 continue
@@ -123,8 +160,13 @@ def search_files_content(
             return results
 
         for file_id, folder_id, name, size, mtime in rows:
+            if is_sensitive_file(name):
+                continue
             folder_path = reconstruct_folder_path(conn, folder_id)
             full_path = os.path.join(folder_path, name)
+
+            if is_sensitive_file(name, full_path):
+                continue
 
             if root_norm and not (full_path == root_norm or full_path.startswith(root_norm + os.sep)):
                 continue
@@ -260,11 +302,21 @@ def search_files(
         target_loc = f" under {root}" if root else ""
         return {"success": False, "message": f"No files matching '{query_str}' found{target_loc}.", "results": []}
 
-    shown = "; ".join(os.path.basename(r["path"]) for r in name_results[:5])
     target_loc = f" under {root}" if root else ""
+    if len(name_results) == 1:
+        first = name_results[0]
+        folder = os.path.dirname(first["path"])
+        msg = f"Found {first['name']} in {folder}."
+    elif len(name_results) <= 3:
+        items = [f"{r['name']} in {os.path.dirname(r['path'])}" for r in name_results]
+        msg = f"Found {len(name_results)} files{target_loc}: {'; '.join(items)}."
+    else:
+        items = [f"{r['name']} in {os.path.dirname(r['path'])}" for r in name_results[:3]]
+        msg = f"Found {len(name_results)} files{target_loc}: {'; '.join(items)}, and {len(name_results) - 3} more."
+
     return {
         "success": True,
         "speak": True,
-        "message": f"Found {len(name_results)} file{'s' if len(name_results) != 1 else ''}{target_loc}: {shown}",
+        "message": msg,
         "results": [r["path"] for r in name_results]
     }

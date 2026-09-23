@@ -157,9 +157,11 @@ class ContentExtractionWorker:
                 with _db_lock:
                     with conn:
                         cur = conn.cursor()
-                        # Clean any previous chunks
                         cur.execute("DELETE FROM content_chunks WHERE file_id = ?;", (file_id,))
-                        cur.execute("DELETE FROM content_fts WHERE rowid = ?;", (file_id,))
+                        try:
+                            cur.execute("DELETE FROM content_fts WHERE rowid = ?;", (file_id,))
+                        except sqlite3.OperationalError:
+                            pass
 
                         if extracted_text and extracted_text.strip():
                             # Chunk into segments, compress with zlib

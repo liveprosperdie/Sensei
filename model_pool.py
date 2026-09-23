@@ -309,7 +309,7 @@ def _try_local_floor_fallback(
 # Models are partitioned into High and Standard quality tiers.
 
 DEFAULT_MODELS: list[ModelEndpoint] = [
-    # ── High Quality Tier: Superior reasoning, instruction following, and schema precision
+    # ── High Quality Tier: Superior reasoning, instruction following, and schema precision (>= 27B)
     ModelEndpoint(
         provider="groq",
         model_id="openai/gpt-oss-120b",
@@ -323,16 +323,6 @@ DEFAULT_MODELS: list[ModelEndpoint] = [
     ModelEndpoint(
         provider="groq",
         model_id="qwen/qwen3.8-27b",
-        param_class="27B",
-        rpm_limit=30,
-        rpd_limit=1000,
-        key_env="GROQ_API_KEY",
-        base_url="https://api.groq.com/openai/v1",
-        quality_tier="high",
-    ),
-    ModelEndpoint(
-        provider="groq",
-        model_id="qwen/qwen3.6-27b",
         param_class="27B",
         rpm_limit=30,
         rpd_limit=1000,
@@ -695,10 +685,10 @@ class ModelPoolManager:
                     self.unpin_session_model(session_id)
                     backoff = parse_reset_seconds(
                         resp.headers.get("retry-after") or
-                        resp.headers.get("x-ratelimit-reset-requests") or
-                        resp.headers.get("x-ratelimit-reset-requests-minute") or
-                        15.0
-                    ) or 15.0
+                        resp.headers.get("x-ratelimit-reset-tokens") or
+                        10.0
+                    ) or 10.0
+                    backoff = min(max(backoff, 2.0), 15.0)
                     state.record_429(backoff, time.monotonic())
                     retries += 1
                     print(f"[model_pool] 429 on {endpoint.full_name} (cooling {backoff:.1f}s). Failing over to next model...")
