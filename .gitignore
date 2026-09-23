@@ -42,6 +42,8 @@ tests/*_results.json
 # models
 *.onnx
 *.onnx.data
+!akira.onnx
+!akira.onnx.data
 *.gguf
 *.bin
 Akira/

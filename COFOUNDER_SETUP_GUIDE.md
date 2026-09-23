@@ -96,9 +96,8 @@ Because the repository enforces strict safety and data-minimization, sensitive f
 - **Where to put it:** Place `chromedriver.exe` directly in the project root directory. (The codebase also supports automatic resolution via `webdriver-manager`).
 
 ### 2. Custom Wake Word Models (`akira.onnx`, `akira.onnx.data`)
-- **What it is:** OpenWakeWord custom model files trained for the wake phrase *"Akira"*.
-- **Where to get it:** Ask the team for the pinned `akira.onnx` and `akira.onnx.data` binary files, or let openWakeWord use its built-in pre-trained models.
-- **Where to put it:** Place directly in the project root.
+- **Status:** **Included in the repository.** Pinned custom openWakeWord models for *"Akira"* are already present in the project root.
+- **Action required:** None! Akira will automatically detect and load `akira.onnx` on launch.
 
 ### 3. Local GGUF LLMs (`Akira/*.gguf`)
 - **What it is:** Optional local LoRA adapters and 8B quantization models (`Llama-3-8B-Instruct.Q4_K_M.gguf`, `akira_mech.gguf`, etc.).
