@@ -2,7 +2,7 @@
 
     Plugin: https://github.com/coddingtonbear/obsidian-local-rest-api
     Requires plugin >= 5.0.2 on Obsidian >= 1.13.1. Latest is fine (and
-    preferred). See SETUP_OBSIDIAN_FOCUS_MODE.md.
+    preferred).
 
 WHY REST AND NOT THE PLUGIN'S BUILT-IN MCP SERVER
 -------------------------------------------------

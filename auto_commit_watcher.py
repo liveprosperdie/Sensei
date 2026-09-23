@@ -7,8 +7,6 @@ from watchdog.events import FileSystemEventHandler
 WATCHED_FILES = [
     ".vscode",
     ".gitignore",
-    "OBSIDIAN_FOCUS_MODE_PLAN.md",
-    "SETUP_OBSIDIAN_FOCUS_MODE.md",
     "action_guard.py",
     "action_router.py",
     "avatar_ui.py",
