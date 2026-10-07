@@ -1157,6 +1157,31 @@ def _try_fast_path_regex(utterance: str) -> dict[str, Any] | None:
     if t in ("new tab", "open a new tab", "open tab"):
         return {"mode": "command", "action": "new_tab", "parameter": "", "actions": [{"action": "new_tab", "parameter": ""}], "response": "Opening a new tab.", "confirmation_required": False, "end_session": False}
 
+    # 4b. Teaching Mode / Study Room Reflex
+    if t in ("open study room", "launch study room", "study room", "open teaching mode", "start teaching mode", "teaching mode"):
+        return {
+            "mode": "command",
+            "action": "open_study_room",
+            "parameter": "",
+            "actions": [{"action": "open_study_room", "parameter": ""}],
+            "response": "Opening your study room.",
+            "confirmation_required": False,
+            "end_session": False,
+        }
+    study_m = re.match(r"^(?:open\s+study\s+room\s+for|teach\s+me\s+(?:about\s+)?|study\s+)(.+)$", t)
+    if study_m:
+        topic_arg = study_m.group(1).strip()
+        if topic_arg and len(topic_arg) > 1 and not topic_arg.startswith(("window", "tab", "application", "music")):
+            return {
+                "mode": "command",
+                "action": "open_study_room",
+                "parameter": topic_arg,
+                "actions": [{"action": "open_study_room", "parameter": topic_arg}],
+                "response": f"Opening your study room for {topic_arg}.",
+                "confirmation_required": False,
+                "end_session": False,
+            }
+
     # 5. System Utilities
     if t in ("lock", "lock pc", "lock the computer", "lock screen"):
         return {"mode": "command", "action": "lock_pc", "parameter": "", "actions": [{"action": "lock_pc", "parameter": ""}], "response": "Locking your PC.", "confirmation_required": False, "end_session": False}

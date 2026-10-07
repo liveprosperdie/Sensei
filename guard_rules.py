@@ -269,6 +269,7 @@ ACTION_RULES: dict[str, Rule] = {
     "manage_index_scope": SUB,
     "index_stats": IGNORED,
     "open_file": OPAQUE_TEXT,
+    "open_study_room": OPT_OPAQUE_TEXT,
     "open_folder": OPAQUE_TEXT,
     "list_folder": OPT_OPAQUE_TEXT,
     "copy_files": SUB_FREE_TEXT,

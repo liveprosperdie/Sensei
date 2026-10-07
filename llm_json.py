@@ -225,7 +225,11 @@ def parse(raw: str) -> tuple[dict | None, dict]:
                   f"keys={list(obj)}")
             return obj, info
 
-    print(f"[llm_json] unrepairable: {text[:300]!r}")
+    try:
+        print(f"[llm_json] unrepairable: {text[:300]!r}")
+    except Exception:
+        safe_repr = text[:300].encode("ascii", errors="backslashreplace").decode("ascii")
+        print(f"[llm_json] unrepairable: {safe_repr}")
     return None, info
 
 

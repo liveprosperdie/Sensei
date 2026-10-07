@@ -152,6 +152,7 @@ ROLLBACK: dict[str, Rollback] = {
     "switch_tab": Rollback.SAFE,
     "open_folder": Rollback.SAFE,       # opens Explorer; no state change
     "open_file": Rollback.SAFE,         # opens in the default app; no content change
+    "open_study_room": Rollback.SAFE,   # opens the local browser study room; no vault mutation
     "open_application": Rollback.SAFE,  # closable, though see close_application (gated)
     "open_settings": Rollback.SAFE,
     "open_system_tool": Rollback.SAFE,

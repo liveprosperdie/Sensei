@@ -4307,6 +4307,21 @@ def open_file(parameter: str | None = None) -> dict:
     return {"success": True, "message": f"Opened {os.path.basename(fpath)}."}
 
 
+def open_study_room(parameter: str | None = None) -> dict:
+    """Launch Akira Teaching Mode study room in the background and open authenticated browser.
+    Ungated local application launcher.
+    """
+    try:
+        from teaching import server
+        url = server.ensure_server(open_browser=True)
+        topic = (parameter or "").strip()
+        msg = f"Opening your study room for {topic}." if topic else "Opening the study room."
+        return {"success": True, "message": msg, "url": url}
+    except Exception as e:
+        print(f"[executor] open_study_room error: {e}")
+        return {"success": False, "message": f"Could not launch study room: {e}"}
+
+
 def _resolve_dest(raw: str) -> tuple[str | None, str | None]:
     """Destination folder: spoken name ('desktop') > absolute > relative to
     session folder. Creating a NEW folder is fine if the parent exists."""
@@ -6395,6 +6410,7 @@ _ACTION_MAP = {
     "manage_index_scope": manage_index_scope,
     "index_stats":       index_stats,
     "open_file":         open_file,
+    "open_study_room":   open_study_room,
     "open_folder":       open_folder,
     "list_folder":       list_folder,
     "copy_files":        copy_files,
