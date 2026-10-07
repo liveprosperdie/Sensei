@@ -15,8 +15,8 @@ except Exception:
 # binary is never stored or served back, so a hostile PDF/DOCX can't be replayed
 # to the browser.
 ALLOWED_UPLOAD_EXT = {".pdf", ".docx", ".txt", ".md"}
-MAX_UPLOAD_BYTES = 15 * 1024 * 1024
-MAX_SOURCE_CHARS = 400_000          # per source, after extraction
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB (accommodates textbooks with heavy diagrams & slides)
+MAX_SOURCE_CHARS = 1_000_000          # per source, after extraction (~200k words)
 MAX_SOURCES_PER_TOPIC = 12
 MAX_TOPICS = 200
 PAGE_CHARS = 3000                   # synthetic "page" size for txt/md/docx/web

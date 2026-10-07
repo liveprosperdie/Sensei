@@ -76,7 +76,7 @@ def extract_pages(data: bytes, ext: str) -> list[dict]:
             if getattr(reader, "is_encrypted", False):
                 raise SourceError("encrypted PDFs are not supported")
             pages = []
-            for i, pg in enumerate(reader.pages[:400], start=1):
+            for i, pg in enumerate(reader.pages[:800], start=1):
                 t = (pg.extract_text() or "").strip()
                 if t:
                     pages.append({"page": i, "text": t})

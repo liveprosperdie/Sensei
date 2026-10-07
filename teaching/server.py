@@ -165,13 +165,14 @@ def create_app(token: str, port: int) -> FastAPI:
     @app.post("/api/topics/{slug}/sources/upload")
     async def upload(slug: str, request: Request, name: str = "", cloud: int = 0):
         declared = request.headers.get("content-length")
+        max_mb = config.MAX_UPLOAD_BYTES // (1024 * 1024)
         if declared and declared.isdigit() and int(declared) > config.MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="file is larger than 15 MB")
+            raise HTTPException(status_code=413, detail=f"file is larger than {max_mb} MB")
         buf = bytearray()
         async for chunk in request.stream():
             buf.extend(chunk)
             if len(buf) > config.MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail="file is larger than 15 MB")
+                raise HTTPException(status_code=413, detail=f"file is larger than {max_mb} MB")
         try:
             workspace.load_meta(slug)
             entry = sources.add_local_file(slug, unquote(name), bytes(buf), bool(cloud))
@@ -191,8 +192,9 @@ def create_app(token: str, port: int) -> FastAPI:
             p = Path(raw).expanduser().resolve(strict=True)
             if not p.is_file() or p.suffix.lower() not in config.ALLOWED_UPLOAD_EXT:
                 raise sources.SourceError("only PDF, DOCX, TXT and MD files are supported")
+            max_mb = config.MAX_UPLOAD_BYTES // (1024 * 1024)
             if p.stat().st_size > config.MAX_UPLOAD_BYTES:
-                raise sources.SourceError("file is larger than 15 MB")
+                raise sources.SourceError(f"file is larger than {max_mb} MB")
             entry = sources.add_local_file(slug, p.name, p.read_bytes(), bool(body.get("allow_cloud", False)))
         except (OSError, workspace.WorkspaceError, sources.SourceError) as e:
             fail(e)
