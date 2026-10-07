@@ -433,7 +433,7 @@ function viewNew(existingSlug) {
   function addFiles(list) {
     for (const f of list) {
       if (!/\.(pdf|docx|txt|md)$/i.test(f.name)) { err.textContent = `“${f.name}” isn’t a supported type (PDF, DOCX, TXT, MD).`; continue; }
-      if (f.size > 15 * 1024 * 1024) { err.textContent = `“${f.name}” is over 15 MB.`; continue; }
+      if (f.size > 100 * 1024 * 1024) { err.textContent = `“${f.name}” is over 100 MB.`; continue; }
       if (state.files.length >= 8) { err.textContent = 'Up to 8 files per course.'; break; }
       const entry = { file: f, cloud: false }; state.files.push(entry);
       const cb = h('input', { type: 'checkbox', 'aria-label': 'Allow cloud model to read excerpts of ' + f.name, onchange: () => { entry.cloud = cb.checked; } });

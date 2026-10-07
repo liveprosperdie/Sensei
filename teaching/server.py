@@ -10,7 +10,7 @@ SECURITY MODEL (all enforced in this file, covered by tests/test_teaching_mode.p
   * Strict CSP: scripts only from this origin, no inline scripts, no external
     images/fonts/connections, no framing. Nothing in the UI contacts a third party.
   * No CORS headers are ever emitted.
-  * Uploads: extension allowlist, 15 MB streamed cap, stored as extracted text
+  * Uploads: extension allowlist, 100 MB streamed cap, stored as extracted text
     under server-generated ids; the original file is never kept or served.
   * All file access goes through teaching.workspace (path allowlist + confinement).
   * Error text returned to the browser is key-scrubbed; stack traces never leave

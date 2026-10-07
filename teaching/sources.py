@@ -135,7 +135,7 @@ def add_local_file(slug: str, filename: str, data: bytes, allow_cloud: bool) -> 
     if ext not in config.ALLOWED_UPLOAD_EXT:
         raise SourceError("only PDF, DOCX, TXT and MD files are supported")
     if len(data) > config.MAX_UPLOAD_BYTES:
-        raise SourceError("file is larger than 15 MB")
+        raise SourceError(f"file is larger than {config.MAX_UPLOAD_BYTES // (1024 * 1024)} MB")
     if not data:
         raise SourceError("file is empty")
     pages = extract_pages(data, ext)
