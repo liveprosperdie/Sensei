@@ -10,6 +10,8 @@ const root = document.getElementById('app');
 
 /* ── token & prefs ───────────────────────────────────────── */
 let TOKEN = sessionStorage.getItem('akira_t') || '';
+let userToken = localStorage.getItem('study_jwt') || sessionStorage.getItem('study_jwt') || '';
+let currentUser = null;
 const tm = location.hash.match(/t=([\w-]+)/);
 if (tm) { TOKEN = tm[1]; sessionStorage.setItem('akira_t', TOKEN); history.replaceState(null, '', location.pathname + '#/'); }
 const prefs = {
@@ -71,7 +73,9 @@ const hue = (slug) => { let n = 0; for (const c of slug) n = (n * 31 + c.charCod
 
 /* ── API ─────────────────────────────────────────────────── */
 async function api(path, opts = {}) {
-  const headers = { 'X-Akira-Token': TOKEN, ...(opts.headers || {}) };
+  const headers = { ...(opts.headers || {}) };
+  if (userToken) headers['Authorization'] = 'Bearer ' + userToken;
+  if (TOKEN) headers['X-Akira-Token'] = TOKEN;
   let body = opts.raw;
   if (opts.body !== undefined) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(opts.body); }
   const res = await fetch('/api' + path, { method: opts.method || 'GET', headers, body });
@@ -85,11 +89,94 @@ function toast(msg, bad = false) {
   const t = h('div', { class: 'toast' + (bad ? ' bad' : ''), role: 'status', text: msg });
   document.body.append(t); setTimeout(() => t.remove(), 4200);
 }
+function logout() {
+  userToken = '';
+  currentUser = null;
+  localStorage.removeItem('study_jwt');
+  sessionStorage.removeItem('study_jwt');
+  sessionStorage.removeItem('akira_t');
+  TOKEN = '';
+  gate();
+}
 function gate() {
-  root.replaceChildren(h('div', { class: 'gate' },
-    h('div', { class: 'seal', style: 'margin:0 auto 18px;width:52px;height:52px;font-size:30px', text: 'A' }),
-    h('h1', { class: 'h-display', text: 'Session ended' }),
-    h('p', { class: 'lede', text: 'For your privacy the Study Room only opens from Akira. Say “Akira, open the study room”, or run python -m teaching, to start a fresh session.' })));
+  let authMode = 'login';
+  const emailInput = h('input', { class: 'auth-input', type: 'email', placeholder: 'you@example.com', required: true });
+  const pwInput = h('input', { class: 'auth-input', type: 'password', placeholder: '••••••••', required: true });
+  const authErr = h('div', { class: 'err', role: 'alert', style: 'margin-bottom:12px;display:none' });
+  const submitBtn = h('button', { class: 'btn accent', style: 'width:100%', text: 'Sign In' });
+
+  const tabLogin = h('button', { class: 'auth-tab active', text: 'Sign In' });
+  const tabReg = h('button', { class: 'auth-tab', text: 'Create Account' });
+
+  function setMode(m) {
+    authMode = m;
+    tabLogin.classList.toggle('active', m === 'login');
+    tabReg.classList.toggle('active', m === 'register');
+    submitBtn.textContent = m === 'login' ? 'Sign In' : 'Create Account';
+    authErr.style.display = 'none';
+  }
+  tabLogin.onclick = () => setMode('login');
+  tabReg.onclick = () => setMode('register');
+
+  const form = h('form', {
+    onsubmit: async (e) => {
+      e.preventDefault();
+      authErr.style.display = 'none';
+      submitBtn.disabled = true;
+      try {
+        const endpoint = authMode === 'login' ? '/auth/login' : '/auth/register';
+        const res = await api(endpoint, {
+          method: 'POST',
+          body: { email: emailInput.value, password: pwInput.value }
+        });
+        userToken = res.token;
+        localStorage.setItem('study_jwt', userToken);
+        currentUser = { id: res.id, email: res.email };
+        toast(authMode === 'login' ? 'Welcome back!' : 'Account created!');
+        route();
+      } catch (err) {
+        authErr.textContent = err.message || 'Authentication failed';
+        authErr.style.display = 'block';
+      } finally {
+        submitBtn.disabled = false;
+      }
+    }
+  },
+    h('div', { class: 'auth-input-group' }, h('label', { text: 'Email address' }), emailInput),
+    h('div', { class: 'auth-input-group' }, h('label', { text: 'Password' }), pwInput),
+    authErr,
+    submitBtn
+  );
+
+  const demoBtn = h('button', {
+    class: 'btn ghost',
+    style: 'width:100%',
+    onclick: async () => {
+      try {
+        const res = await api('/auth/demo', { method: 'POST' });
+        userToken = res.token;
+        localStorage.setItem('study_jwt', userToken);
+        currentUser = { id: res.id, email: res.email };
+        toast('Demo session started!');
+        route();
+      } catch (err) {
+        authErr.textContent = err.message;
+        authErr.style.display = 'block';
+      }
+    }
+  }, icon('spark'), 'Explore Instant Demo (No signup)');
+
+  root.replaceChildren(
+    h('div', { class: 'auth-box' },
+      h('div', { class: 'seal', style: 'margin:0 auto 16px;width:52px;height:52px;font-size:28px', text: 'A' }),
+      h('h1', { class: 'h-display', style: 'font-size:26px;margin:0 0 6px', text: 'Study Room' }),
+      h('p', { class: 'lede', style: 'font-size:14.5px;margin:0 0 24px', text: 'Your private, adaptive AI learning environment.' }),
+      h('div', { class: 'auth-tabs' }, tabLogin, tabReg),
+      form,
+      h('div', { class: 'demo-divider', text: 'Or' }),
+      demoBtn
+    )
+  );
 }
 
 /* ── busy overlay + job polling ──────────────────────────── */
@@ -170,7 +257,11 @@ function topbar(crumb) {
     crumb ? h('div', { class: 'crumb' }, icon('arrow'), h('b', { text: crumb })) : null,
     h('div', { class: 'grow' }),
     timerEl,
-    h('span', { class: 'privacy-pill', title: 'Courses, files and results are saved only in a private folder on this PC.' }, icon('shield'), 'Private on PC'),
+    currentUser ? h('div', { class: 'user-pill' },
+      icon('smile'),
+      h('span', { text: currentUser.email }),
+      h('button', { class: 'chip-btn text-only', style: 'padding:2px 6px;margin-left:4px', onclick: logout, title: 'Sign out' }, 'Sign out')
+    ) : (userToken ? h('button', { class: 'chip-btn text-only', onclick: logout }, 'Sign out') : h('span', { class: 'privacy-pill', title: 'Courses and notes are saved privately.' }, icon('shield'), 'Private & Encrypted')),
     h('button', { class: 'chip-btn', 'aria-label': 'Cycle theme', onclick: () => {
       document.documentElement.dataset.theme = themeNext;
       prefs.set('theme', themeNext);
@@ -976,7 +1067,13 @@ async function viewJournal(meta) {
 
 /* ── router ──────────────────────────────────────────────── */
 async function route() {
-  if (!TOKEN) { gate(); return; }
+  if (!TOKEN && !userToken) { gate(); return; }
+  if (userToken && !currentUser) {
+    try {
+      const udata = await api('/auth/me');
+      if (udata && udata.authenticated) currentUser = udata.user;
+    } catch { /* proceed */ }
+  }
   if (observer) { observer.disconnect(); observer = null; }
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   if (!parts.length) return viewShelf();

@@ -12,11 +12,12 @@ def main() -> None:
     ap.add_argument("--demo", action="store_true", help="create the offline sample course first")
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--port", type=int, default=0)
+    ap.add_argument("--host", type=str, default="127.0.0.1")
     args = ap.parse_args()
     if args.demo:
         from . import demo
         demo.seed()
-    server.run(open_browser=not args.no_browser, port=args.port)
+    server.run(open_browser=not args.no_browser, port=args.port, host=args.host)
 
 
 if __name__ == "__main__":

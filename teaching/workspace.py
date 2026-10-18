@@ -12,12 +12,15 @@ import os
 import shutil
 import tempfile
 import threading
+import contextvars
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 from . import config, schema
 
 _LOCK = threading.RLock()
+CURRENT_USER_ID: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("current_user_id", default=None)
 
 
 class WorkspaceError(ValueError):
@@ -28,10 +31,20 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def topic_dir(slug: str) -> Path:
+def user_root(user_id: Optional[str] = None) -> Path:
+    uid = user_id or CURRENT_USER_ID.get()
+    if uid:
+        base = config.workspace_root() / "users" / uid
+    else:
+        base = config.workspace_root()
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def topic_dir(slug: str, user_id: Optional[str] = None) -> Path:
     if not isinstance(slug, str) or not schema.SLUG_RE.match(slug):
         raise WorkspaceError("invalid topic id")
-    root = config.workspace_root()
+    root = user_root(user_id)
     d = (root / slug).resolve()
     if d.parent != root:
         raise WorkspaceError("invalid topic id")
@@ -92,9 +105,9 @@ def read_json(slug: str, rel: str):
 
 # ── Topics ──────────────────────────────────────────────────────────────────
 
-def list_topics() -> list[dict]:
+def list_topics(user_id: Optional[str] = None) -> list[dict]:
     out = []
-    root = config.workspace_root()
+    root = user_root(user_id)
     for d in sorted(root.iterdir()) if root.exists() else []:
         if not d.is_dir() or not schema.SLUG_RE.match(d.name):
             continue

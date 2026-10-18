@@ -400,6 +400,54 @@ class ServerTests(_Base):
             self.assertIsNotNone(lesson_data["feynman"])
             self.assertEqual(lesson_data["feynman"]["evaluation"]["mastery_score"], 0.92)
 
+    def test_user_auth_and_scoping(self):
+        # 1. Register user
+        reg = self.c.post("/api/auth/register", json={"email": "alice@example.com", "password": "password123"})
+        self.assertEqual(reg.status_code, 200)
+        alice_data = reg.json()
+        self.assertIn("token", alice_data)
+        alice_token = alice_data["token"]
+
+        # Duplicate email rejected
+        reg_dup = self.c.post("/api/auth/register", json={"email": "alice@example.com", "password": "password123"})
+        self.assertEqual(reg_dup.status_code, 400)
+
+        # 2. Login user
+        login = self.c.post("/api/auth/login", json={"email": "alice@example.com", "password": "password123"})
+        self.assertEqual(login.status_code, 200)
+
+        # Wrong password rejected
+        login_bad = self.c.post("/api/auth/login", json={"email": "alice@example.com", "password": "wrong"})
+        self.assertEqual(login_bad.status_code, 401)
+
+        # 3. Create topic as Alice using Bearer token
+        alice_h = {"Authorization": f"Bearer {alice_token}", "Origin": f"http://127.0.0.1:{PORT}"}
+        alice_topic = self.c.post("/api/topics", json={"topic": "Alice Machine Learning"}, headers=alice_h)
+        self.assertEqual(alice_topic.status_code, 200)
+        alice_slug = alice_topic.json()["topic_slug"]
+
+        # Alice's topic list has her topic
+        alice_list = self.c.get("/api/topics", headers=alice_h).json()["topics"]
+        self.assertEqual(len(alice_list), 1)
+        self.assertEqual(alice_list[0]["topic_slug"], alice_slug)
+
+        # 4. Register Bob
+        bob_reg = self.c.post("/api/auth/register", json={"email": "bob@example.com", "password": "securepass456"})
+        bob_token = bob_reg.json()["token"]
+        bob_h = {"Authorization": f"Bearer {bob_token}", "Origin": f"http://127.0.0.1:{PORT}"}
+
+        # Bob's topic list is empty (multi-tenant isolation!)
+        bob_list = self.c.get("/api/topics", headers=bob_h).json()["topics"]
+        self.assertEqual(len(bob_list), 0)
+
+        # Bob cannot access Alice's topic
+        bob_access = self.c.get(f"/api/topics/{alice_slug}", headers=bob_h)
+        self.assertEqual(bob_access.status_code, 404)
+
+        # 5. Demo session
+        demo = self.c.post("/api/auth/demo")
+        self.assertEqual(demo.status_code, 200)
+        self.assertIn("token", demo.json())
 
 
 def tearDownModule():

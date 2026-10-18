@@ -19,6 +19,7 @@ SECURITY MODEL (all enforced in this file, covered by tests/test_teaching_mode.p
 
 from __future__ import annotations
 
+import os
 import secrets
 import socket
 import threading
@@ -32,7 +33,7 @@ from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import config, llm, pipeline, schema, sources, workspace
+from . import auth, config, llm, pipeline, schema, sources, workspace
 from .heuristics import PROCEED_AT
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -88,23 +89,44 @@ class Jobs:
         return None if j is None else {k: v for k, v in j.items() if k not in ("key", "started")}
 
 
-def create_app(token: str, port: int) -> FastAPI:
+def create_app(token: str, port: int, host: str = "127.0.0.1") -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     jobs = Jobs()
-    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}", "127.0.0.1", "localhost", "testserver"}
     allowed_origins = {f"http://127.0.0.1:{port}", f"http://localhost:{port}"}
+    is_local = host in ("127.0.0.1", "localhost")
 
     @app.middleware("http")
     async def guard(request: Request, call_next):
-        if request.headers.get("host", "").lower() not in allowed_hosts:
+        host_header = request.headers.get("host", "").lower()
+        if is_local and host_header not in allowed_hosts and not os.environ.get("ALLOWED_HOSTS"):
             return JSONResponse({"detail": "bad host"}, status_code=403)
         path = request.url.path
         if path.startswith("/api/"):
-            supplied = request.headers.get("x-akira-token", "")
-            if not secrets.compare_digest(supplied.encode(), token.encode()):
-                return JSONResponse({"detail": "unauthorized"}, status_code=401)
-            if request.method not in ("GET", "HEAD"):
-                if request.headers.get("origin", "") not in allowed_origins:
+            # Public routes
+            if path in ("/api/health", "/api/auth/register", "/api/auth/login", "/api/auth/demo"):
+                resp = await call_next(request)
+                resp.headers["Content-Security-Policy"] = CSP
+                return resp
+
+            # Check User JWT / Auth token
+            auth_header = request.headers.get("authorization", "")
+            user_token = request.headers.get("x-auth-token", "")
+            if auth_header.lower().startswith("bearer "):
+                user_token = auth_header[7:].strip()
+
+            user = auth.verify_token(user_token) if user_token else None
+            if user:
+                workspace.CURRENT_USER_ID.set(user["id"])
+            else:
+                # Check legacy desktop session token
+                supplied = request.headers.get("x-akira-token", "")
+                if not (supplied and secrets.compare_digest(supplied.encode(), token.encode())):
+                    return JSONResponse({"detail": "unauthorized"}, status_code=401)
+                workspace.CURRENT_USER_ID.set(None)
+
+            if request.method not in ("GET", "HEAD") and is_local:
+                if request.headers.get("origin", "") not in allowed_origins and not os.environ.get("ALLOWED_ORIGINS"):
                     return JSONResponse({"detail": "bad origin"}, status_code=403)
         resp = await call_next(request)
         resp.headers["Content-Security-Policy"] = CSP
@@ -126,6 +148,36 @@ def create_app(token: str, port: int) -> FastAPI:
         return FileResponse(STATIC_DIR / "index.html", media_type="text/html")
 
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+    # ── auth ────────────────────────────────────────────────────────────────
+    @app.post("/api/auth/register")
+    def register(body: dict = Body(...)):
+        try:
+            return auth.register_user(body.get("email", ""), body.get("password", ""))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.post("/api/auth/login")
+    def login(body: dict = Body(...)):
+        try:
+            return auth.login_user(body.get("email", ""), body.get("password", ""))
+        except ValueError as e:
+            raise HTTPException(status_code=401, detail=str(e))
+
+    @app.get("/api/auth/me")
+    def me():
+        uid = workspace.CURRENT_USER_ID.get()
+        if not uid:
+            return {"authenticated": False}
+        u = auth.get_user_by_id(uid)
+        return {"authenticated": True, "user": u}
+
+    @app.post("/api/auth/demo")
+    def demo_session():
+        demo_id = f"demo_{secrets.token_hex(4)}"
+        demo_email = f"{demo_id}@studyroom.demo"
+        t = auth.create_token(demo_id, demo_email, expires_in_days=1)
+        return {"id": demo_id, "email": demo_email, "token": t, "is_demo": True}
 
     # ── topics ──────────────────────────────────────────────────────────────
     @app.get("/api/health")
@@ -387,19 +439,22 @@ def ensure_server(open_browser: bool = True) -> str:
         return url_with_token
 
 
-def run(open_browser: bool = True, port: int = 0, block: bool = True) -> str:
+def run(open_browser: bool = True, port: int = 0, block: bool = True, host: str = "127.0.0.1") -> str:
     """Start the server. Returns the base URL (without the token)."""
     import uvicorn
 
-    port = port or _free_port()
+    env_port = int(os.environ.get("PORT", "0"))
+    port = port or env_port or _free_port()
+    host = os.environ.get("HOST", host)
     token = secrets.token_urlsafe(32)
-    app = create_app(token, port)
-    base = f"http://127.0.0.1:{port}"
-    config_ = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    app = create_app(token, port, host=host)
+    base = f"http://{host}:{port}"
+    config_ = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config_)
-    if open_browser:
+    is_local = host in ("127.0.0.1", "localhost")
+    if open_browser and is_local and not os.environ.get("HEADLESS"):
         threading.Timer(1.0, lambda: webbrowser.open(f"{base}/#t={token}")).start()
-    print(f"[teaching] study room at {base} (session token is only in your browser)")
+    print(f"[teaching] study room at {base}")
     if block:
         server.run()
     else:

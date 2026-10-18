@@ -475,3 +475,41 @@ kbd { font-family: var(--mono); font-size: 11px; border: 1px solid var(--rule); 
 @media (max-width: 800px) { .src-col, .split { display: none; } .sheet { padding: 24px 20px 24px 40px; } .sheet::before { left: 26px; } .qcard { padding: 22px 18px 22px 44px; } .qcard::before { left: 28px; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .001s !important; transition-duration: .001s !important; scroll-behavior: auto !important; } }
 @media print { .bar, .spine-nav, .src-col, .split, .toolbar, .after { display: none !important; } .lesson-scroll { overflow: visible; } }
+
+/* ── Web App Auth & User Portal ───────────────────────── */
+.auth-box {
+  max-width: 440px; margin: 40px auto; background: var(--card); border: 1px solid var(--rule);
+  border-radius: 18px; padding: 34px 30px; box-shadow: 0 18px 48px -12px rgba(0,0,0,0.14);
+  animation: rise 0.3s ease; text-align: center;
+}
+.auth-tabs {
+  display: flex; gap: 6px; background: color-mix(in srgb, var(--ink) 4%, transparent);
+  border-radius: 10px; padding: 4px; margin-bottom: 22px;
+}
+.auth-tab {
+  flex: 1; padding: 9px 14px; background: transparent; border: none; font-size: 14px; font-weight: 600;
+  color: var(--ink-soft); cursor: pointer; border-radius: 8px; transition: all 0.15s ease;
+}
+.auth-tab.active {
+  background: var(--card); color: var(--ink); box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+}
+.auth-input-group {
+  text-align: left; margin-bottom: 16px;
+}
+.auth-input-group label {
+  display: block; font-size: 12.5px; font-weight: 600; color: var(--ink-soft); margin-bottom: 6px;
+}
+.auth-input {
+  width: 100%; padding: 11px 14px; border: 1px solid var(--rule); border-radius: 10px;
+  background: var(--paper); color: var(--ink); font-size: 14.5px; outline: none; transition: border-color 0.15s ease;
+}
+.auth-input:focus { border-color: var(--accent); }
+.user-pill {
+  display: inline-flex; align-items: center; gap: 8px; padding: 4px 10px 4px 12px;
+  background: color-mix(in srgb, var(--accent) 8%, var(--paper));
+  border: 1px solid var(--rule); border-radius: 20px; font-size: 13px; color: var(--ink);
+}
+.demo-divider {
+  display: flex; align-items: center; gap: 12px; margin: 20px 0; color: var(--ink-soft); font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.demo-divider::before, .demo-divider::after { content: ''; flex: 1; height: 1px; background: var(--rule); }
