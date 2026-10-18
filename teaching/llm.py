@@ -31,7 +31,10 @@ import time
 import requests
 
 from . import config  # noqa: F401  (loads .env)
-import llm_json
+try:
+    from . import llm_json
+except ImportError:
+    import llm_json
 
 
 class LLMUnavailable(RuntimeError):
