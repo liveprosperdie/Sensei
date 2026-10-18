@@ -63,7 +63,38 @@ Your browser will automatically open to `http://127.0.0.1:8765`.
 
 ---
 
-## 3. Architecture & File Contracts
+## 3. One-Click Cloud Deployment & Docker
+
+Deploy Study Room as your team's or community's shared web app:
+
+### Option A: One-Command Docker Compose
+```bash
+# Clone and run
+git clone https://github.com/liveprosperdie/Sensei.git
+cd Sensei/teaching
+docker compose up -d
+```
+Visit `http://localhost:8080`. Data is securely persisted in the `studyroom_data` Docker volume.
+
+### Option B: Deploy to Render (One-Click)
+1. Fork or push this repository to GitHub.
+2. In Render, select **Blueprints** and choose [teaching/render.yaml](file:///d:/Coding/Projects/Sensei/teaching/render.yaml).
+3. Add your `GROQ_API_KEY` or `GEMINI_API_KEY` in environment variables.
+
+### Option C: Deploy to Railway or Fly.io
+- **Railway:** Connect your repo; Railway automatically detects [teaching/railway.json](file:///d:/Coding/Projects/Sensei/teaching/railway.json) and [teaching/Dockerfile](file:///d:/Coding/Projects/Sensei/teaching/Dockerfile).
+- **Fly.io:** Run `fly launch` in `teaching/` using [teaching/fly.toml](file:///d:/Coding/Projects/Sensei/teaching/fly.toml).
+
+---
+
+## 4. Multi-Tenant User Accounts & Authentication
+
+Study Room includes a complete user account system:
+- **Instant Signup & Sign In**: Users sign up with email and password (hashed with PBKDF2-HMAC-SHA256).
+- **Multi-Tenant Isolation**: Each user's courses, Feynman recordings, and notes are isolated in `<workspace>/users/<user_id>/`.
+- **Instant Demo Mode**: A 1-click **"Explore Demo"** button lets first-time visitors immediately test courses without creating a password.
+- **Cross-Device Persistence**: Login from your laptop, tablet, or phone to pick up exactly where you left off.
+
 
 Models only output Markdown and structured JSON sidecars. The UI is deterministic, offline-first, and never speaks directly to third-party endpoints.
 
