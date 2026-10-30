@@ -168,8 +168,22 @@ def calendar_control(action: str, parameter: str | None = None) -> dict:
 
         if action == "delete":
             if not parts:
-                return {"success": False, "message": "Which event? I need the event id."}
-            return google_mcp.call("workspace", "delete_event", {"eventId": parts[0]})
+                return {"success": False, "message": "Which event? I need the event id or name."}
+            import os, webbrowser
+            if os.environ.get("AKIRA_HEADLESS_TEST") != "1":
+                try:
+                    webbrowser.open("https://calendar.google.com")
+                except Exception:
+                    pass
+            return {
+                "success": True,
+                "speak": True,
+                "handoff": True,
+                "message": (
+                    f"I don't delete calendar events directly — I've opened Google Calendar for '{parts[0]}' "
+                    f"so now you can delete it yourself."
+                ),
+            }
 
         if action == "free":
             if len(parts) < 2:

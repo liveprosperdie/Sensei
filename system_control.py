@@ -465,64 +465,46 @@ def preview_temp_cleanup(parameter: str = "") -> dict:
                         f"from {len(targets)} temp folders.")}
 
 
-def _do_clear_temp_worker(targets: list[str]) -> None:
-    removed = freed = skipped = unreadable = 0
-    for t in targets:
-        try:
-            names = os.listdir(t)
-        except Exception as e:
-            unreadable += 1
-            print(f"[SYS] temp folder unreadable {t}: {e}")
-            continue
-
-        for name in names:
-            path = os.path.join(t, name)
-            try:
-                size = os.path.getsize(path) if os.path.isfile(path) else 0
-                if os.path.isdir(path) and not os.path.islink(path):
-                    failures = []
-                    shutil.rmtree(path, onerror=lambda *a: failures.append(a))
-                    if failures or os.path.exists(path):
-                        skipped += 1
-                        continue
-                else:
-                    os.remove(path)
-                removed += 1
-                freed += size
-            except Exception:
-                skipped += 1
-    print(f"[SYS] async temp cleanup finished: removed={removed} skipped={skipped} freed={freed}")
-
-
 def clear_temp_files(parameter: str = "") -> dict:
-    """Delete contents of OS temp folders asynchronously in background.
-    Locked/in-use files are skipped normally."""
+    """Non-destructive handoff: opens the user's Temp folder in File Explorer
+    so the user can review and delete temp files themselves."""
     targets = _temp_targets()
     if not targets:
         return {"success": False, "message": "I couldn't find any temp folders."}
-
-    import threading
-    t = threading.Thread(target=_do_clear_temp_worker, args=(targets,), daemon=True, name="TempCleanupWorker")
-    t.start()
-
-    return {"success": True, "speak": True, "message": "Cleaning temporary files in the background."}
-
-
-def _do_empty_recycle_bin_worker() -> None:
-    try:
-        flags = 0x1 | 0x2 | 0x4
-        ctypes.windll.shell32.SHEmptyRecycleBinW(None, None, flags)
-        print("[SYS] async empty recycle bin finished.")
-    except Exception as e:
-        print(f"[SYS] async empty recycle bin error: {e}")
+    if os.environ.get("AKIRA_HEADLESS_TEST") != "1":
+        try:
+            subprocess.Popen(["explorer.exe", os.path.normpath(targets[0])])
+        except Exception as e:
+            print(f"[SYS] open temp folder warning: {e}")
+    return {
+        "success": True,
+        "speak": True,
+        "handoff": True,
+        "targets": targets,
+        "message": (
+            f"I don't delete files directly — I've opened your Temp folder ({targets[0]}) "
+            f"in File Explorer. Now you can delete the temporary files yourself."
+        ),
+    }
 
 
 def empty_recycle_bin(parameter: str = "") -> dict:
-    """SHEmptyRecycleBin executed asynchronously in background."""
-    import threading
-    t = threading.Thread(target=_do_empty_recycle_bin_worker, daemon=True, name="RecycleBinWorker")
-    t.start()
-    return {"success": True, "speak": True, "message": "Emptying the Recycle Bin in the background."}
+    """Non-destructive handoff: opens the Windows Recycle Bin in File Explorer
+    so the user can review and empty it themselves."""
+    if os.environ.get("AKIRA_HEADLESS_TEST") != "1":
+        try:
+            subprocess.Popen(["explorer.exe", "shell:RecycleBinFolder"])
+        except Exception as e:
+            print(f"[SYS] open recycle bin warning: {e}")
+    return {
+        "success": True,
+        "speak": True,
+        "handoff": True,
+        "message": (
+            "I don't empty the Recycle Bin directly — I've opened the Recycle Bin for you. "
+            "Now you can delete the items yourself."
+        ),
+    }
 
 
 def run_disk_cleanup(parameter: str = "") -> dict:
@@ -630,46 +612,55 @@ def sleep_pc(parameter: str = "") -> dict:
 
 
 def hibernate_pc(parameter: str = "") -> dict:
-    """Hibernate, but only after confirming it is actually enabled."""
-    if not hibernate_available():
-        return {"success": False,
-                "message": "Hibernate is turned off on this PC, so I can't use it. "
-                           "I can sleep or shut down instead."}
-    ok, out = _run(["shutdown", "/h"], timeout=15.0)
-    if ok:
-        return {"success": True, "message": "Hibernating."}
-    print(f"[SYS] hibernate failed: {out[:200]}")
-    return {"success": False, "message": "I couldn't hibernate this PC."}
+    """Non-destructive handoff for hibernate."""
+    return {
+        "success": True,
+        "speak": True,
+        "handoff": True,
+        "message": (
+            "I don't force power state transitions directly — open the Windows Start menu "
+            "power options and now you can hibernate your PC yourself."
+        ),
+    }
 
 
 def sign_out(parameter: str = "") -> dict:
-    """ExitWindowsEx(EWX_LOGOFF). Not forced, so apps can still veto with
-    unsaved work — which is the safer default for a voice command."""
-    try:
-        ok = bool(ctypes.windll.user32.ExitWindowsEx(0, 0))
-        if ok:
-            return {"success": True, "message": "Signing you out."}
-        err = ctypes.windll.kernel32.GetLastError()
-        print(f"[SYS] ExitWindowsEx failed err={err}")
-        return {"success": False, "message": "I couldn't sign you out."}
-    except Exception as e:
-        return {"success": False, "message": f"I couldn't sign you out: {e}"}
+    """Non-destructive handoff for sign out."""
+    return {
+        "success": True,
+        "speak": True,
+        "handoff": True,
+        "message": (
+            "I don't sign you out directly to prevent losing unsaved work — open the Start menu "
+            "profile icon and now you can sign out yourself."
+        ),
+    }
 
 
 def shutdown_pc(parameter: str = "") -> dict:
-    ok, out = _run(["shutdown", "/s", "/t", "0"], timeout=15.0)
-    if not ok:
-        print(f"[SYS] shutdown failed: {out[:200]}")
-    return {"success": ok,
-            "message": "Shutting down." if ok else "I couldn't shut down."}
+    """Non-destructive handoff for shutdown."""
+    return {
+        "success": True,
+        "speak": True,
+        "handoff": True,
+        "message": (
+            "I don't shut down your PC directly — press Alt+F4 on your desktop or open the "
+            "Start menu power button, and now you can shut it down yourself."
+        ),
+    }
 
 
 def restart_pc(parameter: str = "") -> dict:
-    ok, out = _run(["shutdown", "/r", "/t", "0"], timeout=15.0)
-    if not ok:
-        print(f"[SYS] restart failed: {out[:200]}")
-    return {"success": ok,
-            "message": "Restarting." if ok else "I couldn't restart."}
+    """Non-destructive handoff for restart."""
+    return {
+        "success": True,
+        "speak": True,
+        "handoff": True,
+        "message": (
+            "I don't restart your PC directly — press Alt+F4 on your desktop or open the "
+            "Start menu power button, and now you can restart it yourself."
+        ),
+    }
 
 
 # ── Dispatch ──────────────────────────────────────────────────────────────────

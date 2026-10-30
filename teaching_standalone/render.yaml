@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: studyroom-ai
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m teaching --host 0.0.0.0 --port $PORT --no-browser
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: TEACHING_SECRET_KEY
+        generateValue: true
+      - key: HEADLESS
+        value: "true"
+      - key: ALLOWED_HOSTS
+        value: "studyroom-ai.onrender.com"
+    disk:
+      name: studyroom-data
+      mountPath: /app/data
+      sizeGB: 10

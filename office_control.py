@@ -1548,17 +1548,24 @@ def _powerpoint(sub: str, parameter: str | None) -> dict:
         try:
             total = int(pres.Slides.Count)
             if total <= 0:
-                return _err("There are no slides to delete.")
+                return _err("There are no slides in this presentation.")
             n = _slide_number(parameter, pres) if (parameter or "").strip() \
                 else _current_slide(app, pres)
             if n is None:
-                return _err("Which slide should I delete?")
+                return _err("Which slide should I navigate to?")
             if not 1 <= n <= total:
                 return _err(f"There are only {total} slides.")
-            pres.Slides(n).Delete()
-            return _ok(f"Deleted slide {n}. {total - 1} left.")
+            try:
+                app.ActiveWindow.View.GotoSlide(n)
+            except Exception:
+                pass
+            return _ok(
+                f"I don't delete slides directly — I've navigated to slide {n} in PowerPoint "
+                f"and selected it. Now you can delete it yourself.",
+                handoff=True,
+            )
         except Exception as e:
-            return _err(f"I couldn't delete that slide: {e}")
+            return _err(f"I couldn't navigate to that slide: {e}")
 
     if sub in ("set title", "set content"):
         text = (parameter or "").strip()

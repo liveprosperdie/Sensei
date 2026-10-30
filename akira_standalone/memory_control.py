@@ -1,0 +1,182 @@
+import os
+import datetime
+import glob
+import re
+import json
+
+MEMORY_DIR = os.path.join(os.path.dirname(__file__), "memory")
+LOGS_DIR = os.path.join(MEMORY_DIR, "logs")
+
+# Secure Vault on C: drive (excluded from LLM context)
+SECURE_VAULT_MEMORY_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local"),
+    "Akira", "secure_vault", "memory"
+)
+SECURE_LOGS_DIR = os.path.join(SECURE_VAULT_MEMORY_DIR, "logs")
+
+def _ensure_dirs():
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    try:
+        os.makedirs(SECURE_VAULT_MEMORY_DIR, exist_ok=True)
+        os.makedirs(SECURE_LOGS_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+def _today_log_path() -> str:
+    _ensure_dirs()
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    return os.path.join(LOGS_DIR, f"{today}.md")
+
+def log_turn(user_text: str, assistant_response: str, actions: list | None = None) -> None:
+    """Silently logs a full conversational turn to today's rolling log."""
+    if not (user_text or "").strip() and not (assistant_response or "").strip():
+        return
+    try:
+        path = _today_log_path()
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        lines = [f"\n### [{timestamp}] Conversational Turn"]
+        if user_text and user_text.strip():
+            lines.append(f"- **User**: {user_text.strip()}")
+        if assistant_response and assistant_response.strip():
+            lines.append(f"- **Akira**: {assistant_response.strip()}")
+        if actions:
+            action_desc = []
+            for a in actions:
+                if isinstance(a, dict):
+                    act = a.get("action", "")
+                    param = a.get("parameter")
+                    action_desc.append(f"`{act}|{param}`" if param else f"`{act}`")
+                else:
+                    action_desc.append(f"`{a}`")
+            if action_desc:
+                lines.append(f"- **Actions**: {', '.join(action_desc)}")
+        lines.append("")
+        content_to_append = "\n".join(lines) + "\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(content_to_append)
+        try:
+            today_secure = os.path.join(SECURE_LOGS_DIR, os.path.basename(path))
+            with open(today_secure, "a", encoding="utf-8") as sf:
+                sf.write(content_to_append)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[memory_control] failed to log turn: {e}")
+
+def log_action(text: str) -> None:
+    """Silently logs an action to today's rolling log."""
+    try:
+        path = _today_log_path()
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        action_line = f"- **{timestamp}**: {text}\n"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(action_line)
+        try:
+            today_secure = os.path.join(SECURE_LOGS_DIR, os.path.basename(path))
+            with open(today_secure, "a", encoding="utf-8") as sf:
+                sf.write(action_line)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[memory_control] failed to log action: {e}")
+
+def save_memory(parameter) -> dict:
+    """Autonomously saves memory to either core profile (forever) or daily log (30 days)."""
+    import json
+    
+    if not parameter:
+        return {"success": False, "message": "Nothing to remember."}
+        
+    try:
+        # Check if parameter is a JSON dict (e.g. {"type": "core", "content": "..."})
+        if isinstance(parameter, str):
+            try:
+                data = json.loads(parameter)
+            except json.JSONDecodeError:
+                data = {"type": "log", "content": parameter}
+        else:
+            data = parameter
+            
+        mem_type = data.get("type", "log")
+        content = data.get("content", str(data))
+        
+        _ensure_dirs()
+        if mem_type == "core":
+            core_path = os.path.join(MEMORY_DIR, "core_profile.md")
+            with open(core_path, "a", encoding="utf-8") as f:
+                f.write(f"\n- {content}\n")
+            try:
+                secure_core = os.path.join(SECURE_VAULT_MEMORY_DIR, "core_profile.md")
+                with open(secure_core, "a", encoding="utf-8") as sf:
+                    sf.write(f"\n- {content}\n")
+            except Exception:
+                pass
+            msg = "Saved to core memory."
+        else:
+            log_action(content)
+            msg = "Saved to daily memory."
+            
+        return {"success": True, "speak": False, "message": msg}
+    except Exception as e:
+        return {"success": False, "message": f"Failed to save memory: {e}"}
+
+def search_memory(query: str) -> dict:
+    """Searches past daily logs for the query."""
+    if not query:
+        return {"success": False, "message": "You must provide a search query."}
+    
+    _ensure_dirs()
+    log_files = sorted(glob.glob(os.path.join(LOGS_DIR, "*.md")), reverse=True)
+    
+    hits = []
+    pattern = re.compile(re.escape(query), re.IGNORECASE)
+    
+    for file_path in log_files:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                if pattern.search(content):
+                    date_str = os.path.basename(file_path).replace(".md", "")
+                    hits.append(f"--- LOG: {date_str} ---\n{content.strip()}")
+        except Exception:
+            continue
+            
+    if not hits:
+        return {"success": True, "speak": True, "message": f"I couldn't find anything matching '{query}' in your past memory logs."}
+    
+    # Return the last 3 days of hits to avoid blowing up the context window
+    combined = "\n\n".join(hits[:3])
+    msg = f"I found some matches in your memory logs:\n\n{combined}"
+    return {"success": True, "speak": True, "message": msg}
+
+def forget_today() -> dict:
+    """Deletes today's log file."""
+    path = _today_log_path()
+    if os.path.exists(path):
+        os.remove(path)
+        return {"success": True, "speak": True, "message": "I have deleted all memory logs for today."}
+    return {"success": True, "speak": True, "message": "There were no memory logs saved for today."}
+
+def wipe_all_memory() -> dict:
+    """Deletes all daily logs and resets the core profile."""
+    try:
+        log_files = glob.glob(os.path.join(LOGS_DIR, "*.md"))
+        for f in log_files:
+            os.remove(f)
+            
+        core = os.path.join(MEMORY_DIR, "core_profile.md")
+        if os.path.exists(core):
+            with open(core, "w", encoding="utf-8") as f:
+                f.write("# Akira Core Profile\n*Memory wiped.*\n")
+
+        # Also wipe procedural memory store
+        try:
+            import procedural_memory as pm
+            pm.get_store().clear_all()
+        except Exception:
+            pass
+
+        return {"success": True, "speak": True, "message": "I have completely wiped my memory logs and core profile."}
+    except Exception as e:
+        return {"success": False, "message": f"Failed to wipe memory: {e}"}

@@ -146,11 +146,15 @@ DESTRUCTIVE_COMMAND_PATTERNS: Final[list[re.Pattern]] = [
     re.compile(r"\bRemove-Item\b.*-(Recurse|Force)\b", re.I),
     re.compile(r"\brd\b.*\s+/[sS]\b", re.I),
 
-    # Disk formatting and partitioning
+    # Disk formatting, partitioning, free-space wiping, and shadow copy destruction
     re.compile(r"\bformat\s+[a-zA-Z]:(\s|$|/|\\)", re.I),
     re.compile(r"\bFormat-Volume\b", re.I),
     re.compile(r"\bdiskpart\b", re.I),
     re.compile(r"\bclean\s+all\b", re.I),
+    re.compile(r"\bcipher(\.exe)?\s+/w:", re.I),
+    re.compile(r"\bvssadmin(\.exe)?\s+delete\s+shadows\b", re.I),
+    re.compile(r"\bwbadmin(\.exe)?\s+delete\b", re.I),
+    re.compile(r"\bbcdedit(\.exe)?\b.*\b(delete|set)\b", re.I),
 
     # Registry deletion
     re.compile(r"\breg\s+(delete|add)\b", re.I),

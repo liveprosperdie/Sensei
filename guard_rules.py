@@ -479,6 +479,12 @@ def validate(action: str, parameter=None) -> Verdict:
         # rule. The coverage gate exists so the second never reaches runtime.
         return Verdict(BLOCK, (f"no guard rule for action {name!r}",))
 
+    raw_param = "" if parameter is None else str(parameter)
+    if "\x00" in raw_param or any(ord(c) < 32 and c not in ("\n", "\r", "\t") for c in raw_param):
+        return Verdict(BLOCK, ("null byte or control character in parameter",))
+    if len(raw_param) > 65536:
+        return Verdict(BLOCK, ("parameter exceeds maximum length (64KB)",))
+
     fields = _fields(parameter, split_pipe=rule.split_pipe)
     if len(fields) < rule.min_fields:
         reasons.append(
@@ -559,7 +565,9 @@ def validate(action: str, parameter=None) -> Verdict:
     # Explicit URL safety checks for navigation actions
     if name in ("open_url", "new_tab", "open_site_tab") and fields:
         url = fields[0].strip().lower()
-        if any(url.startswith(proto) for proto in ("file:", "javascript:", "data:", "ftp:", "ws:", "about:")):
+        if any(url.startswith(proto) for proto in ("file:", "javascript:", "vbscript:", "data:", "chrome:", "edge:", "about:")):
+            return Verdict(BLOCK, ("unsafe or forbidden URI protocol",))
+        if any(url.startswith(proto) for proto in ("ftp:", "ws:")):
             reasons.append("unsafe or non-web URL protocol")
         if any(url.endswith(ext) or f"{ext}?" in url for ext in (".exe", ".bat", ".cmd", ".ps1", ".msi", ".vbs", ".reg", ".sh", ".iso")):
             reasons.append("executable or installer file download URL")

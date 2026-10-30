@@ -1,0 +1,57 @@
+# ==============================================================================
+# Akira (Sensei) Requirements
+# Core dependencies for voice pipeline, routing, guards, and Windows automation.
+# Saved as UTF-8 (do NOT save as UTF-16).
+# ==============================================================================
+
+# LLM Providers & API Clients
+anthropic>=0.34.0
+groq>=0.9.0
+pydantic>=2.7.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Audio & Voice Pipeline (Mic, VAD, STT, TTS)
+torch>=2.2.0
+torchaudio>=2.2.0
+openai-whisper>=20231117
+silero-vad>=5.1
+openwakeword>=0.6.0
+PyAudio>=0.2.14
+sounddevice>=0.4.6
+soundfile>=0.12.1
+pyttsx3>=2.90
+edge-tts>=6.1.9
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Security, Crypto & Procedural Memory
+cryptography>=42.0.0
+
+# Windows System, Automation & COM Control
+pywin32>=306
+pywinauto>=0.6.8
+pycaw>=20240210
+comtypes>=1.4.0
+PyGetWindow>=0.0.9
+pyautogui>=0.9.54
+pyperclip>=1.8.2
+psutil>=5.9.0
+pillow>=10.2.0
+
+# Browser Automation
+selenium>=4.18.0
+webdriver-manager>=4.0.1
+
+# Document & Media Handlers (Office COM & Direct File Creation)
+python-docx>=1.1.0
+python-pptx>=0.6.23
+pypdf>=4.0.0
+PyPDF2>=3.0.0
+xlsxwriter>=3.2.0
+
+# Optional Integrations
+spotipy>=2.23.0
+onnxruntime>=1.17.0
+fastapi>=0.110.0
+uvicorn>=0.28.0

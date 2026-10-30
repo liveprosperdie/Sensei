@@ -1,0 +1,72 @@
+# NOTE: this file must stay UTF-8. It has been saved as UTF-16 four times now,
+# and git cannot parse UTF-16 at all -- every rule below goes silently inert and
+# .pyc files start getting committed. Do not "fix" it in an editor that re-saves
+# as UTF-16/UCS-2 (PowerShell `>` redirection and Set-Content both default to
+# UTF-16LE on Windows; use `Set-Content -Encoding utf8`, or Notepad's
+# "Save as -> UTF-8").
+#
+# To verify the rules are actually live:
+#     git check-ignore -v __pycache__/anything.pyc     # must print a matching rule
+#     file .gitignore                                  # must NOT say UTF-16
+#
+# The fourth recurrence had already landed when this was rewritten: `file` said
+# UTF-16LE, check-ignore matched nothing, and 12 .pyc files were tracked. If you
+# are reading this because it happened again, the durable fix is a pre-commit
+# hook or a .gitattributes entry, not another manual re-save.
+
+# virtualenvs
+akira_env/
+sensei_env/
+.venv/
+
+# python bytecode
+__pycache__/
+*.pyc
+
+# secrets / credentials
+.env
+.env.*
+!.env.example
+credentials.json
+token.json
+memory/.session_vault.key
+memory/*.vault
+memory/*.key
+*.procedures.key
+.procedures.key
+
+# temporary office lock files & test artifacts
+~$*
+tests/*_results.json
+
+# models
+*.onnx
+*.onnx.data
+!akira.onnx
+!akira.onnx.data
+*.gguf
+*.bin
+Akira/
+
+# drivers
+chromedriver-win64/
+chromedriver.exe
+
+# scratch & test artifacts
+test.py
+.v0/
+scratch/
+*.mp3
+
+# Diagnostic/debug artifacts — not meant for version control
+akira_system_prompts_dump.md
+live_all_local_functions_report.json
+live_function_test_results.json
+live_verified_report.json
+akira_performance_dashboard.html
+*.db
+procedures.db
+.procedures.key
+*.procedures.key
+voice_engine_branch/
+memory/logs/

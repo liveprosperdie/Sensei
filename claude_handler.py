@@ -178,7 +178,45 @@ client = (anthropic.Anthropic(
     # silence is already too much dead air on a voice interface.
     timeout=30.0,
     max_retries=1,
-) if anthropic is not None else None)
+) if (anthropic is not None and os.environ.get("AKIRA_DISABLE_CLAUDE", "true").strip().lower() in ("0", "false", "no", "off") and os.environ.get("ANTHROPIC_API_KEY")) else None)
+
+
+def _is_claude_off() -> bool:
+    try:
+        from tiered_config import is_claude_disabled
+        return is_claude_disabled()
+    except Exception:
+        return os.environ.get("AKIRA_DISABLE_CLAUDE", "true").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _groq_fallback_call(system_prompt: str, user_block: str, max_tokens: int = 1024,
+                        json_mode: bool = False, timeout: float = 30.0) -> str | None:
+    """100% free Groq fallback when local servant is unavailable and Claude API is disabled."""
+    groq_key = (os.environ.get("GROQ_API_KEY") or os.environ.get("SPEECH_API_KEY") or "").strip()
+    if not groq_key:
+        return None
+    try:
+        from groq import Groq
+        g_client = Groq(api_key=groq_key)
+        model = os.environ.get("GROQ_ESCALATION_MODEL") or os.environ.get("GROQ_MODEL") or "openai/gpt-oss-120b"
+        safe_max = min(max_tokens, 900 if "qwen" in model.lower() else 4000)
+        kwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_block},
+            ],
+            "max_tokens": safe_max,
+            "temperature": 0.2,
+            "timeout": timeout,
+        }
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+        resp = g_client.chat.completions.create(**kwargs)
+        return (resp.choices[0].message.content or "").strip() or None
+    except Exception as e:
+        print(f"[_groq_fallback_call] Groq fallback error: {e}")
+        return None
 
 # ── Timeouts for the reasoning tier ──────────────────────────────────────────
 # The reasoning passes are a different shape from the fast path: they generate
@@ -902,44 +940,33 @@ def plan_organization(raw_content: str, vault_context: str = "", *,
             prompt_dump.capture_payload(f"Claude Brain ({BRAIN_MODEL} - plan_organization)", organize_system, user_block, {"model": BRAIN_MODEL, "max_tokens": 8000})
         except Exception:
             pass
-        message = client.with_options(
-            timeout=ORGANIZE_TIMEOUT,
-            max_retries=REASONING_MAX_RETRIES,
-        ).messages.create(
-            # Judgement and bulk text in ONE call, on the judgement model, and
-            # that is deliberate: whether a structural split is right depends on
-            # whether the bodies actually fill it, so a skeleton-then-fill split
-            # would make the structural call blind. A wrong structure scatters a
-            # vault silently; a weaker note body is editable prose.
-            #
-            # TRIPWIRE: this pass has no servant fallback and no partial salvage
-            # — max_tokens below is a hard discard. Sonnet's terseness used to be
-            # what kept large dumps under 8000; on a wordier model that margin is
-            # unproven. If focus-mode organize starts returning None, split the
-            # judgement out and put the bodies on DRAFT_MODEL before raising the
-            # ceiling.
-            model=BRAIN_MODEL,
-            # Real headroom: note bodies live in THIS reply, unlike the routing
-            # envelope, which is exactly why this is a separate call.
-            max_tokens=8000,
-            system=[{"type": "text", "text": organize_system,
-                     "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": user_block}],
-            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
-        )
+        if _is_claude_off() or client is None:
+            raw_reply = _groq_fallback_call(organize_system, user_block, max_tokens=4000, json_mode=True, timeout=ORGANIZE_TIMEOUT)
+            if not raw_reply:
+                return None
+            message = None
+        else:
+            message = client.with_options(
+                timeout=ORGANIZE_TIMEOUT,
+                max_retries=REASONING_MAX_RETRIES,
+            ).messages.create(
+                model=BRAIN_MODEL,
+                max_tokens=8000,
+                system=[{"type": "text", "text": organize_system,
+                         "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": user_block}],
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+            )
     except Exception as e:
-        # Includes APITimeoutError. Returning None makes the caller say it wrote
-        # nothing, which is the correct outcome — a half-planned vault would be
-        # worse than an honest failure.
         print(f"[plan_organization] model call failed after "
               f"{ORGANIZE_TIMEOUT:.0f}s limit: {e!r}")
         return None
 
-    if getattr(message, "stop_reason", None) == "max_tokens":
-        print("[plan_organization] WARNING: plan hit max_tokens — discarding")
-        return None
-
-    raw_reply = response_text(message)
+    if message is not None:
+        if getattr(message, "stop_reason", None) == "max_tokens":
+            print("[plan_organization] WARNING: plan hit max_tokens — discarding")
+            return None
+        raw_reply = response_text(message)
     parsed, info = llm_json.parse(raw_reply)
     if not isinstance(parsed, dict) or info.get("truncated"):
         print(f"[plan_organization] unusable plan: {raw_reply[:300]!r}")
@@ -1036,23 +1063,29 @@ def summarize_code_batch(repo: str, files: list[dict]) -> dict:
             servant = None
 
     if servant is None:
-        try:
-            message = client.with_options(
-                timeout=BATCH_SUMMARY_TIMEOUT,
-                max_retries=REASONING_MAX_RETRIES,
-            ).messages.create(
-                model=HAIKU_MODEL,
-                max_tokens=max_tokens,
-                system=[{"type": "text", "text": CODE_SUMMARY_PROMPT,
-                         "cache_control": {"type": "ephemeral"}}],
-                messages=[{"role": "user", "content": user_block}],
-                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
-            )
-        except Exception as e:
-            print(f"[summarize_code_batch] {len(files)} files failed: {e!r}")
-            return {}
+        if _is_claude_off() or client is None:
+            raw_g = _groq_fallback_call(CODE_SUMMARY_PROMPT, user_block, max_tokens=max_tokens, json_mode=True, timeout=BATCH_SUMMARY_TIMEOUT)
+            if not raw_g:
+                return {}
+            parsed, info = llm_json.parse(raw_g)
+        else:
+            try:
+                message = client.with_options(
+                    timeout=BATCH_SUMMARY_TIMEOUT,
+                    max_retries=REASONING_MAX_RETRIES,
+                ).messages.create(
+                    model=HAIKU_MODEL,
+                    max_tokens=max_tokens,
+                    system=[{"type": "text", "text": CODE_SUMMARY_PROMPT,
+                             "cache_control": {"type": "ephemeral"}}],
+                    messages=[{"role": "user", "content": user_block}],
+                    extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+                )
+            except Exception as e:
+                print(f"[summarize_code_batch] {len(files)} files failed: {e!r}")
+                return {}
 
-        parsed, info = llm_json.parse(response_text(message))
+            parsed, info = llm_json.parse(response_text(message))
 
     if not isinstance(parsed, dict):
         print("[summarize_code_batch] unusable reply")
@@ -1179,29 +1212,33 @@ def plan_repo_outline(repo: str, meta: str, readme: str,
                 servant = None
 
     if servant is None:
-        try:
-            message = client.with_options(
-                timeout=REPO_OUTLINE_TIMEOUT,
-                max_retries=REASONING_MAX_RETRIES,
-            ).messages.create(
-                # SERVANT_GEN fallback, not brain work — stays on the draft
-                # model so an absent servant key degrades cost, not just speed.
-                model=DRAFT_MODEL,
-                max_tokens=2500,
-                system=[{"type": "text", "text": REPO_OUTLINE_PROMPT,
-                         "cache_control": {"type": "ephemeral"}}],
-                messages=[{"role": "user", "content": user_block}],
-                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
-            )
-        except Exception as e:
-            print(f"[plan_repo_outline] model call failed: {e!r}")
-            return None
+        if _is_claude_off() or client is None:
+            raw_g = _groq_fallback_call(REPO_OUTLINE_PROMPT, user_block, max_tokens=2500, json_mode=True, timeout=REPO_OUTLINE_TIMEOUT)
+            if not raw_g:
+                return None
+            parsed, info = llm_json.parse(raw_g)
+        else:
+            try:
+                message = client.with_options(
+                    timeout=REPO_OUTLINE_TIMEOUT,
+                    max_retries=REASONING_MAX_RETRIES,
+                ).messages.create(
+                    model=DRAFT_MODEL,
+                    max_tokens=2500,
+                    system=[{"type": "text", "text": REPO_OUTLINE_PROMPT,
+                             "cache_control": {"type": "ephemeral"}}],
+                    messages=[{"role": "user", "content": user_block}],
+                    extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+                )
+            except Exception as e:
+                print(f"[plan_repo_outline] model call failed: {e!r}")
+                return None
 
-        if getattr(message, "stop_reason", None) == "max_tokens":
-            print("[plan_repo_outline] WARNING: outline hit max_tokens")
-            return {"hit_max_tokens": True}
+            if getattr(message, "stop_reason", None) == "max_tokens":
+                print("[plan_repo_outline] WARNING: outline hit max_tokens")
+                return {"hit_max_tokens": True}
 
-        parsed, info = llm_json.parse(response_text(message))
+            parsed, info = llm_json.parse(response_text(message))
 
     if not isinstance(parsed, dict) or info.get("truncated"):
         print("[plan_repo_outline] unusable outline")
@@ -1324,25 +1361,31 @@ def write_note_bodies(repo: str, meta: str, outline: list,
             truncated = bool(info.get("truncated"))
 
     if servant is None:
-        try:
-            message = client.with_options(
-                timeout=NOTE_BODY_TIMEOUT,
-                max_retries=REASONING_MAX_RETRIES,
-            ).messages.create(
-                # Same SERVANT_GEN fallback rationale as plan_repo_outline.
-                model=DRAFT_MODEL,
-                max_tokens=max_tokens,
-                system=[{"type": "text", "text": NOTE_BODY_PROMPT,
-                         "cache_control": {"type": "ephemeral"}}],
-                messages=[{"role": "user", "content": user_block}],
-                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
-            )
-        except Exception as e:
-            print(f"[write_note_bodies] {len(targets)} notes failed: {e!r}")
-            return {}
+        if _is_claude_off() or client is None:
+            raw_g = _groq_fallback_call(NOTE_BODY_PROMPT, user_block, max_tokens=max_tokens, json_mode=True, timeout=NOTE_BODY_TIMEOUT)
+            if not raw_g:
+                return {}
+            parsed, info = llm_json.parse(raw_g)
+            truncated = bool(info.get("truncated"))
+        else:
+            try:
+                message = client.with_options(
+                    timeout=NOTE_BODY_TIMEOUT,
+                    max_retries=REASONING_MAX_RETRIES,
+                ).messages.create(
+                    model=DRAFT_MODEL,
+                    max_tokens=max_tokens,
+                    system=[{"type": "text", "text": NOTE_BODY_PROMPT,
+                             "cache_control": {"type": "ephemeral"}}],
+                    messages=[{"role": "user", "content": user_block}],
+                    extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+                )
+            except Exception as e:
+                print(f"[write_note_bodies] {len(targets)} notes failed: {e!r}")
+                return {}
 
-        truncated = getattr(message, "stop_reason", None) == "max_tokens"
-        parsed, info = llm_json.parse(response_text(message))
+            truncated = getattr(message, "stop_reason", None) == "max_tokens"
+            parsed, info = llm_json.parse(response_text(message))
 
     if not isinstance(parsed, dict):
         print("[write_note_bodies] unusable reply")
@@ -1479,34 +1522,35 @@ def deliberate(request: str, context: str = "", *,
             prompt_dump.capture_payload(f"Claude Brain ({BRAIN_MODEL} - deliberate)", [AKIRA_PROMPT, DELIBERATE_PROMPT], user_block, {"model": BRAIN_MODEL, "max_tokens": 4000})
         except Exception:
             pass
-        message = client.with_options(
-            timeout=DELIBERATE_TIMEOUT,
-            max_retries=REASONING_MAX_RETRIES,
-        ).messages.create(
-            # Escalation-only, so the judgement model's latency is nearly free
-            # here — nothing reaches this path on an ordinary voice turn.
-            model=BRAIN_MODEL,
-            # Room to actually think, unlike the 1600-token routing envelope.
-            max_tokens=4000,
-            system=[{"type": "text", "text": AKIRA_PROMPT,
-                     "cache_control": {"type": "ephemeral"}},
-                    {"type": "text", "text": DELIBERATE_PROMPT,
-                     "cache_control": {"type": "ephemeral"}}],
-            messages=[{"role": "user", "content": user_block}],
-            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
-        )
+        if _is_claude_off() or client is None:
+            raw_reply = _groq_fallback_call(f"{AKIRA_PROMPT}\n\n{DELIBERATE_PROMPT}", user_block, max_tokens=2000, json_mode=True, timeout=DELIBERATE_TIMEOUT)
+            if not raw_reply:
+                return None
+            message = None
+        else:
+            message = client.with_options(
+                timeout=DELIBERATE_TIMEOUT,
+                max_retries=REASONING_MAX_RETRIES,
+            ).messages.create(
+                model=BRAIN_MODEL,
+                max_tokens=4000,
+                system=[{"type": "text", "text": AKIRA_PROMPT,
+                         "cache_control": {"type": "ephemeral"}},
+                        {"type": "text", "text": DELIBERATE_PROMPT,
+                         "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": user_block}],
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+            )
     except Exception as e:
-        # Includes APITimeoutError. None makes the caller admit it couldn't
-        # work the request out, rather than falling back to a guessed action.
         print(f"[deliberate] model call failed after "
               f"{DELIBERATE_TIMEOUT:.0f}s limit: {e!r}")
         return None
 
-    if getattr(message, "stop_reason", None) == "max_tokens":
-        print("[deliberate] WARNING: reasoning hit max_tokens — discarding")
-        return None
-
-    raw_reply = response_text(message)
+    if message is not None:
+        if getattr(message, "stop_reason", None) == "max_tokens":
+            print("[deliberate] WARNING: reasoning hit max_tokens — discarding")
+            return None
+        raw_reply = response_text(message)
     parsed, info = llm_json.parse(raw_reply)
     if not isinstance(parsed, dict) or info.get("truncated"):
         print(f"[deliberate] unusable reply: {raw_reply[:300]!r}")
@@ -2195,6 +2239,12 @@ def ask_confirmation(text: str, pending_description: str | None = None) -> bool:
             print(f"[ask_confirmation] servant error, defaulting NO: {e!r}")
             return False
 
+    if _is_claude_off() or client is None:
+        raw_g = _groq_fallback_call(system, text, max_tokens=16, json_mode=False, timeout=8.0)
+        if not raw_g:
+            return False
+        return raw_g.strip().upper().startswith("YES")
+
     try:
         message = client.messages.create(
             model=HAIKU_MODEL,
@@ -2220,10 +2270,8 @@ _SUMMARIZE_TEXT_PROMPT = (
 def summarize_text(text: str, filename: str = "") -> str:
     """4-5 line spoken summary of file content, for executor.summarize_file.
     SERVANT_MECH — a mechanical reduction, so the cheapest tier that can read
-    is the right one. Falls back to Haiku when the servant key is unset or the
-    servant reply is truncated (ServantUnavailable covers both), and the
-    fallback gets a wider token budget so a length-capped retry cannot repeat
-    the same truncation."""
+    is the right one. Falls back to Groq / Haiku when the servant key is unset or the
+    servant reply is truncated (ServantUnavailable covers both)."""
     user = f"File: {filename}\n\n{text}"
     servant = servant_or_none("summarize_text")
     if servant is not None:
@@ -2233,7 +2281,17 @@ def summarize_text(text: str, filename: str = "") -> str:
                 servant, system=_SUMMARIZE_TEXT_PROMPT, user=user,
                 max_tokens=300, label="summarize_text").strip()
         except servant_clients.ServantUnavailable as e:
-            print(f"[summarize_text] {e} — retrying on cheap brain tier")
+            print(f"[summarize_text] {e} — retrying on free Groq / cheap brain tier")
+
+    raw_g = _groq_fallback_call(_SUMMARIZE_TEXT_PROMPT, user, max_tokens=350, json_mode=False, timeout=15.0)
+    if raw_g:
+        return raw_g.strip()
+
+    if _is_claude_off() or client is None:
+        # Local deterministic extractive summary fallback if both local servant and Groq are offline
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()][:4]
+        snippet = " ".join(lines)[:280]
+        return f"This file is {filename or 'a document'}. Here is what it starts with: {snippet}"
 
     message = client.messages.create(
         model=HAIKU_MODEL,

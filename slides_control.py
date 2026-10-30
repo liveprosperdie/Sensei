@@ -114,18 +114,26 @@ def slides_control(action: str, parameter: str | None = None) -> dict:
 
     if action == "delete":
         if not parts or not parts[0].strip():
-            return {"success": False, "message": "Which presentation should I delete?"}
+            return {"success": False, "message": "Which presentation should I locate for you to delete?"}
         pres_id, err = _resolve_presentation_id(parts[0])
         if err:
             return {"success": False, "message": err}
-        # The Slides API has no delete — presentations are Drive files, and
-        # the server's only per-file delete is delete_item, which moves the
-        # file to the Drive TRASH (recoverable), not a permanent wipe.
-        res = google_mcp.call("workspace", "delete_item", {"itemId": pres_id})
-        if res["success"]:
-            res["detail"] = res["message"]  # full server output for the LLM
-            res["message"] = ("Presentation moved to the Drive trash. "
-                              "It can be restored from there if needed.")
-        return res
+        url = f"https://docs.google.com/presentation/d/{pres_id}/edit"
+        import os, webbrowser
+        if os.environ.get("AKIRA_HEADLESS_TEST") != "1":
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+        return {
+            "success": True,
+            "speak": True,
+            "handoff": True,
+            "url": url,
+            "message": (
+                f"I don't delete presentations directly — I've opened the presentation ({parts[0].strip()}) "
+                f"in your browser so now you can delete it yourself."
+            ),
+        }
 
     return {"success": False, "message": f"Unknown slides action: {action}"}

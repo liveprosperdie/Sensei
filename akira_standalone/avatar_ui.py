@@ -1,0 +1,494 @@
+"""avatar_ui.py — 2D desktop pet/avatar widget for Akira.
+
+Frameless, transparent, always-on-top desktop overlay with:
+- Natural, intermittent eye tracking (does NOT constantly lock onto mouse)
+- Ambient gaze drift & natural blinks
+- Subtle breathing sway
+- Lip sync animations synchronized with Akira's speech (talk_open / talk_closed)
+- Emotional expressions (happy, wake, calm, sleep) triggered via UDP port 55555
+"""
+
+import sys
+import os
+import time
+import math
+import random
+import socket
+import threading
+from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QMenu, QGraphicsOpacityEffect, QSystemTrayIcon
+from PyQt6.QtCore import Qt, QPoint, QTimer, pyqtSignal, QPropertyAnimation, QEasingCurve, QRect
+from PyQt6.QtGui import QPixmap, QCursor, QAction, QIcon
+
+SPRITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sprites")
+UDP_PORT = 55555
+IDLE_SLEEP_MS = 5 * 60 * 1000  # 5 minutes idle timeout
+
+# Configurable behavior knobs (tunable via environment variables)
+EYE_TRACK_PROBABILITY = float(os.environ.get("AKIRA_EYE_TRACK_PROBABILITY", "0.35"))
+EYE_TRACK_DURATION_SEC = float(os.environ.get("AKIRA_EYE_TRACK_DURATION", "2.0"))
+GLANCE_INTERVAL_MIN = int(os.environ.get("AKIRA_GLANCE_INTERVAL_MIN", "4000"))
+GLANCE_INTERVAL_MAX = int(os.environ.get("AKIRA_GLANCE_INTERVAL_MAX", "9000"))
+GLANCE_DURATION_MIN = int(os.environ.get("AKIRA_GLANCE_DURATION_MIN", "1200"))
+GLANCE_DURATION_MAX = int(os.environ.get("AKIRA_GLANCE_DURATION_MAX", "1800"))
+
+
+class AvatarWindow(QWidget):
+    speaking_signal = pyqtSignal(bool)
+    sleep_signal = pyqtSignal(bool)
+    happy_signal = pyqtSignal()
+    wake_signal = pyqtSignal()
+    calm_signal = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+
+        self.dragging = False
+        self.offset = QPoint()
+
+        # Core states
+        self.is_speaking = False
+        self.is_sleeping = False
+        self.is_patting = False
+        self.current_sprite_name = "idle.png"
+        self.talk_toggle = False
+
+        # Natural eye tracking & ambient gaze states
+        self.is_tracking_mouse = False
+        self.track_mouse_until = 0.0
+        self.attention_until = 0.0
+        self.is_ambient_glancing = False
+        self.last_mouse_pos = None
+        self.last_mouse_check_time = 0.0
+
+        self.init_ui()
+        self.load_sprites()
+        self.setup_animations()
+        self.setup_timers()
+        self.start_udp_listener()
+
+        self.speaking_signal.connect(self.handle_speaking_state)
+        self.sleep_signal.connect(self.handle_sleep_state)
+        self.happy_signal.connect(self.trigger_happy)
+        self.wake_signal.connect(self.trigger_wake)
+        self.calm_signal.connect(self.trigger_calm)
+
+    def init_ui(self):
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        # Setup two labels for crossfading
+        self.label_bottom = QLabel(self)
+        self.label_bottom.setScaledContents(True)
+
+        self.label_top = QLabel(self)
+        self.label_top.setScaledContents(True)
+
+        self.opacity_effect = QGraphicsOpacityEffect()
+        self.label_top.setGraphicsEffect(self.opacity_effect)
+        self.opacity_effect.setOpacity(1.0)
+
+        self.resize(250, 250)
+        self.label_bottom.resize(250, 250)
+        self.label_top.resize(250, 250)
+
+        # Position in bottom-right corner by default
+        screen = QApplication.primaryScreen()
+        if screen:
+            geo = screen.availableGeometry()
+            self.move(geo.width() - 280, geo.height() - 290)
+
+        # System Tray Icon
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon))
+
+        tray_menu = QMenu()
+        show_action = QAction("Show Avatar", self)
+        show_action.triggered.connect(self.show_avatar)
+        tray_menu.addAction(show_action)
+
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(QApplication.instance().quit)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.show()
+
+        self.show()
+
+    def load_sprites(self):
+        self.sprites = {}
+        expected = [
+            "idle.png", "blink.png", "talk_open.png", "talk_closed.png",
+            "look_up.png", "look_down.png", "look_left.png", "look_right.png",
+            "happy.png", "sleep.png"
+        ]
+        for name in expected:
+            path = os.path.join(SPRITE_DIR, name)
+            if os.path.exists(path):
+                self.sprites[name] = QPixmap(path)
+
+        # Resilient fallbacks: ensure core sprites are never missing
+        fallback_pixmap = self.sprites.get("idle.png") or self.sprites.get("talk_closed.png")
+        if not fallback_pixmap and self.sprites:
+            fallback_pixmap = next(iter(self.sprites.values()))
+
+        if "idle.png" not in self.sprites and fallback_pixmap:
+            self.sprites["idle.png"] = fallback_pixmap
+        if "talk_closed.png" not in self.sprites and fallback_pixmap:
+            self.sprites["talk_closed.png"] = fallback_pixmap
+        if "talk_open.png" not in self.sprites and fallback_pixmap:
+            self.sprites["talk_open.png"] = self.sprites.get("happy.png", fallback_pixmap)
+
+        if "idle.png" in self.sprites:
+            self.tray_icon.setIcon(QIcon(os.path.join(SPRITE_DIR, "idle.png")))
+
+        init_pixmap = self.sprites.get("idle.png", QPixmap())
+        self.label_bottom.setPixmap(init_pixmap)
+        self.label_top.setPixmap(init_pixmap)
+
+    def setup_animations(self):
+        # Crossfade animation
+        self.fade_anim = QPropertyAnimation(self.opacity_effect, b"opacity")
+        self.fade_anim.setDuration(220)
+        self.fade_anim.setStartValue(0.0)
+        self.fade_anim.setEndValue(1.0)
+        self.fade_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+
+        # Breathing animation (moves the window Y slightly)
+        self.breath_anim = QPropertyAnimation(self, b"pos")
+        self.breath_anim.setDuration(3000)
+        self.breath_anim.setEasingCurve(QEasingCurve.Type.InOutSine)
+
+    def setup_timers(self):
+        # 60fps physics/eye tracking loop
+        self.physics_timer = QTimer(self)
+        self.physics_timer.timeout.connect(self.physics_loop)
+        self.physics_timer.start(16)
+
+        # Lip sync toggler
+        self.lip_sync_timer = QTimer(self)
+        self.lip_sync_timer.timeout.connect(self.lip_sync_tick)
+
+        # Random natural blinker
+        self.blink_timer = QTimer(self)
+        self.blink_timer.timeout.connect(self.do_blink)
+        self.blink_timer.start(random.randint(3000, 6500))
+        self.is_blinking = False
+
+        # Ambient gaze drift timer (slow natural glances)
+        self.ambient_glance_timer = QTimer(self)
+        self.ambient_glance_timer.timeout.connect(self.do_ambient_glance)
+        self.ambient_glance_timer.start(random.randint(GLANCE_INTERVAL_MIN, GLANCE_INTERVAL_MAX))
+
+        # Idle sleep timer
+        self.idle_timer = QTimer(self)
+        self.idle_timer.timeout.connect(lambda: self.handle_sleep_state(True))
+        self.idle_timer.start(IDLE_SLEEP_MS)
+
+        # Breathing loop trigger
+        self.breath_loop_timer = QTimer(self)
+        self.breath_loop_timer.timeout.connect(self.trigger_breath)
+        self.breath_loop_timer.start(3000)
+        self.base_pos = self.pos()
+
+        # Happy timer
+        self.happy_timer = QTimer(self)
+        self.happy_timer.setSingleShot(True)
+        self.happy_timer.timeout.connect(self.end_happy)
+
+    def trigger_breath(self):
+        if self.dragging:
+            return
+
+        dur = 4000 if self.is_sleeping else 3000
+        depth = 4 if self.is_sleeping else 2
+
+        self.breath_anim.setDuration(dur)
+        self.breath_anim.setStartValue(self.base_pos)
+        self.breath_anim.setKeyValueAt(0.5, QPoint(self.base_pos.x(), self.base_pos.y() - depth))
+        self.breath_anim.setEndValue(self.base_pos)
+        self.breath_anim.start()
+
+        self.breath_loop_timer.setInterval(dur)
+
+    def transition_sprite(self, target_name, instant=False):
+        if target_name not in self.sprites or target_name == self.current_sprite_name:
+            return
+
+        if instant:
+            self.label_top.setPixmap(self.sprites[target_name])
+            self.opacity_effect.setOpacity(1.0)
+            self.current_sprite_name = target_name
+            return
+
+        # Smooth crossfade
+        self.label_bottom.setPixmap(self.sprites[self.current_sprite_name])
+        self.label_top.setPixmap(self.sprites[target_name])
+        self.current_sprite_name = target_name
+
+        self.fade_anim.stop()
+        self.fade_anim.start()
+
+    def do_ambient_glance(self):
+        """Slow, semi-random ambient glance (like a person looking around naturally)."""
+        if self.is_speaking or self.is_sleeping or self.is_patting or self.is_tracking_mouse or self.is_blinking:
+            self.ambient_glance_timer.start(random.randint(GLANCE_INTERVAL_MIN, GLANCE_INTERVAL_MAX))
+            return
+
+        self.is_ambient_glancing = True
+        glance_sprites = ["look_left.png", "look_right.png", "look_up.png", "look_down.png"]
+        chosen = random.choice(glance_sprites)
+        self.transition_sprite(chosen)
+
+        dur = random.randint(GLANCE_DURATION_MIN, GLANCE_DURATION_MAX)
+
+        def end_glance():
+            if self.is_ambient_glancing and not (self.is_speaking or self.is_sleeping or self.is_patting or self.is_tracking_mouse):
+                self.transition_sprite("idle.png")
+            self.is_ambient_glancing = False
+            self.ambient_glance_timer.start(random.randint(GLANCE_INTERVAL_MIN, GLANCE_INTERVAL_MAX))
+
+        QTimer.singleShot(dur, end_glance)
+
+    def physics_loop(self):
+        """Natural intermittent eye tracking loop."""
+        if self.is_speaking:
+            return  # Speaking has highest priority (lip sync controls mouth)
+
+        if self.is_sleeping or self.is_patting or self.is_blinking:
+            return
+
+        now = time.time()
+        mouse_pos = QCursor.pos()
+        center = self.geometry().center()
+
+        dx = mouse_pos.x() - center.x()
+        dy = mouse_pos.y() - center.y()
+        dist = math.hypot(dx, dy)
+
+        # 1. Motion and proximity evaluation
+        if self.last_mouse_pos is not None:
+            delta_mouse = math.hypot(mouse_pos.x() - self.last_mouse_pos.x(),
+                                     mouse_pos.y() - self.last_mouse_pos.y())
+            dt = max(0.001, now - self.last_mouse_check_time)
+            velocity = delta_mouse / dt
+
+            if delta_mouse > 5:
+                self.idle_timer.start(IDLE_SLEEP_MS)
+
+            # Decide whether to initiate eye tracking
+            if not self.is_tracking_mouse:
+                should_track = False
+                # A: Akira just finished speaking and is paying attention
+                if now < self.attention_until:
+                    should_track = True
+                # B: Cursor is hovering very close to or over avatar
+                elif dist < 160:
+                    should_track = True
+                # C: Fast nearby mouse movement caught Akira's peripheral vision
+                elif dist < 700 and velocity > 650:
+                    should_track = True
+                # D: Occasional casual glance when mouse moves (probabilistic)
+                elif delta_mouse > 15 and random.random() < (EYE_TRACK_PROBABILITY * 0.04):
+                    should_track = True
+
+                if should_track:
+                    self.is_tracking_mouse = True
+                    self.track_mouse_until = now + EYE_TRACK_DURATION_SEC
+                    self.is_ambient_glancing = False
+
+        self.last_mouse_pos = mouse_pos
+        self.last_mouse_check_time = now
+
+        # 2. If actively tracking, orient eyes toward cursor
+        if self.is_tracking_mouse:
+            if now > self.track_mouse_until:
+                # Easing back to natural idle
+                self.is_tracking_mouse = False
+                if not self.is_ambient_glancing:
+                    self.transition_sprite("idle.png")
+                return
+
+            if dist < 120:
+                self.transition_sprite("idle.png")
+            else:
+                angle = math.degrees(math.atan2(dy, dx))
+                if -45 <= angle <= 45:
+                    self.transition_sprite("look_right.png")
+                elif 45 < angle < 135:
+                    self.transition_sprite("look_down.png")
+                elif -135 < angle < -45:
+                    self.transition_sprite("look_up.png")
+                else:
+                    self.transition_sprite("look_left.png")
+
+    def enterEvent(self, event):
+        """User hovered cursor over avatar — immediately pay attention."""
+        self.is_tracking_mouse = True
+        self.track_mouse_until = time.time() + EYE_TRACK_DURATION_SEC
+        super().enterEvent(event)
+
+    def lip_sync_tick(self):
+        self.talk_toggle = not self.talk_toggle
+        target = "talk_open.png" if self.talk_toggle else "talk_closed.png"
+        self.transition_sprite(target, instant=True)
+
+    def do_blink(self):
+        if self.is_sleeping or self.is_patting:
+            return
+        self.is_blinking = True
+        prev = self.current_sprite_name
+        self.transition_sprite("blink.png", instant=True)
+
+        def restore():
+            self.is_blinking = False
+            self.transition_sprite(prev, instant=True)
+            self.blink_timer.start(random.randint(3000, 6500))
+
+        QTimer.singleShot(140, restore)
+
+    def handle_speaking_state(self, is_speaking):
+        self.is_speaking = is_speaking
+        if is_speaking:
+            if self.is_sleeping:
+                self.handle_sleep_state(False)
+            if self.is_patting:
+                self.end_happy()
+            self.is_tracking_mouse = False
+            self.is_ambient_glancing = False
+            self.lip_sync_timer.start(140)
+            self.talk_toggle = True
+            self.transition_sprite("talk_open.png", instant=True)
+        else:
+            self.lip_sync_timer.stop()
+            self.transition_sprite("idle.png")
+            # Attentive listening window: track user cursor briefly after speaking
+            self.attention_until = time.time() + 3.0
+            self.is_tracking_mouse = True
+            self.track_mouse_until = time.time() + 2.5
+
+    def handle_sleep_state(self, is_sleeping):
+        self.is_sleeping = is_sleeping
+        if is_sleeping:
+            self.is_tracking_mouse = False
+            self.is_ambient_glancing = False
+            self.transition_sprite("sleep.png")
+            self.lip_sync_timer.stop()
+        else:
+            self.transition_sprite("idle.png")
+            self.idle_timer.start(IDLE_SLEEP_MS)
+
+    def show_avatar(self):
+        self.show()
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
+        self.activateWindow()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            if event.position().y() < self.height() * 0.35:
+                self.trigger_happy()
+            else:
+                self.dragging = True
+                self.offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def trigger_happy(self):
+        if self.is_speaking:
+            return
+        self.is_patting = True
+        self.handle_sleep_state(False)
+        self.transition_sprite("happy.png", instant=False)
+        self.happy_timer.start(3500)
+
+    def trigger_wake(self):
+        """Awaken and display an alert, happy expression upon wake word."""
+        self.handle_sleep_state(False)
+        self.attention_until = time.time() + 3.5
+        self.is_tracking_mouse = True
+        self.track_mouse_until = time.time() + 2.0
+        self.trigger_happy()
+
+    def trigger_calm(self):
+        """Transition into a calm, steady idle state."""
+        self.handle_sleep_state(False)
+        self.is_tracking_mouse = False
+        self.transition_sprite("idle.png")
+
+    def end_happy(self):
+        self.is_patting = False
+        self.happy_timer.stop()
+        if not self.is_speaking:
+            self.transition_sprite("idle.png")
+
+    def mouseMoveEvent(self, event):
+        if self.dragging:
+            new_pos = event.globalPosition().toPoint() - self.offset
+            self.move(new_pos)
+            self.base_pos = new_pos
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.dragging = False
+
+    def contextMenuEvent(self, event):
+        menu = QMenu(self)
+
+        sleep_act = QAction("Wake Up" if self.is_sleeping else "Go to Sleep", self)
+        sleep_act.triggered.connect(lambda: self.handle_sleep_state(not self.is_sleeping))
+        menu.addAction(sleep_act)
+
+        hide_act = QAction("Hide Avatar (To Tray)", self)
+        hide_act.triggered.connect(self.hide)
+        menu.addAction(hide_act)
+
+        quit_act = QAction("Quit Avatar", self)
+        quit_act.triggered.connect(QApplication.instance().quit)
+        menu.addAction(quit_act)
+
+        menu.exec(event.globalPos())
+
+    def start_udp_listener(self):
+        def listener():
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            except Exception:
+                pass
+            try:
+                sock.bind(('127.0.0.1', UDP_PORT))
+            except Exception as e:
+                print(f"[avatar] UDP bind error on port {UDP_PORT}: {e}")
+                return
+
+            while True:
+                try:
+                    data, _ = sock.recvfrom(1024)
+                    msg = data.decode('utf-8').strip()
+                    if msg == "SPEAK_START":
+                        self.speaking_signal.emit(True)
+                    elif msg == "SPEAK_STOP":
+                        self.speaking_signal.emit(False)
+                    elif msg == "SLEEP_START":
+                        self.sleep_signal.emit(True)
+                    elif msg == "SLEEP_STOP":
+                        self.sleep_signal.emit(False)
+                    elif msg == "HAPPY_START":
+                        self.happy_signal.emit()
+                    elif msg == "WAKE_START":
+                        self.wake_signal.emit()
+                    elif msg == "CALM_START":
+                        self.calm_signal.emit()
+                except Exception as e:
+                    print(f"[avatar] UDP receive error: {e}")
+
+        t = threading.Thread(target=listener, daemon=True)
+        t.start()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = AvatarWindow()
+    sys.exit(app.exec())
